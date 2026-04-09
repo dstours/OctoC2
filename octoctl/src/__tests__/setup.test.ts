@@ -38,3 +38,48 @@ describe("validateRepoConfig", () => {
     expect(result).toEqual([]);
   });
 });
+
+import { generateEnvFile } from "../commands/setup/phases.ts";
+
+describe("generateEnvFile", () => {
+  test("produces valid .env content with required fields", () => {
+    const env = generateEnvFile({
+      token: "ghp_abc123",
+      owner: "myorg",
+      repo: "c2-repo",
+      operatorSecret: "base64secret",
+      operatorPublicKey: "base64public",
+    });
+    expect(env).toContain("OCTOC2_GITHUB_TOKEN=ghp_abc123");
+    expect(env).toContain("OCTOC2_REPO_OWNER=myorg");
+    expect(env).toContain("OCTOC2_REPO_NAME=c2-repo");
+    expect(env).toContain("OCTOC2_OPERATOR_SECRET=base64secret");
+    expect(env).toContain("# MONITORING_PUBKEY=base64public");
+  });
+
+  test("includes app fields when provided", () => {
+    const env = generateEnvFile({
+      token: "ghp_abc123",
+      owner: "myorg",
+      repo: "c2-repo",
+      operatorSecret: "base64secret",
+      operatorPublicKey: "base64public",
+      appId: 12345,
+      installationId: 67890,
+    });
+    expect(env).toContain("SVC_APP_ID=12345");
+    expect(env).toContain("SVC_INSTALLATION_ID=67890");
+  });
+
+  test("includes tentacle priority when provided", () => {
+    const env = generateEnvFile({
+      token: "ghp_abc123",
+      owner: "myorg",
+      repo: "c2-repo",
+      operatorSecret: "base64secret",
+      operatorPublicKey: "base64public",
+      tentaclePriority: "actions,issues",
+    });
+    expect(env).toContain("SVC_TENTACLE_PRIORITY=actions,issues");
+  });
+});
