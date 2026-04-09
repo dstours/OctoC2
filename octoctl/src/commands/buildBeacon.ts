@@ -126,8 +126,6 @@ export interface BuildBeaconOptions {
   grpcUrl?: string;
   /** Base HTTP URL for HttpTentacle (SVC_HTTP_URL). e.g. "https://codespace-8080.app.github.dev" */
   httpUrl?: string;
-  /** Strip debug symbols + UPX compress the binary (100MB → 25MB) */
-  pack?: boolean;
 }
 
 /** Minimal env resolution for build-beacon — only needs token/owner/repo, no operator secret. */
@@ -251,21 +249,6 @@ export async function runBuildBeacon(opts: BuildBeaconOptions): Promise<void> {
   if (code !== 0) {
     console.error(`\n  Build failed (exit ${code}).\n`);
     process.exit(1);
-  }
-
-  // ── Post-build packing: strip + UPX ──────────────────────────────────────
-  if (opts.pack) {
-    console.log(`\n  Packing binary (strip + UPX)…`);
-    const strip = Bun.spawn(["strip", opts.outfile], { stdout: "inherit", stderr: "inherit" });
-    if ((await strip.exited) !== 0) {
-      console.error(`  strip failed — skipping compression.`);
-    } else {
-      const upx = Bun.spawn(["upx", "--best", "--lzma", "-f", opts.outfile], { stdout: "inherit", stderr: "inherit" });
-      if ((await upx.exited) !== 0) {
-        console.error(`  UPX not found or failed — binary is stripped but not compressed.`);
-        console.error(`  Install UPX: apt install upx  (or download from https://github.com/upx/upx/releases)`);
-      }
-    }
   }
 
   console.log("");

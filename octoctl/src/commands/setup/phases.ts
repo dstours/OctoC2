@@ -331,11 +331,6 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
     placeholder: "./beacon",
   });
 
-  const pack = await promptConfirm({
-    message: "Strip + UPX compress? (100MB → 25MB)",
-    initialValue: true,
-  });
-
   const args = [
     "run", "octoctl/src/index.ts", "build-beacon",
     "--outfile", outfile,
@@ -366,18 +361,6 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
     const code = await proc.exited;
     if (code !== 0) throw new Error(`Build failed (exit ${code})`);
   });
-
-  if (pack) {
-    await withSpinner("Stripping + UPX compressing…", async () => {
-      const strip = Bun.spawn(["strip", outfile], { stdout: "pipe", stderr: "pipe" });
-      if ((await strip.exited) !== 0) throw new Error("strip failed");
-
-      const upx = Bun.spawn(["upx", "--best", "--lzma", "-f", outfile], { stdout: "pipe", stderr: "pipe" });
-      if ((await upx.exited) !== 0) {
-        p.log.warn("UPX not found — skipping compression. Install: apt install upx");
-      }
-    });
-  }
 
   p.log.success(`Beacon built: ${outfile}`);
 }

@@ -216,7 +216,6 @@ program
   .option("--tentacle-priority <list>",  "bake tentacle priority order (SVC_TENTACLE_PRIORITY), e.g. codespaces,issues")
   .option("--grpc-url <url>",            "bake public gRPC URL (SVC_GRPC_DIRECT), e.g. https://name-50051.app.github.dev")
   .option("--http-url <url>",            "base HTTP URL to bake in (SVC_HTTP_URL). e.g. https://codespace-8080.app.github.dev")
-  .option("--pack",                      "strip + UPX compress the binary (100MB → 25MB)", false)
   .addHelpText("after", `
 Examples:
   # Simple mode (just compile, no key baking):
@@ -236,7 +235,6 @@ Examples:
     beaconId?: string; source: string; relay: string[];
     target?: string; randomTitle: boolean; appId?: string; installationId?: string;
     codespaceName?: string; githubUser?: string; tentaclePriority?: string; grpcUrl?: string; httpUrl?: string;
-    pack: boolean;
   }) => {
     // Simple mode: --output (or --output + --platform) — no key baking, just bun build
     if (opts.output !== undefined) {
@@ -270,7 +268,6 @@ Examples:
       ...(opts.tentaclePriority !== undefined && { tentaclePriority: opts.tentaclePriority }),
       ...(opts.grpcUrl          !== undefined && { grpcUrl:          opts.grpcUrl }),
       ...(opts.httpUrl          !== undefined && { httpUrl:          opts.httpUrl }),
-      pack: opts.pack,
     }).catch(fatal);
   });
 
