@@ -363,7 +363,7 @@ function HeroSection() {
     >
       <div style={{ marginBottom: '1.5rem', display: 'flex', justifyContent: 'center' }}>
         <img
-          src="/logo.png"
+          src={`${import.meta.env.BASE_URL}logo.png`}
           alt="OctoC2 logo"
           width="180"
           style={{ filter: 'drop-shadow(0 0 16px rgba(0,240,255,0.5))' }}
