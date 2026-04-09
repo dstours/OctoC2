@@ -228,6 +228,7 @@ export async function runBuildBeacon(opts: BuildBeaconOptions): Promise<void> {
       "--compile",
       "--minify",
       "--sourcemap=none",
+      '--compile-exec-argv=--smol',
       `--target=${opts.target}`,
       "--external=cpu-features",
       ...defineArgs,
