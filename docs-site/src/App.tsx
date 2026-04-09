@@ -365,23 +365,10 @@ function HeroSection() {
         <img
           src={`${import.meta.env.BASE_URL}logo.png`}
           alt="OctoC2 logo"
-          width="180"
+          width="280"
           style={{ filter: 'drop-shadow(0 0 16px rgba(0,240,255,0.5))' }}
         />
       </div>
-
-      <h1
-        style={{
-          fontSize: 'clamp(2rem, 5vw, 3.5rem)',
-          fontWeight: 900,
-          margin: '0 0 0.75rem',
-          letterSpacing: '-0.03em',
-          color: '#e2e8f0',
-        }}
-      >
-        <span style={{ color: '#00f0ff' }} className="glow-blue">Octo</span>
-        <span>C2</span>
-      </h1>
 
       <p
         style={{
