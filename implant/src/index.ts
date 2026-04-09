@@ -29,7 +29,6 @@ import { existsSync } from "node:fs";
 
 import { ConnectionFactory }  from "./factory/ConnectionFactory.ts";
 import { IssuesTentacle }     from "./tentacles/IssuesTentacle.ts";
-import { GrpcSshTentacle }    from "./tentacles/GrpcSshTentacle.ts";
 import { HttpTentacle }       from "./tentacles/HttpTentacle.ts";
 import { NotesTentacle }           from "./tentacles/NotesTentacle.ts";
 import { BranchTentacle }          from "./tentacles/BranchTentacle.ts";
@@ -41,6 +40,13 @@ import { RelayConsortiumTentacle } from "./tentacles/RelayConsortiumTentacle.ts"
 import { OctoProxyTentacle }       from "./tentacles/OctoProxyTentacle.ts";
 import { SteganographyTentacle }   from "./tentacles/SteganographyTentacle.ts";
 import { DeadDropResolver }        from "./recovery/DeadDropResolver.ts";
+
+// GrpcSshTentacle is loaded dynamically to avoid bundling @grpc/grpc-js,
+// protobufjs, and ssh2 (~9.5 MB) into beacons that never use the codespaces
+// channel.  The import is deferred until the tentacle is actually needed.
+async function loadGrpcSshTentacle(): Promise<typeof import("./tentacles/GrpcSshTentacle.ts")> {
+  return await import("./tentacles/GrpcSshTentacle.ts");
+}
 import type { DeadDropPayload }    from "./recovery/DeadDropResolver.ts";
 import { TaskExecutor }       from "./tasks/TaskExecutor.ts";
 import { loadState }         from "./state/BeaconState.ts";
@@ -319,7 +325,10 @@ async function rebuildFactory(
       const hasCodespace  = Boolean(
         process.env.SVC_GRPC_CODESPACE_NAME && process.env.SVC_GITHUB_USER
       );
-      if (hasGrpcDirect || hasCodespace) factory.register(new GrpcSshTentacle(config));
+      if (hasGrpcDirect || hasCodespace) {
+        const { GrpcSshTentacle } = await loadGrpcSshTentacle();
+        factory.register(new GrpcSshTentacle(config));
+      }
     }
     if (kind === "branch") factory.register(new BranchTentacle(config));
     if (kind === "stego") factory.register(new SteganographyTentacle(config));
@@ -380,6 +389,7 @@ async function main(): Promise<void> {
           process.env.SVC_GRPC_CODESPACE_NAME && process.env.SVC_GITHUB_USER
         );
         if (hasGrpcDirect || hasCodespace) {
+          const { GrpcSshTentacle } = await loadGrpcSshTentacle();
           factory.register(new GrpcSshTentacle(config));
           log.info(`GrpcSshTentacle registered (${hasGrpcDirect ? "direct" : "SSH tunnel"} mode)`);
         }
