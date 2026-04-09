@@ -46,6 +46,7 @@ coverage/
 # Editor / OS / Claude Code
 .vscode-test/
 .superpowers/
+docs/superpowers/
 .claude/
 *.Zone.Identifier
 .DS_Store
