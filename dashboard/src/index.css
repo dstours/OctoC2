@@ -1,0 +1,186 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* ── OctoC2 brand palette ───────────────────────────── */
+    --octo-blue:        #00f0ff;
+    --octo-blue-glow:   #00f0ff66;
+    --octo-red:         #ff0033;
+    --octo-red-glow:    #ff003366;
+    --octo-black:       #05050f;
+    --octo-surface:     #0d0d1a;
+    --octo-card:        #12121f;
+    --octo-border:      #1e1e3a;
+    --octo-text:        #e2e8f0;
+    --octo-muted:       #4a5568;
+
+    /* ── shadcn CSS vars — dark cyberpunk mapping ───────── */
+    --background:          240 50% 4%;      /* #05050f */
+    --foreground:          214 32% 91%;     /* #e2e8f0 */
+
+    --card:                240 27% 10%;     /* #12121f */
+    --card-foreground:     214 32% 91%;
+
+    --popover:             240 27% 10%;
+    --popover-foreground:  214 32% 91%;
+
+    --primary:             184 100% 50%;    /* #00f0ff neon cyan-blue */
+    --primary-foreground:  240 50% 4%;
+
+    --secondary:           240 32% 17%;     /* #1e1e3a */
+    --secondary-foreground:214 32% 91%;
+
+    --muted:               240 32% 17%;
+    --muted-foreground:    218 17% 35%;     /* #4a5568 */
+
+    --accent:              348 100% 50%;    /* #ff0033 neon red */
+    --accent-foreground:   214 32% 91%;
+
+    --destructive:         348 100% 50%;
+    --destructive-foreground: 214 32% 91%;
+
+    --border:              240 32% 17%;     /* #1e1e3a */
+    --input:               240 32% 17%;
+    --ring:                184 100% 50%;    /* #00f0ff */
+
+    --radius: 0.375rem;
+  }
+}
+
+/* ── Base styles ─────────────────────────────────────────── */
+body {
+  background-color: var(--octo-black);
+  color: var(--octo-text);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Circuit-grid background pattern (pure CSS, no images) ── */
+.bg-circuit {
+  background-color: var(--octo-black);
+  background-image:
+    /* horizontal lines */
+    linear-gradient(0deg,   transparent 24%, rgba(0, 240, 255, 0.05) 25%, rgba(0, 240, 255, 0.05) 26%, transparent 27%, transparent 74%, rgba(0, 240, 255, 0.05) 75%, rgba(0, 240, 255, 0.05) 76%, transparent 77%),
+    /* vertical lines */
+    linear-gradient(90deg,  transparent 24%, rgba(0, 240, 255, 0.05) 25%, rgba(0, 240, 255, 0.05) 26%, transparent 27%, transparent 74%, rgba(0, 240, 255, 0.05) 75%, rgba(0, 240, 255, 0.05) 76%, transparent 77%);
+  background-size: 48px 48px;
+}
+
+/* ── Login page background — pure #05050f + depth bloom behind logo ── */
+/* Radial gradient adds subtle dimensionality without competing with the logo.  */
+/* No grid lines — they draw the eye away from the focal point.               */
+.bg-login {
+  background-color: #05050f;
+  background-image: radial-gradient(
+    ellipse 640px 480px at 50% 30%,
+    rgba(0, 240, 255, 0.045) 0%,
+    transparent 70%
+  );
+}
+
+/* ── Neon glow effects ────────────────────────────────────── */
+.glow-blue {
+  text-shadow: 0 0 8px var(--octo-blue-glow), 0 0 20px var(--octo-blue-glow);
+  box-shadow:  0 0 8px var(--octo-blue-glow), 0 0 20px var(--octo-blue-glow);
+}
+
+.glow-red {
+  text-shadow: 0 0 8px var(--octo-red-glow), 0 0 20px var(--octo-red-glow);
+  box-shadow:  0 0 8px var(--octo-red-glow), 0 0 20px var(--octo-red-glow);
+}
+
+.border-glow-blue {
+  border-color: var(--octo-blue);
+  box-shadow: 0 0 6px var(--octo-blue-glow);
+}
+
+.border-glow-red {
+  border-color: var(--octo-red);
+  box-shadow: 0 0 6px var(--octo-red-glow);
+}
+
+/* ── Scan-line overlay (optional, add class to root div) ──── */
+.scanlines::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.08) 2px,
+    rgba(0, 0, 0, 0.08) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── Status dot colours (used in BeaconStatusDot) ────────── */
+.dot-active  { background-color: #22c55e; }
+.dot-stale   { background-color: #eab308; }
+.dot-dead    { background-color: var(--octo-red); }
+
+/* ── Logo ambient breath (login page hero) ──────────────── */
+/* Barely-there: rests at 2px/10%, drifts to 7px/25% over 5s.                */
+/* Real RGBA PNG means drop-shadow follows the emblem silhouette exactly.     */
+@keyframes logo-breath {
+  0%, 100% { filter: drop-shadow(0 0 4px rgba(0, 240, 255, 0.20)); }
+  50%       { filter: drop-shadow(0 0 18px rgba(0, 240, 255, 0.60))
+                      drop-shadow(0 0 40px rgba(0, 240, 255, 0.20)); }
+}
+
+.logo-pulse {
+  animation: logo-breath 5s ease-in-out infinite;
+}
+
+/* ── Logo hover glow (topbar icon) ───────────────────────── */
+.logo-glow-hover {
+  transition: filter 200ms ease;
+}
+.logo-glow-hover:hover {
+  filter: drop-shadow(0 0 8px rgba(0, 240, 255, 0.45));
+}
+
+
+/* ── Login card — neon hairline border + floating elevation ── */
+/* Hairline border at low opacity: visible enough to frame, quiet enough to   */
+/* not compete with the logo. Two-layer shadow gives natural float depth.     */
+.card-neon {
+  border: 1px solid rgba(0, 240, 255, 0.09);
+  box-shadow:
+    0 0 0 1px rgba(0, 240, 255, 0.03),
+    0 4px 24px rgba(0, 0, 0, 0.65),
+    0 16px 64px rgba(0, 0, 0, 0.85),
+    inset 0 1px 0 rgba(0, 240, 255, 0.03);
+}
+
+/* ── Connect button — neon lift on hover ─────────────────── */
+.btn-connect {
+  background: #00f0ff;
+  color: #05050f;
+  font-weight: 700;
+  transition: box-shadow 150ms ease, transform 150ms ease;
+}
+.btn-connect:hover:not(:disabled) {
+  box-shadow: 0 0 18px rgba(0, 240, 255, 0.5), 0 0 40px rgba(0, 240, 255, 0.2);
+  transform: translateY(-1px);
+}
+.btn-connect:active:not(:disabled) {
+  transform: translateY(0);
+}
+.btn-connect:disabled {
+  background: #1e1e3a;
+  color: #4a5568;
+  cursor: not-allowed;
+}
+.btn-connect:focus-visible {
+  outline: 2px solid rgba(0, 240, 255, 0.6);
+  outline-offset: 2px;
+}
+
+/* ── Topbar inset glow — thin neon line at bottom of header ── */
+.header-inset-glow {
+  box-shadow: inset 0 -1px 0 rgba(0, 240, 255, 0.08);
+}

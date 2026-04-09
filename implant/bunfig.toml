@@ -1,0 +1,9 @@
+# implant — Bun configuration
+# Force CJS condition so libsodium-wrappers resolves to dist/modules/*.js
+# instead of the broken ESM entrypoint (dist/modules-esm/*.mjs imports ./libsodium.mjs
+# which does not exist in the installed package).
+[build]
+conditions = ["require", "node", "default"]
+
+[test]
+conditions = ["require", "node", "default"]

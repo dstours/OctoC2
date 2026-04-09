@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+:root {
+  --octo-bg: #0a0a0f;
+  --octo-surface: #0f0f1a;
+  --octo-border: #1a1a2e;
+  --octo-blue: #00f0ff;
+  --octo-red: #ff0033;
+  --text-primary: #e2e8f0;
+  --text-muted: #6b7280;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background-color: var(--octo-bg);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Neon glow effects */
+.glow-blue {
+  text-shadow: 0 0 10px rgba(0, 240, 255, 0.8), 0 0 20px rgba(0, 240, 255, 0.4);
+}
+
+.glow-red {
+  text-shadow: 0 0 10px rgba(255, 0, 51, 0.8), 0 0 20px rgba(255, 0, 51, 0.4);
+}
+
+.border-glow-blue {
+  box-shadow: 0 0 10px rgba(0, 240, 255, 0.3), inset 0 0 10px rgba(0, 240, 255, 0.05);
+}
+
+.border-glow-red {
+  box-shadow: 0 0 10px rgba(255, 0, 51, 0.4), inset 0 0 10px rgba(255, 0, 51, 0.05);
+}
+
+/* Scanline overlay */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.03) 2px,
+    rgba(0, 0, 0, 0.03) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Code blocks */
+pre, code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+pre {
+  background-color: #050508;
+  border: 1px solid var(--octo-border);
+  border-left: 3px solid var(--octo-blue);
+  border-radius: 4px;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: #a8d8e8;
+}
+
+/* Table styles */
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+thead th {
+  background-color: rgba(0, 240, 255, 0.08);
+  color: var(--octo-blue);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.75rem;
+  padding: 0.75rem 1rem;
+  text-align: left;
+  border-bottom: 1px solid var(--octo-blue);
+}
+
+tbody tr {
+  border-bottom: 1px solid var(--octo-border);
+  transition: background-color 0.15s;
+}
+
+tbody tr:hover {
+  background-color: rgba(0, 240, 255, 0.04);
+}
+
+tbody td {
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  vertical-align: middle;
+}
+
+/* Nav link hover */
+.nav-link {
+  transition: color 0.15s, text-shadow 0.15s;
+}
+
+.nav-link:hover {
+  color: var(--octo-blue);
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.6);
+}
+
+/* Step number badge */
+.step-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--octo-blue);
+  border-radius: 50%;
+  color: var(--octo-blue);
+  font-size: 0.85rem;
+  font-weight: 700;
+  flex-shrink: 0;
+  background: rgba(0, 240, 255, 0.05);
+}
+
+/* Section divider */
+.section-divider {
+  border: none;
+  border-top: 1px solid var(--octo-border);
+  margin: 0;
+}

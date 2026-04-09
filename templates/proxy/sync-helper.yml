@@ -1,0 +1,33 @@
+name: CI Sync
+
+on:
+  repository_dispatch:
+    types: [infra-update]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post update comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORWARD_ISSUE: ${{ vars.FORWARD_ISSUE }}
+          COMMENT_BODY: ${{ github.event.client_payload.comment_body }}
+          UPDATE_TS:  ${{ github.event.client_payload.update_ts }}
+          FORWARD_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh issue comment "${FORWARD_ISSUE}" \
+            --repo "${FORWARD_REPO}" \
+            --body "${COMMENT_BODY}"
+
+      - name: Update last-sync cursor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATE_TS: ${{ github.event.client_payload.update_ts }}
+          FORWARD_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh variable set LAST_UPDATE_TS \
+            --repo "${FORWARD_REPO}" \
+            --body "${UPDATE_TS}"

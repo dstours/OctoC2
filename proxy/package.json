@@ -1,0 +1,17 @@
+{
+  "name": "@octoc2/proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OctoProxy — decoy repository system for traffic obfuscation",
+  "scripts": {
+    "dev":   "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --compile --target=bun-linux-x64 --outfile dist/octoproxy"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0"
+  },
+  "devDependencies": {
+    "typescript": "*"
+  }
+}

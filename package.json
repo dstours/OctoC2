@@ -1,0 +1,33 @@
+{
+  "name": "octoc2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub-Native Octopus Command & Control Framework",
+  "workspaces": ["implant", "server", "dashboard", "octoctl", "proxy"],
+  "scripts": {
+    "build": "bun run --filter='*' build",
+    "build:implant": "cd implant   && bun run build",
+    "build:server": "cd server    && bun run build",
+    "build:dashboard": "cd dashboard && bun run build",
+    "build:octoctl": "cd octoctl   && bun run build",
+    "dev:server": "cd server    && bun run dev",
+    "dev:dashboard": "cd dashboard && bun run dev",
+    "dashboard:dev": "cd dashboard && bun run dev",
+    "dev:octoctl": "cd octoctl   && bun run dev",
+    "proto:gen": "bash scripts/proto-gen.sh",
+    "lint": "eslint . --ext .ts,.tsx"
+  },
+  "devDependencies": {
+    "@types/libsodium-wrappers": "0.7.13",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/proto-loader": "^0.8.0"
+  }
+}

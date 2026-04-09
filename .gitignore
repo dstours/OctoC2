@@ -1,0 +1,52 @@
+# ── Security-critical — never commit ──────────────────────────────────────────
+# Operator secrets, tokens, private keys
+*.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ── OctoC2 runtime data ───────────────────────────────────────────────────────
+# Beacon registry, proxy configs, operator state — generated at runtime
+data/
+
+# E2E test output logs (may contain partial token previews)
+e2e-*.log
+*.log
+
+# ── Build artefacts ───────────────────────────────────────────────────────────
+dist/
+node_modules/
+
+# Generated proto TypeScript bindings (regenerate: bun run proto:gen)
+server/src/proto/
+implant/src/proto/
+
+# ── Tooling ───────────────────────────────────────────────────────────────────
+# Bun
+bun.lockb
+.act/
+
+# Vite / bundler cache
+.cache/
+.parcel-cache/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Editor / OS / Claude Code
+.vscode-test/
+.superpowers/
+.claude/
+*.Zone.Identifier
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir":  "dist",
+    "types":   ["bun-types"],
+    // Bun handles .ts extension resolution at runtime; enable for tsc type-checking
+    "allowImportingTsExtensions": true,
+    // When allowImportingTsExtensions is true, tsc cannot emit — Bun handles builds
+    "noEmit": true
+  },
+  "include": ["src/**/*"]
+}

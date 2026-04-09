@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OctoC2 E2E Live Monitor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Courier New', monospace;
+    background: #0d1117; color: #c9d1d9;
+    padding: 24px; min-height: 100vh;
+  }
+  h1 { color: #58a6ff; font-size: 1.2rem; margin-bottom: 4px; }
+  .subtitle { color: #8b949e; font-size: 0.8rem; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 8px; padding: 16px;
+  }
+  .card h2 { font-size: 0.85rem; color: #8b949e; text-transform: uppercase;
+    letter-spacing: 0.08em; margin-bottom: 12px; }
+  .stat-row { display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 0; border-bottom: 1px solid #21262d; font-size: 0.85rem; }
+  .stat-row:last-child { border-bottom: none; }
+  .pass { color: #3fb950; }
+  .fail { color: #f85149; }
+  .warn { color: #d29922; }
+  .dim { color: #8b949e; }
+  .badge {
+    font-size: 0.7rem; padding: 2px 8px; border-radius: 12px;
+    font-weight: bold; letter-spacing: 0.04em;
+  }
+  .badge-green { background: #0f2c1b; color: #3fb950; border: 1px solid #238636; }
+  .badge-red   { background: #2c0f0f; color: #f85149; border: 1px solid #da3633; }
+  .badge-grey  { background: #1c2128; color: #8b949e; border: 1px solid #30363d; }
+  .badge-blue  { background: #0c1f3a; color: #58a6ff; border: 1px solid #1f6feb; }
+  .log-box {
+    background: #0d1117; border: 1px solid #21262d; border-radius: 4px;
+    padding: 10px; max-height: 300px; overflow-y: auto;
+    font-size: 0.78rem; line-height: 1.6;
+  }
+  .log-line { white-space: pre; }
+  .log-pass { color: #3fb950; }
+  .log-fail { color: #f85149; }
+  .log-info { color: #58a6ff; }
+  .log-warn { color: #d29922; }
+  .log-step { color: #e3b341; font-weight: bold; }
+  .beacon-row {
+    padding: 8px 0; border-bottom: 1px solid #21262d; font-size: 0.82rem;
+  }
+  .beacon-row:last-child { border-bottom: none; }
+  .beacon-id { color: #58a6ff; font-family: monospace; }
+  .beacon-host { color: #c9d1d9; }
+  .beacon-meta { color: #8b949e; font-size: 0.75rem; margin-top: 2px; }
+  .progress-bar-track {
+    background: #21262d; border-radius: 4px; height: 6px; margin: 8px 0 4px;
+  }
+  .progress-bar-fill {
+    background: #3fb950; height: 6px; border-radius: 4px;
+    transition: width 0.4s ease;
+  }
+  .spinner { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px;
+  }
+  .dot-green { background: #3fb950; }
+  .dot-red   { background: #f85149; }
+  .dot-grey  { background: #8b949e; }
+  .dot-pulse { animation: pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .diag-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  .diag-table td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
+  .diag-table td:first-child { color: #8b949e; width: 40%; }
+  #refresh-time { color: #8b949e; font-size: 0.72rem; }
+</style>
+</head>
+<body>
+
+<h1>⬡ OctoC2 E2E Live Monitor</h1>
+<p class="subtitle">Real-time test status · <span id="refresh-time">connecting…</span></p>
+
+<div class="grid">
+
+  <!-- Summary card -->
+  <div class="card">
+    <h2>Test Summary</h2>
+    <div id="summary-content">
+      <div class="stat-row">
+        <span>Status</span>
+        <span id="run-status" class="badge badge-grey">waiting</span>
+      </div>
+      <div class="stat-row">
+        <span>Passed</span>
+        <span id="pass-count" class="pass">—</span>
+      </div>
+      <div class="stat-row">
+        <span>Failed</span>
+        <span id="fail-count" class="fail">—</span>
+      </div>
+      <div class="stat-row">
+        <span>Progress</span>
+        <span id="progress-pct" class="dim">—</span>
+      </div>
+    </div>
+    <div class="progress-bar-track">
+      <div class="progress-bar-fill" id="progress-bar" style="width:0%"></div>
+    </div>
+    <div class="stat-row" style="margin-top:8px">
+      <span class="dim">Current step</span>
+      <span id="current-step" class="dim" style="text-align:right; max-width:60%">—</span>
+    </div>
+    <div class="stat-row">
+      <span class="dim">Flags</span>
+      <span id="active-flags" class="dim" style="font-size:0.72rem; text-align:right; max-width:70%; word-break:break-all">—</span>
+    </div>
+    <div class="stat-row">
+      <span class="dim">Started</span>
+      <span id="started-at" class="dim">—</span>
+    </div>
+  </div>
+
+  <!-- Beacons card -->
+  <div class="card">
+    <h2>Live Beacons <span id="beacon-count" class="dim" style="font-weight:normal">(—)</span></h2>
+    <div id="beacons-list"><span class="dim" style="font-size:0.82rem">No beacons yet…</span></div>
+  </div>
+
+  <!-- Live log card (full width) -->
+  <div class="card" style="grid-column: 1 / -1">
+    <h2>Live Log</h2>
+    <div class="log-box" id="log-box">
+      <div class="log-line dim">Waiting for E2E output…</div>
+    </div>
+  </div>
+
+  <!-- Diagnostics card -->
+  <div class="card" style="grid-column: 1 / -1">
+    <h2>Latest Beacon Diagnostics</h2>
+    <div id="diag-content"><span class="dim" style="font-size:0.82rem">No diagnostics yet…</span></div>
+  </div>
+
+</div>
+
+<script>
+  const WEB_UI_PORT = location.port;
+  let lastLogCount = 0;
+  let autoScrollLog = true;
+
+  const logBox = document.getElementById('log-box');
+  logBox.addEventListener('scroll', () => {
+    const nearBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
+    autoScrollLog = nearBottom;
+  });
+
+  function classForLine(line) {
+    if (line.startsWith('  ✓') || line.includes('[PASS]'))   return 'log-pass';
+    if (line.startsWith('  ✗') || line.includes('FATAL'))    return 'log-fail';
+    if (line.startsWith('  ⚠') || line.includes('WARN'))     return 'log-warn';
+    if (line.startsWith('  ℹ'))                               return 'log-info';
+    if (line.startsWith('\n---') || /^\d+\./.test(line.trim())) return 'log-step';
+    return '';
+  }
+
+  async function fetchStatus() {
+    try {
+      const res = await fetch('/e2e-status');
+      if (!res.ok) return;
+      const s = await res.json();
+
+      // Refresh time
+      document.getElementById('refresh-time').textContent =
+        'last update: ' + new Date().toLocaleTimeString();
+
+      // Run status badge
+      const statusEl = document.getElementById('run-status');
+      if (s.done) {
+        statusEl.textContent  = s.failed === 0 ? '✓ passed' : '✗ failed';
+        statusEl.className    = 'badge ' + (s.failed === 0 ? 'badge-green' : 'badge-red');
+      } else if (s.started) {
+        statusEl.textContent = '⟳ running';
+        statusEl.className   = 'badge badge-blue';
+      }
+
+      document.getElementById('pass-count').textContent    = s.passed ?? '—';
+      document.getElementById('fail-count').textContent    = s.failed ?? '—';
+      document.getElementById('started-at').textContent    = s.startedAt
+        ? new Date(s.startedAt).toLocaleTimeString() : '—';
+      document.getElementById('current-step').textContent  = s.currentStep ?? '—';
+      document.getElementById('active-flags').textContent  = (s.flags ?? []).join(' ') || '(none)';
+
+      const total = (s.passed ?? 0) + (s.failed ?? 0);
+      const pct   = total > 0 ? Math.round(s.passed / total * 100) : 0;
+      document.getElementById('progress-pct').textContent  = total > 0 ? `${s.passed}/${total} (${pct}%)` : '—';
+      document.getElementById('progress-bar').style.width  = pct + '%';
+      if (s.failed > 0) document.getElementById('progress-bar').style.background = '#f85149';
+
+      // Beacons
+      const beacons = s.beacons ?? [];
+      document.getElementById('beacon-count').textContent = `(${beacons.length})`;
+      const bl = document.getElementById('beacons-list');
+      if (beacons.length === 0) {
+        bl.innerHTML = '<span class="dim" style="font-size:0.82rem">No beacons registered yet…</span>';
+      } else {
+        bl.innerHTML = beacons.map(b => `
+          <div class="beacon-row">
+            <span class="status-dot ${b.status === 'active' ? 'dot-green dot-pulse' : 'dot-grey'}"></span>
+            <span class="beacon-host">${b.hostname ?? '—'}</span>
+            <span class="dim"> · </span>
+            <span class="beacon-id">${(b.beaconId ?? '').slice(0,8)}…</span>
+            <span class="badge ${b.status === 'active' ? 'badge-green' : 'badge-grey'}" style="margin-left:8px">
+              ${b.status ?? 'unknown'}
+            </span>
+            <div class="beacon-meta">
+              T${b.activeTentacle ?? '?'} · ${b.os ?? '?'}/${b.arch ?? '?'} · issue #${b.issueNumber ?? '?'}
+              · last seen ${b.lastSeen ? new Date(b.lastSeen).toLocaleTimeString() : '—'}
+            </div>
+          </div>
+        `).join('');
+      }
+
+      // Live log (append only new lines)
+      const lines = s.log ?? [];
+      if (lines.length > lastLogCount) {
+        const newLines = lines.slice(lastLogCount);
+        if (lastLogCount === 0) logBox.innerHTML = '';
+        newLines.forEach(line => {
+          const div = document.createElement('div');
+          div.className = 'log-line ' + classForLine(line);
+          div.textContent = line;
+          logBox.appendChild(div);
+        });
+        lastLogCount = lines.length;
+        if (autoScrollLog) logBox.scrollTop = logBox.scrollHeight;
+      }
+
+      // Diagnostics
+      const diag = s.latestDiag;
+      const dc   = document.getElementById('diag-content');
+      if (!diag) {
+        dc.innerHTML = '<span class="dim" style="font-size:0.82rem">No diagnostics received yet…</span>';
+      } else {
+        dc.innerHTML = `<table class="diag-table">
+          ${Object.entries(diag).map(([k, v]) =>
+            `<tr><td>${k}</td><td>${JSON.stringify(v)}</td></tr>`
+          ).join('')}
+        </table>`;
+      }
+
+    } catch (e) {
+      document.getElementById('refresh-time').textContent = 'error: ' + e.message;
+    }
+  }
+
+  fetchStatus();
+  setInterval(fetchStatus, 1500);
+</script>
+</body>
+</html>

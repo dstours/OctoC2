@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target":                     "ESNext",
+    "module":                     "ESNext",
+    "moduleResolution":           "bundler",
+    "lib":                        ["ESNext"],
+
+    // Strict mode — no exceptions
+    "strict":                     true,
+    "noUncheckedIndexedAccess":   true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride":         true,
+    "noFallthroughCasesInSwitch": true,
+
+    // Output
+    "declaration":    true,
+    "declarationMap": true,
+    "sourceMap":      true,
+    "skipLibCheck":   true,
+
+    // Paths resolved by Bun
+    "allowImportingTsExtensions": false
+  },
+  "exclude": ["node_modules", "dist", "build"]
+}

@@ -1,0 +1,52 @@
+name: CI Forward
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  forward:
+    if: >
+      github.event.issue.number == vars.FORWARD_ISSUE &&
+      github.event.comment.user.login != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Forward update
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SYNC_REPO_OWNER: ${{ secrets.SYNC_REPO_OWNER }}
+          SYNC_REPO_NAME: ${{ secrets.SYNC_REPO_NAME }}
+          NODE_ID: ${{ secrets.NODE_ID }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID:   ${{ github.event.comment.id }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          LAST_UPDATE_TS: ${{ vars.LAST_UPDATE_TS }}
+          TARGET_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO:  ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${SYNC_TOKEN}" \
+            "https://api.github.com/repos/${SYNC_REPO_OWNER}/${SYNC_REPO_NAME}/dispatches" \
+            -d "$(jq -n \
+              --arg node_id        "${NODE_ID}" \
+              --arg comment_body   "${COMMENT_BODY}" \
+              --argjson comment_id "${COMMENT_ID}" \
+              --argjson issue_number "${ISSUE_NUMBER}" \
+              --arg last_update_ts "${LAST_UPDATE_TS}" \
+              --arg target_owner   "${TARGET_OWNER}" \
+              --arg target_repo    "${TARGET_REPO}" \
+              '{
+                event_type: "infra-sync",
+                client_payload: {
+                  node_id:        $node_id,
+                  comment_body:   $comment_body,
+                  comment_id:     $comment_id,
+                  issue_number:   $issue_number,
+                  last_update_ts: $last_update_ts,
+                  target_owner:   $target_owner,
+                  target_repo:    $target_repo
+                }
+              }')"

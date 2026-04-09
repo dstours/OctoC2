@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir":  "dist",
+    // Keep output small — no lib dom, just node/bun types
+    "types": ["bun-types"],
+    // Bun handles .ts extension resolution; enable for tsc type-checking
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*"]
+}

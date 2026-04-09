@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "target":    "ES2020",
+    "lib":       ["ES2020", "DOM", "DOM.Iterable"],
+    "module":    "ESNext",
+    "jsx":       "react-jsx",
+    "rootDir":   "src",
+    "noEmit":    true,
+    "types":     ["vite/client"],
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*"]
+}

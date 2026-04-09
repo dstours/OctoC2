@@ -1,0 +1,13 @@
+# OctoC2 — Bun workspace configuration
+
+[build]
+# Force CJS resolution for packages whose ESM entrypoints have Bun compatibility issues.
+# libsodium-wrappers ESM (dist/modules-esm/*.mjs) imports ./libsodium.mjs which
+# doesn't exist in the package — the CJS path (dist/modules/*.js) works correctly.
+conditions = ["require", "node", "default"]
+
+[test]
+# Force CJS resolution for packages whose ESM entrypoints have Bun compatibility issues.
+# libsodium-wrappers ESM (dist/modules-esm/*.mjs) imports ./libsodium.mjs which
+# doesn't exist in the package — the CJS path (dist/modules/*.js) works correctly.
+conditions = ["require", "node", "default"]

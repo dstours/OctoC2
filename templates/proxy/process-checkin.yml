@@ -1,0 +1,64 @@
+name: CI Update
+
+on:
+  repository_dispatch:
+    types: [infra-sync]
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch and relay pending updates
+        env:
+          MAIN_TOKEN:        ${{ secrets.MAIN_TOKEN }}
+          MAIN_REPO_OWNER:   ${{ secrets.MAIN_REPO_OWNER }}
+          MAIN_REPO_NAME:    ${{ secrets.MAIN_REPO_NAME }}
+          NODE_ISSUE_MAP:    ${{ secrets.NODE_ISSUE_MAP }}
+          TARGET_TOKEN:      ${{ secrets.TARGET_TOKEN }}
+          NODE_ID:           ${{ github.event.client_payload.node_id }}
+          TARGET_OWNER:      ${{ github.event.client_payload.target_owner }}
+          TARGET_REPO:       ${{ github.event.client_payload.target_repo }}
+          LAST_UPDATE_TS:    ${{ github.event.client_payload.last_update_ts }}
+        run: |
+          set -euo pipefail
+          # Resolve main issue number for this node
+          ISSUE_NUMBER=$(echo "${NODE_ISSUE_MAP}" | jq -r --arg id "${NODE_ID}" '.[$id]')
+          if [ "${ISSUE_NUMBER}" = "null" ] || [ -z "${ISSUE_NUMBER}" ]; then
+            echo "Unknown node ${NODE_ID}, skipping"
+            exit 0
+          fi
+
+          # Fetch comments from the main issue newer than last sync
+          COMMENTS=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${MAIN_TOKEN}" \
+            "https://api.github.com/repos/${MAIN_REPO_OWNER}/${MAIN_REPO_NAME}/issues/${ISSUE_NUMBER}/comments?per_page=100&sort=created&direction=asc" \
+            | jq --arg since "${LAST_UPDATE_TS}" \
+                '[.[] | select(.created_at > $since)]')
+
+          COUNT=$(echo "${COMMENTS}" | jq length)
+          if [ "${COUNT}" = "0" ]; then
+            echo "No new updates for ${NODE_ID}"
+            exit 0
+          fi
+
+          # Forward each update comment to the target repo
+          echo "${COMMENTS}" | jq -c '.[]' | while read -r comment; do
+            BODY=$(echo "${comment}" | jq -r '.body')
+            UPDATE_TS=$(echo "${comment}" | jq -r '.created_at')
+            curl -fsSL \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${TARGET_TOKEN}" \
+              "https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/dispatches" \
+              -d "$(jq -n \
+                --arg comment_body "${BODY}" \
+                --arg update_ts     "${UPDATE_TS}" \
+                '{
+                  event_type: "infra-update",
+                  client_payload: {
+                    comment_body: $comment_body,
+                    update_ts:    $update_ts
+                  }
+                }')"
+          done

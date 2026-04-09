@@ -1,0 +1,68 @@
+# OctoC2 Mega E2E — full suite with all tentacles and optional components
+name: E2E Mega Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_proxy:
+        description: 'Enable proxy tentacle'
+        required: false
+        default: false
+        type: boolean
+      run_openhulud:
+        description: 'Enable OpenHulud'
+        required: false
+        default: false
+        type: boolean
+      run_bulk:
+        description: 'Enable bulk shell test'
+        required: false
+        default: true
+        type: boolean
+      run_app_key:
+        description: 'Enable GitHub App auth'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  e2e-mega:
+    runs-on: ubuntu-latest
+    env:
+      OCTOC2_GITHUB_TOKEN:    ${{ secrets.OCTOC2_GITHUB_TOKEN }}
+      OCTOC2_REPO_OWNER:      ${{ secrets.OCTOC2_REPO_OWNER }}
+      OCTOC2_REPO_NAME:       ${{ secrets.OCTOC2_REPO_NAME }}
+      OCTOC2_OPERATOR_SECRET: ${{ secrets.OCTOC2_OPERATOR_SECRET }}
+      OCTOC2_APP_ID:          ${{ secrets.OCTOC2_APP_ID }}
+      OCTOC2_INSTALLATION_ID: ${{ secrets.OCTOC2_INSTALLATION_ID }}
+      OCTOC2_APP_PRIVATE_KEY: ${{ secrets.OCTOC2_APP_PRIVATE_KEY }}
+      OCTOC2_PROXY_REPOS:     ${{ secrets.OCTOC2_PROXY_REPOS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: E2E — mega suite
+        run: |
+          CMD="bun run scripts/test-end-to-end.ts"
+          CMD="$CMD --notes --gist --branch --actions --secrets --maintenance --stego --pages --fingerprint --cleanup"
+          if [ "${{ inputs.run_proxy }}" = "true" ]; then
+            CMD="$CMD --proxy"
+          fi
+          if [ "${{ inputs.run_openhulud }}" = "true" ]; then
+            CMD="$CMD --openhulud"
+          fi
+          if [ "${{ inputs.run_bulk }}" = "true" ]; then
+            CMD="$CMD --bulk"
+          fi
+          if [ "${{ inputs.run_app_key }}" = "true" ]; then
+            CMD="$CMD --app-key"
+          fi
+          echo "Running: $CMD"
+          eval "$CMD"

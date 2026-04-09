@@ -1,0 +1,82 @@
+{
+  "name": "OctoC2",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "USERNAME": "vscode"
+    }
+  },
+
+  // ── Devcontainer Features ──────────────────────────────────────────────────
+  "features": {
+    // GitHub CLI (authenticated via GITHUB_TOKEN / gh auth login)
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    // SSH server — required for gRPC-over-SSH tunnel tentacle
+    "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" }
+  },
+
+  // ── Port forwarding ────────────────────────────────────────────────────────
+  // These mirror Codespaces port mappings exactly
+  "forwardPorts": [5173, 8080, 50051, 2222],
+  "portsAttributes": {
+    "5173":  { "label": "Operator Dashboard (Vite)", "onAutoForward": "openBrowser", "protocol": "http" },
+    "8080":  { "label": "Operator API",               "onAutoForward": "notify" },
+    "50051": { "label": "gRPC Server",                 "onAutoForward": "silent" },
+    "2222":  { "label": "SSH Tunnel",                  "onAutoForward": "silent" }
+  },
+
+  // ── Lifecycle hooks ────────────────────────────────────────────────────────
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  // Auto-start dashboard on Codespace resume; operator can open it immediately
+  "postStartCommand": "cd dashboard && bun run dev -- --host 0.0.0.0 &",
+
+  // ── Container user ─────────────────────────────────────────────────────────
+  "remoteUser": "vscode",
+
+  // ── Environment ────────────────────────────────────────────────────────────
+  "containerEnv": {
+    "BUN_INSTALL": "/home/vscode/.bun",
+    "PATH": "/home/vscode/.bun/bin:${PATH}"
+  },
+
+  // ── SSH key passthrough (for gh auth and tentacle SSH ops) ─────────────────
+  "mounts": [
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached,readonly"
+  ],
+
+  // ── VS Code customizations ─────────────────────────────────────────────────
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        // TypeScript / JS
+        "ms-vscode.vscode-typescript-next",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        // GitHub
+        "github.vscode-github-actions",
+        "github.remotehub",
+        "eamodio.gitlens",
+        // Protobuf / gRPC
+        "zxh404.vscode-proto3",
+        // REST / API
+        "humao.rest-client",
+        // Frontend
+        "bradlc.vscode-tailwindcss",
+        "ms-vscode.live-server",
+        // Containers
+        "ms-azuretools.vscode-docker",
+        "ms-vscode-remote.remote-containers"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "[typescript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+        "[typescriptreact]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+        "typescript.preferences.importModuleSpecifier": "relative",
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "files.eol": "\n",
+        "git.autofetch": true
+      }
+    }
+  }
+}
