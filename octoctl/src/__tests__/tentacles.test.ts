@@ -34,8 +34,8 @@ import {
 
 const ALL_KINDS = [
   "issues", "gist", "branch", "notes", "actions",
-  "secrets", "proxy", "codespaces", "relay", "oidc",
-  "pages", "stego",
+  "secrets", "proxy", "codespaces", "http", "relay",
+  "oidc", "pages", "stego",
 ] as const;
 
 function makeBeacon(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -99,7 +99,7 @@ describe("runTentaclesList — offline mode", () => {
       json: true,
     });
 
-    expect(result.channels).toHaveLength(12);
+    expect(result.channels).toHaveLength(13);
     const kinds = result.channels.map(c => c.kind);
     for (const k of ALL_KINDS) {
       expect(kinds).toContain(k);
@@ -221,7 +221,7 @@ describe("runTentaclesList — offline mode", () => {
         json: true,
       });
 
-      expect(result.channels).toHaveLength(12);
+      expect(result.channels).toHaveLength(13);
       const active = result.channels.filter(c => c.status === "active");
       expect(active).toHaveLength(1);
       expect(active[0]!.kind).toBe(kind);
@@ -465,7 +465,7 @@ describe("runTentaclesHealth — alias for runTentaclesList", () => {
     // runTentaclesHealth === runTentaclesList; captureJsonOutput is equivalent
     const result = await captureJsonOutput({ beacon: "abc12345", json: true });
 
-    expect(result.channels).toHaveLength(12);
+    expect(result.channels).toHaveLength(13);
     const kinds = result.channels.map(c => c.kind);
     expect(kinds).toContain("pages");
     expect(kinds).toContain("stego");

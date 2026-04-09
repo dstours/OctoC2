@@ -37,6 +37,7 @@ import { proxyCreate, proxyList, proxyRotate, proxyProvision } from "./commands/
 import { runTentaclesList, runTentaclesHealth } from "./commands/tentacles.ts";
 import { runBeaconShell }  from "./commands/beaconShell.ts";
 import { runBulkShell }    from "./commands/bulkShell.ts";
+import { runSetup }        from "./commands/setup.ts";
 
 const program = new Command();
 
@@ -552,6 +553,16 @@ Examples:
       wait:        opts.wait,
       pollTimeout: parseInt(opts.timeout, 10),
     }).catch(fatal);
+  });
+
+// ── setup (interactive wizard) ───────────────────────────────────────────────
+
+program
+  .command("setup")
+  .description("Interactive setup wizard — configure C2 deployment from scratch")
+  .option("--phase <phase>", "run a single phase: credentials | validate | keygen | auth | tentacles | env | build | verify")
+  .action(async (opts: { phase?: string }) => {
+    await runSetup(opts).catch(fatal);
   });
 
 // ── Error handler ─────────────────────────────────────────────────────────────

@@ -5,15 +5,15 @@ import { describe, it, expect } from "bun:test";
 import { VALID_TENTACLE_KINDS } from "../commands/task.ts";
 
 describe("VALID_TENTACLE_KINDS", () => {
-  it("contains all 10 valid tentacle kinds", () => {
+  it("contains all 11 valid tentacle kinds", () => {
     const expected = [
       "issues", "branch", "actions", "proxy", "codespaces",
-      "relay", "gist", "oidc", "notes", "secrets",
+      "http", "relay", "gist", "oidc", "notes", "secrets",
     ];
     for (const kind of expected) {
       expect(VALID_TENTACLE_KINDS.has(kind as any)).toBe(true);
     }
-    expect(VALID_TENTACLE_KINDS.size).toBe(10);
+    expect(VALID_TENTACLE_KINDS.size).toBe(11);
   });
 
   it("does not contain invalid kinds", () => {
@@ -27,7 +27,7 @@ describe("VALID_TENTACLE_KINDS", () => {
 describe("--tentacle flag serialization", () => {
   it("valid kind is recognized by VALID_TENTACLE_KINDS check", () => {
     for (const kind of ["issues", "branch", "actions", "proxy", "codespaces",
-                        "relay", "gist", "oidc", "notes", "secrets"]) {
+                        "http", "relay", "gist", "oidc", "notes", "secrets"]) {
       expect(VALID_TENTACLE_KINDS.has(kind as any)).toBe(true);
     }
   });
