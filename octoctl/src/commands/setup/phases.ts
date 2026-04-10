@@ -33,10 +33,28 @@ export async function phaseCredentials(): Promise<{
   owner: string;
   repo: string;
 }> {
-  sectionHeader("Phase 1 / 8 — GitHub Credentials");
+  sectionHeader("Phase 1 / 9 — GitHub Credentials");
+
+  p.log.info(`${DIM}The C2 repo is a private GitHub repository where beacon traffic flows.${RESET}`);
+  p.log.info(`${DIM}The PAT must belong to an account with access to this repo.${RESET}`);
+
+  const owner = await promptText({
+    message: "C2 repo owner — the GitHub username or org that owns the private C2 repo",
+    placeholder: "myorg",
+    validate: (v) => (!v.trim() ? "Required" : undefined),
+  });
+
+  const repo = await promptText({
+    message: "C2 repo name — the private repo where beacon issues/branches/gists live",
+    placeholder: "infrastructure",
+    validate: (v) => (!v.trim() ? "Required" : undefined),
+  });
+
+  p.log.info(`${DIM}Create a PAT at: https://github.com/settings/tokens/new${RESET}`);
+  p.log.info(`${DIM}Required scope: 'repo'. Optional: 'gist' (gist channel), 'codespace' (gRPC channel).${RESET}`);
 
   const token = await promptPassword({
-    message: "GitHub PAT (repo scope minimum)",
+    message: `GitHub PAT for ${owner}/${repo} — must have 'repo' scope at minimum`,
     validate: (v) => {
       if (!v.trim()) return "Token is required";
       if (!v.startsWith("ghp_") && !v.startsWith("github_pat_"))
@@ -46,18 +64,6 @@ export async function phaseCredentials(): Promise<{
 
   p.log.info(`Token: ${maskToken(token)}`);
 
-  const owner = await promptText({
-    message: "C2 repo owner (org or username)",
-    placeholder: "myorg",
-    validate: (v) => (!v.trim() ? "Required" : undefined),
-  });
-
-  const repo = await promptText({
-    message: "C2 repo name",
-    placeholder: "infrastructure",
-    validate: (v) => (!v.trim() ? "Required" : undefined),
-  });
-
   return { token: token.trim(), owner: owner.trim(), repo: repo.trim() };
 }
 
@@ -66,7 +72,7 @@ export async function phaseValidate(
   owner: string,
   repo: string,
 ): Promise<void> {
-  sectionHeader("Phase 2 / 8 — Validating GitHub Access");
+  sectionHeader("Phase 2 / 9 — Validating GitHub Access");
 
   const result = await withSpinner(
     `Checking ${owner}/${repo}…`,
@@ -107,7 +113,10 @@ export async function phaseKeygen(
   owner: string,
   repo: string,
 ): Promise<{ operatorSecret: string; operatorPublicKey: string }> {
-  sectionHeader("Phase 3 / 8 — Operator Keypair");
+  sectionHeader("Phase 3 / 9 — Operator Keypair");
+
+  p.log.info(`${DIM}The operator keypair encrypts all beacon ↔ server communication.${RESET}`);
+  p.log.info(`${DIM}The secret key stays on your operator machine. The public key goes to the C2 repo.${RESET}`);
 
   const existingSecret = process.env["OCTOC2_OPERATOR_SECRET"]?.trim();
   if (existingSecret) {
@@ -163,25 +172,33 @@ export async function phaseAuthMode(): Promise<{
   appId?: number;
   installationId?: number;
 }> {
-  sectionHeader("Phase 4 / 8 — Authentication Mode");
+  sectionHeader("Phase 4 / 9 — Beacon Authentication Mode");
+
+  p.log.info(`${DIM}This controls how the deployed beacon authenticates to GitHub.${RESET}`);
+  p.log.info(`${DIM}PAT: the token you entered earlier gets baked into the binary.${RESET}`);
+  p.log.info(`${DIM}App: short-lived tokens (1hr), private key delivered at runtime via dead-drop.${RESET}`);
 
   const mode = await promptSelect<"pat" | "app">({
-    message: "How should the beacon authenticate?",
+    message: "How should the beacon authenticate to GitHub?",
     options: [
-      { value: "pat", label: "PAT only", hint: "simpler — static token baked into binary" },
-      { value: "app", label: "GitHub App", hint: "recommended — rotating 1-hour tokens, key delivered via dead-drop" },
+      { value: "pat", label: "PAT only", hint: "simpler — your PAT is baked directly into the beacon binary" },
+      { value: "app", label: "GitHub App", hint: "production — rotating 1-hour installation tokens, private key never baked" },
     ],
   });
 
   if (mode === "pat") return { authMode: "pat" };
 
+  p.log.info(`${DIM}Create a GitHub App at: https://github.com/settings/apps/new${RESET}`);
+  p.log.info(`${DIM}Required permissions: Contents (R/W), Issues (R/W), Variables (R/W), Actions (R/W)${RESET}`);
+  p.log.info(`${DIM}After creating, install it on your C2 repo and note the IDs.${RESET}`);
+
   const appIdStr = await promptText({
-    message: "GitHub App ID (numeric)",
+    message: "GitHub App ID — numeric ID from the app's settings page",
     validate: (v) => (isNaN(parseInt(v, 10)) ? "Must be a number" : undefined),
   });
 
   const installIdStr = await promptText({
-    message: "Installation ID (from app install URL)",
+    message: "Installation ID — from the URL after installing the app on your C2 repo",
     validate: (v) => (isNaN(parseInt(v, 10)) ? "Must be a number" : undefined),
   });
 
@@ -195,7 +212,7 @@ export async function phaseAuthMode(): Promise<{
 }
 
 export async function phaseTentacles(): Promise<string | undefined> {
-  sectionHeader("Phase 5 / 8 — Tentacle Priority");
+  sectionHeader("Phase 5 / 9 — Tentacle Priority");
 
   const mode = await promptSelect<"auto" | "custom">({
     message: "How should the beacon choose communication channels?",
@@ -274,12 +291,19 @@ export function generateEnvFile(input: EnvFileInput): string {
 }
 
 export async function phaseWriteEnv(state: SetupState): Promise<string> {
-  sectionHeader("Phase 6 / 8 — Write .env File");
+  sectionHeader("Phase 6 / 9 — Write .env File");
+
+  // Default to project root .env (one level up from octoctl/)
+  const { resolve } = await import("node:path");
+  const defaultPath = resolve(process.cwd().replace(/\/octoctl$/, ""), ".env");
+
+  p.log.info(`${DIM}The .env file stores all credentials. 'octoctl start' reads it automatically.${RESET}`);
+  p.log.info(`${DIM}It is gitignored — never committed to the repo.${RESET}`);
 
   const envPath = await promptText({
-    message: "Where should the .env file be written?",
-    initialValue: ".env",
-    placeholder: ".env",
+    message: "Path to write .env file",
+    initialValue: defaultPath,
+    placeholder: defaultPath,
   });
 
   const content = generateEnvFile(state);
@@ -302,7 +326,7 @@ export async function phaseWriteEnv(state: SetupState): Promise<string> {
 }
 
 export async function phaseBuildBeacon(state: SetupState): Promise<void> {
-  sectionHeader("Phase 7 / 8 — Build Beacon");
+  sectionHeader("Phase 7 / 9 — Build Beacon");
 
   const build = await promptConfirm({
     message: "Build a beacon binary now?",
