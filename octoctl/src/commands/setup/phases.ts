@@ -404,9 +404,12 @@ export async function phaseAdvanced(): Promise<AdvancedConfig> {
     })).trim();
   }
 
-  // HTTP/WebSocket URL is a runtime value (Dev Tunnel URL only known after
-  // Codespace starts), so we don't prompt for it here. Set SVC_HTTP_URL in
-  // .env manually once the Codespace is running if you need this channel.
+  // Auto-derive HTTP URL from Codespace name + HTTP port (8080 default)
+  if (config.codespaceName) {
+    const httpPort = "8080";
+    config.httpUrl = `https://${config.codespaceName}-${httpPort}.app.github.dev`;
+    p.log.success(`HTTP URL: ${config.httpUrl}`);
+  }
 
   // ── Beacon tuning ────────────────────────────────────────────────────────
   const tuneSleep = await promptConfirm({
