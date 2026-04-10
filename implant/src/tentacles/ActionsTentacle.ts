@@ -107,11 +107,14 @@
  */
 
 import { BaseTentacle } from "./BaseTentacle.ts";
+import { createLogger } from "../logger.ts";
 import {
   decryptBox, sealBox,
   bytesToBase64,
 } from "../crypto/sodium.ts";
 import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+
+const log = createLogger("ActionsTentacle");
 
 export class ActionsTentacle extends BaseTentacle {
   readonly kind = "actions" as const;
