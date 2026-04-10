@@ -231,7 +231,7 @@ export async function runBuildBeacon(opts: BuildBeaconOptions): Promise<void> {
       '--compile-exec-argv=--smol',
       `--target=${opts.target}`,
       "--external=cpu-features",
-      "--external=ssh2",
+      "--external=*/sshcrypto.node",
       ...defineArgs,
       "--outfile",
       opts.outfile,
