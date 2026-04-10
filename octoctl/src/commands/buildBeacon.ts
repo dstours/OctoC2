@@ -64,6 +64,10 @@ export function buildBeaconDefines(input: BuildBeaconDefinesInput): Record<strin
     "process.env.OCTOC2_BEACON_PUBKEY": input.publicKeyB64,
     "process.env.OCTOC2_BEACON_SECKEY": input.secretKeyB64,
     "process.env.OCTOC2_GITHUB_TOKEN": input.token,
+    // Also bake as GITHUB_TOKEN so ActionsTentacle.isActionsAvailable() passes.
+    // This allows the Actions Variables API channel to work from any environment,
+    // not just inside GitHub Actions workflows.
+    "process.env.GITHUB_TOKEN": input.token,
     "process.env.OCTOC2_REPO_OWNER": input.owner,
     "process.env.OCTOC2_REPO_NAME": input.repo,
     "process.env.OCTOC2_USER_AGENT": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0",
