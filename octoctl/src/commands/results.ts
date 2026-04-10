@@ -68,50 +68,77 @@ export async function runResults(beaconIdPrefix: string, opts: ResultsOptions): 
     ? parseSince(opts.since).toISOString()
     : new Date(Date.now() - 24 * 3600 * 1000).toISOString(); // default: last 24h
 
-  // Fetch comments from GitHub
-  const allComments = await env.octokit.paginate(
-    env.octokit.rest.issues.listComments,
-    {
-      owner:        env.owner,
-      repo:         env.repo,
-      issue_number: beacon.issueNumber,
-      since,
-      per_page:     100,
+  let results: TaskResult[] = [];
+
+  // ── Fetch results: server API or direct Issues comments ─────────────────
+  if (beacon.issueNumber === 0) {
+    // No issue — beacon registered via Actions/Notes/etc. Use server API.
+    const serverUrl = process.env["OCTOC2_SERVER_URL"] ?? "http://localhost:8080";
+    const resp = await fetch(`${serverUrl}/api/beacon/${beacon.beaconId}/results`, {
+      headers: { "Authorization": `Bearer ${env.token}` },
+    });
+    if (!resp.ok) {
+      throw new Error(`Server returned ${resp.status}: ${await resp.text()}`);
     }
-  );
+    const serverResults = await resp.json() as Array<{
+      taskId: string; beaconId?: string; kind?: string;
+      completedAt?: string; output?: string; success?: boolean;
+    }>;
 
-  // Filter to logs comments
-  const logsComments = allComments.filter(c =>
-    /<!--\s*job:\d+:logs:/m.test(c.body ?? "")
-  );
+    results = serverResults
+      .filter(r => new Date(r.completedAt ?? 0) >= new Date(since))
+      .map(r => ({
+        taskId:      r.taskId,
+        beaconId:    r.beaconId ?? beacon.beaconId,
+        kind:        r.kind,
+        completedAt: r.completedAt ?? new Date().toISOString(),
+        output:      r.output,
+        error:       r.success === false ? "task failed" : undefined,
+      }));
 
-  // Apply --last
-  const limited = opts.last
-    ? logsComments.slice(-opts.last)
-    : logsComments;
+    if (opts.last) results = results.slice(-opts.last);
+  } else {
+    // Issues-based — fetch and decrypt comments
+    const allComments = await env.octokit.paginate(
+      env.octokit.rest.issues.listComments,
+      {
+        owner:        env.owner,
+        repo:         env.repo,
+        issue_number: beacon.issueNumber,
+        since,
+        per_page:     100,
+      }
+    );
 
-  // Decrypt each
-  const results: TaskResult[] = [];
-  for (const comment of limited) {
-    const hb = HEARTBEAT_RE.exec(comment.body ?? "");
-    const ct = CIPHERTEXT_RE.exec(comment.body ?? "");
-    if (!hb || !ct) continue;
+    const logsComments = allComments.filter(c =>
+      /<!--\s*job:\d+:logs:/m.test(c.body ?? "")
+    );
 
-    try {
-      const plain  = await openSealBox(
-        ct[1]!.trim(),
-        env.operatorPublicKey,
-        env.operatorSecretKey
-      );
-      const result = JSON.parse(bytesToString(plain)) as TaskResult;
-      results.push(result);
-    } catch (err) {
-      results.push({
-        taskId:      `<decrypt failed: ${(err as Error).message}>`,
-        beaconId:    beacon.beaconId,
-        completedAt: comment.created_at,
-        error:       "decryption failed",
-      });
+    const limited = opts.last
+      ? logsComments.slice(-opts.last)
+      : logsComments;
+
+    for (const comment of limited) {
+      const hb = HEARTBEAT_RE.exec(comment.body ?? "");
+      const ct = CIPHERTEXT_RE.exec(comment.body ?? "");
+      if (!hb || !ct) continue;
+
+      try {
+        const plain  = await openSealBox(
+          ct[1]!.trim(),
+          env.operatorPublicKey,
+          env.operatorSecretKey
+        );
+        const result = JSON.parse(bytesToString(plain)) as TaskResult;
+        results.push(result);
+      } catch (err) {
+        results.push({
+          taskId:      `<decrypt failed: ${(err as Error).message}>`,
+          beaconId:    beacon.beaconId,
+          completedAt: comment.created_at,
+          error:       "decryption failed",
+        });
+      }
     }
   }
 
