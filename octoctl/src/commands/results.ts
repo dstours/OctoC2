@@ -81,19 +81,21 @@ export async function runResults(beaconIdPrefix: string, opts: ResultsOptions): 
       throw new Error(`Server returned ${resp.status}: ${await resp.text()}`);
     }
     const serverResults = await resp.json() as Array<{
-      taskId: string; beaconId?: string; kind?: string;
+      taskId: string; beaconId?: string; kind?: string; status?: string;
       completedAt?: string; output?: string; success?: boolean;
+      result?: { output?: string; success?: boolean; completedAt?: string };
     }>;
 
     results = serverResults
-      .filter(r => new Date(r.completedAt ?? 0) >= new Date(since))
+      .filter(r => r.status === "completed" || r.result)
+      .filter(r => new Date(r.result?.completedAt ?? r.completedAt ?? 0) >= new Date(since))
       .map(r => ({
         taskId:      r.taskId,
         beaconId:    r.beaconId ?? beacon.beaconId,
         kind:        r.kind,
-        completedAt: r.completedAt ?? new Date().toISOString(),
-        output:      r.output,
-        error:       r.success === false ? "task failed" : undefined,
+        completedAt: r.result?.completedAt ?? r.completedAt ?? new Date().toISOString(),
+        output:      r.result?.output ?? r.output,
+        error:       (r.result?.success === false || r.success === false) ? "task failed" : undefined,
       }));
 
     if (opts.last) results = results.slice(-opts.last);
