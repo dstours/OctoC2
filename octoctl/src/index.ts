@@ -38,6 +38,7 @@ import { runTentaclesList, runTentaclesHealth } from "./commands/tentacles.ts";
 import { runBeaconShell }  from "./commands/beaconShell.ts";
 import { runBulkShell }    from "./commands/bulkShell.ts";
 import { runSetup }        from "./commands/setup.ts";
+import { runStart, runStop, runStatus } from "./commands/service.ts";
 
 const program = new Command();
 
@@ -563,6 +564,46 @@ program
   .option("--phase <phase>", "run a single phase: credentials | validate | keygen | auth | tentacles | env | build | verify")
   .action(async (opts: { phase?: string }) => {
     await runSetup(opts).catch(fatal);
+  });
+
+// ── start ────────────────────────────────────────────────────────────────────
+
+program
+  .command("start")
+  .description("Start the C2 server and/or dashboard as background processes")
+  .argument("[component]", "server | dashboard (default: both)")
+  .option("--env <path>", "path to .env file", ".env")
+  .action(async (component: string | undefined, opts: { env: string }) => {
+    const valid = ["server", "dashboard", undefined];
+    if (!valid.includes(component)) {
+      console.error(`\n  Error: unknown component '${component}' — use server or dashboard\n`);
+      process.exit(1);
+    }
+    await runStart({ component: component as any, env: opts.env }).catch(fatal);
+  });
+
+// ── stop ─────────────────────────────────────────────────────────────────────
+
+program
+  .command("stop")
+  .description("Stop running server and/or dashboard")
+  .argument("[component]", "server | dashboard (default: both)")
+  .action(async (component: string | undefined) => {
+    const valid = ["server", "dashboard", undefined];
+    if (!valid.includes(component)) {
+      console.error(`\n  Error: unknown component '${component}' — use server or dashboard\n`);
+      process.exit(1);
+    }
+    await runStop({ component: component as any }).catch(fatal);
+  });
+
+// ── status ───────────────────────────────────────────────────────────────────
+
+program
+  .command("status")
+  .description("Show running OctoC2 components")
+  .action(async () => {
+    await runStatus().catch(fatal);
   });
 
 // ── Error handler ─────────────────────────────────────────────────────────────
