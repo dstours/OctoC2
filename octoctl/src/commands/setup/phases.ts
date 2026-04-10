@@ -404,19 +404,9 @@ export async function phaseAdvanced(): Promise<AdvancedConfig> {
     })).trim();
   }
 
-  // ── HTTP/WebSocket ───────────────────────────────────────────────────────
-  const useHttp = await promptConfirm({
-    message: "Use HTTP/WebSocket channel?",
-    initialValue: false,
-  });
-
-  if (useHttp) {
-    config.httpUrl = (await promptText({
-      message: "HTTP base URL",
-      placeholder: "https://codespace-8080.app.github.dev",
-      validate: (v) => (!v.trim() ? "Required" : undefined),
-    })).trim();
-  }
+  // HTTP/WebSocket URL is a runtime value (Dev Tunnel URL only known after
+  // Codespace starts), so we don't prompt for it here. Set SVC_HTTP_URL in
+  // .env manually once the Codespace is running if you need this channel.
 
   // ── Beacon tuning ────────────────────────────────────────────────────────
   const tuneSleep = await promptConfirm({
