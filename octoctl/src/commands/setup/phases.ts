@@ -585,7 +585,7 @@ export async function phaseWriteEnv(state: SetupState): Promise<string> {
 
 // ── Phase 7: Build Beacon ────────────────────────────────────────────────────
 
-export async function phaseBuildBeacon(state: SetupState): Promise<void> {
+export async function phaseBuildBeacon(state: SetupState): Promise<string | undefined> {
   sectionHeader("8/10  Build Beacon");
 
   const build = await promptConfirm({
@@ -595,7 +595,7 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
 
   if (!build) {
     p.log.info(`${DIM}Build later: octoctl build-beacon --outfile ./beacon${RESET}`);
-    return;
+    return undefined;
   }
 
   const target = await promptSelect<string>({
@@ -664,9 +664,78 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
   if (beaconId) {
     p.log.info(`${DIM}Use this ID for tasking: octoctl task ${beaconId.slice(0, 8)} --kind shell --cmd "id"${RESET}`);
   }
+
+  return beaconId;
 }
 
-// ── Phase 8: Install to PATH ─────────────────────────────────────────────────
+// ── Phase 8b: Dead-drop for App auth ─────────────────────────────────────────
+
+export async function phaseDeadDrop(state: SetupState, beaconId?: string): Promise<void> {
+  if (state.authMode !== "app" || !beaconId) return;
+
+  sectionHeader("8b  Deploy App Private Key");
+
+  p.note(
+    `Your beacon uses GitHub App auth, so the private key must be\n` +
+    `delivered via an encrypted dead-drop gist — it's never baked\n` +
+    `into the binary.\n\n` +
+    `Beacon ID: ${BOLD}${beaconId}${RESET}`,
+    "Dead-drop"
+  );
+
+  const createDrop = await promptConfirm({
+    message: "Create the dead-drop now?",
+    initialValue: true,
+  });
+
+  if (!createDrop) {
+    p.log.info(`${DIM}Create later: octoctl drop create --beacon ${beaconId.slice(0, 8)} --app-key-file <pem>${RESET}`);
+    return;
+  }
+
+  const keyPath = await promptText({
+    message: "Path to App private key PEM file",
+    placeholder: "~/.config/octoc2/app-key.pem",
+    validate: (v) => {
+      if (!v.trim()) return "Required";
+      const { existsSync } = require("node:fs");
+      const resolved = v.trim().replace(/^~/, process.env.HOME ?? "");
+      if (!existsSync(resolved)) return `File not found: ${resolved}`;
+    },
+  });
+
+  const resolvedKeyPath = keyPath.trim().replace(/^~/, process.env.HOME ?? "");
+
+  await withSpinner("Creating dead-drop gist", async () => {
+    const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
+    const projectRoot = process.cwd().replace(/\/octoctl$/, "");
+    const proc = Bun.spawn([
+      bunBin, "run", "octoctl/src/index.ts", "drop", "create",
+      "--beacon", beaconId.slice(0, 8),
+      "--app-key-file", resolvedKeyPath,
+    ], {
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        OCTOC2_GITHUB_TOKEN: state.token,
+        OCTOC2_REPO_OWNER: state.owner,
+        OCTOC2_REPO_NAME: state.repo,
+        OCTOC2_OPERATOR_SECRET: state.operatorSecret,
+      },
+    });
+    const code = await proc.exited;
+    if (code !== 0) {
+      const stderr = await new Response(proc.stderr).text();
+      throw new Error(`Dead-drop failed (exit ${code})${stderr ? `\n${stderr.trim()}` : ""}`);
+    }
+  });
+
+  p.log.success("Dead-drop created — beacon will pick up the key on next recovery cycle");
+}
+
+// ── Phase 9: Install to PATH ─────────────────────────────────────────────────
 
 export async function phaseInstall(): Promise<void> {
   sectionHeader("9/10  Install CLI");
