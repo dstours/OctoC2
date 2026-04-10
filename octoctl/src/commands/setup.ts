@@ -6,6 +6,7 @@ import {
   phaseTentacles,
   phaseWriteEnv,
   phaseBuildBeacon,
+  phaseInstall,
   phaseVerify,
   type SetupState,
 } from "./setup/phases.ts";
@@ -55,7 +56,10 @@ export async function runSetup(opts: SetupOptions): Promise<void> {
   // Phase 7: Build beacon
   await phaseBuildBeacon(state);
 
-  // Phase 8: Next steps
+  // Phase 8: Install to PATH
+  await phaseInstall();
+
+  // Phase 9: Next steps
   await phaseVerify(state);
 
   wizardOutro("Setup complete.");

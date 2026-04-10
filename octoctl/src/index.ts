@@ -606,6 +606,50 @@ program
     await runStatus().catch(fatal);
   });
 
+// ── update ───────────────────────────────────────────────────────────────────
+
+program
+  .command("update")
+  .description("Pull latest OctoC2 from the repo and reinstall dependencies")
+  .option("--branch <branch>", "branch to pull from", "main")
+  .action(async (opts: { branch: string }) => {
+    const { resolve } = await import("node:path");
+
+    // Find project root — walk up from octoctl/ or use cwd
+    let root = process.cwd();
+    const { existsSync } = await import("node:fs");
+    if (existsSync(resolve(root, "octoctl", "package.json"))) {
+      // already at root
+    } else if (existsSync(resolve(root, "..", "octoctl", "package.json"))) {
+      root = resolve(root, "..");
+    }
+
+    const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
+
+    console.log(`\n  Updating OctoC2 from ${opts.branch}…\n`);
+
+    // 1. git pull
+    const pull = Bun.spawn(["git", "pull", "origin", opts.branch], {
+      cwd: root, stdout: "inherit", stderr: "inherit",
+    });
+    if ((await pull.exited) !== 0) {
+      console.error(`\n  git pull failed.\n`);
+      process.exit(1);
+    }
+
+    // 2. bun install
+    console.log(`\n  Installing dependencies…\n`);
+    const install = Bun.spawn([bunBin, "install"], {
+      cwd: root, stdout: "inherit", stderr: "inherit",
+    });
+    if ((await install.exited) !== 0) {
+      console.error(`\n  bun install failed.\n`);
+      process.exit(1);
+    }
+
+    console.log(`\n  \x1b[32m✓\x1b[0m OctoC2 updated.\n`);
+  });
+
 // ── Error handler ─────────────────────────────────────────────────────────────
 
 function fatal(err: unknown): never {

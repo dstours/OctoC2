@@ -365,18 +365,69 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
   p.log.success(`Beacon built: ${outfile}`);
 }
 
+// ── Phase 8: Install to PATH ─────────────────────────────────────────────────
+
+export async function phaseInstall(): Promise<void> {
+  sectionHeader("Phase 8 / 9 — Install octoctl to PATH");
+
+  const install = await promptConfirm({
+    message: "Install octoctl to /usr/local/bin so you can run it from anywhere?",
+    initialValue: true,
+  });
+
+  if (!install) {
+    p.log.info(`${DIM}Skipped. Run manually with: bun run octoctl/src/index.ts <command>${RESET}`);
+    return;
+  }
+
+  const projectRoot = process.cwd().replace(/\/octoctl$/, "");
+  const scriptContent = `#!/bin/sh\nexec bun "${projectRoot}/octoctl/src/index.ts" "$@"\n`;
+  const targetPath = "/usr/local/bin/octoctl";
+
+  try {
+    const { writeFileSync, chmodSync } = await import("node:fs");
+    writeFileSync(targetPath, scriptContent, { mode: 0o755 });
+    chmodSync(targetPath, 0o755);
+    p.log.success(`Installed to ${targetPath}`);
+  } catch (err) {
+    // Likely permission denied — try with sudo
+    p.log.warn(`${YELLOW}Direct write failed — trying with sudo…${RESET}`);
+    const tmpPath = `/tmp/octoctl-install-${Date.now()}`;
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(tmpPath, scriptContent, { mode: 0o755 });
+
+    const proc = Bun.spawn(["sudo", "cp", tmpPath, targetPath], {
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const code = await proc.exited;
+    if (code === 0) {
+      Bun.spawn(["sudo", "chmod", "+x", targetPath], { stdout: "pipe", stderr: "pipe" });
+      p.log.success(`Installed to ${targetPath} (via sudo)`);
+    } else {
+      p.log.error(`${RED}Failed to install. You can do it manually:${RESET}`);
+      p.log.info(`echo '${scriptContent.replace(/\n/g, "\\n")}' | sudo tee ${targetPath} && sudo chmod +x ${targetPath}`);
+    }
+
+    try { (await import("node:fs")).unlinkSync(tmpPath); } catch {}
+  }
+}
+
+// ── Phase 9: Verify ──────────────────────────────────────────────────────────
+
 export async function phaseVerify(state: SetupState): Promise<void> {
-  sectionHeader("Phase 8 / 8 — Next Steps");
+  sectionHeader("Phase 9 / 9 — Next Steps");
 
   p.log.message(`
   ${BOLD}Your deployment is configured.${RESET}
 
-  ${DIM}1.${RESET} Source your env:     ${GREEN}source ${state.envPath ?? ".env"}${RESET}
-  ${DIM}2.${RESET} Start the server:    ${GREEN}cd server && bun run start${RESET}
-  ${DIM}3.${RESET} Deploy the beacon:   ${GREEN}scp ./beacon target:/tmp/ && ssh target '/tmp/beacon &'${RESET}
-  ${DIM}4.${RESET} Check registration:  ${GREEN}octoctl beacons${RESET}  ${DIM}(wait ~60s)${RESET}
-  ${DIM}5.${RESET} Queue first task:    ${GREEN}octoctl task <id> --kind ping${RESET}
-  ${DIM}6.${RESET} Read results:        ${GREEN}octoctl results <id>${RESET}`);
+  ${DIM}1.${RESET} Start everything:    ${GREEN}octoctl start${RESET}
+  ${DIM}2.${RESET} Deploy the beacon:   ${GREEN}scp ./beacon target:/tmp/ && ssh target '/tmp/beacon &'${RESET}
+  ${DIM}3.${RESET} Check registration:  ${GREEN}octoctl beacons${RESET}  ${DIM}(wait ~60s)${RESET}
+  ${DIM}4.${RESET} Queue first task:    ${GREEN}octoctl task <id> --kind shell --cmd "id"${RESET}
+  ${DIM}5.${RESET} Read results:        ${GREEN}octoctl results <id>${RESET}
+  ${DIM}6.${RESET} Check status:        ${GREEN}octoctl status${RESET}
+  ${DIM}7.${RESET} Stop everything:     ${GREEN}octoctl stop${RESET}`);
 
   if (state.authMode === "app") {
     p.log.message(`
