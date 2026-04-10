@@ -56,12 +56,12 @@ describe('AuthContext', () => {
   });
 
   describe('initial state', () => {
-    it('starts with empty PAT, null privkey, and offline mode', () => {
+    it('starts with empty PAT, null privkey, and api mode (forces login)', () => {
       render(<StateDisplay />, { wrapper: Wrapper });
       const state = JSON.parse(screen.getByTestId('state').textContent!);
       expect(state.pat).toBe('');
       expect(state.privkey).toBeNull();
-      expect(state.mode).toBe('offline');
+      expect(state.mode).toBe('api');
       expect(state.latencyMs).toBeNull();
     });
 

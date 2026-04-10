@@ -51,9 +51,9 @@ const queryClient = new QueryClient({
 
 function ProtectedRoutes() {
   const { pat, mode } = useAuth();
-  // Allow through if operator has a PAT or has explicitly chosen offline mode.
-  // Initial state is `mode: 'offline'`, so the dashboard is viewable immediately;
-  // the BeaconTable shows a "connect with PAT" prompt until credentials are set.
+  // Allow through if operator has a PAT or has explicitly chosen offline mode
+  // (via "Skip to Offline Mode" on the login page).
+  // Initial state is `mode: 'api'` which forces redirect to /login.
   if (!pat && mode !== 'offline') return <Navigate to="/login" replace />;
   return <Layout />;
 }

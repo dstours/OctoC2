@@ -798,4 +798,13 @@ export async function phaseVerify(state: SetupState): Promise<void> {
   }
 
   p.note(steps.join("\n"), "Next steps");
+
+  // Show credentials needed for dashboard login
+  p.note(
+    `PAT:          ${maskToken(state.token)}\n` +
+    `Server URL:   http://localhost:8080\n` +
+    `Operator key: ${state.operatorSecret}`,
+    "Dashboard login credentials"
+  );
+  p.log.info(`${DIM}Open http://localhost:3000 and enter the PAT + operator key to decrypt results${RESET}`);
 }

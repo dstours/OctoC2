@@ -58,7 +58,7 @@ const DEFAULT_SERVER =
 const INITIAL_STATE: AuthState = {
   pat:       '',
   privkey:   null,
-  mode:      'offline',
+  mode:      'api',       // Force login redirect — was 'offline' which bypassed auth
   serverUrl: DEFAULT_SERVER,
   latencyMs: null,
 };
