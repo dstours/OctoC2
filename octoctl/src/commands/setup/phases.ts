@@ -405,9 +405,12 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
 
   await withSpinner("Compiling beacon", async () => {
     const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
+    // build-beacon expects cwd = project root (looks for ./implant/src/index.ts)
+    const projectRoot = process.cwd().replace(/\/octoctl$/, "");
     const proc = Bun.spawn([bunBin, ...args], {
       stdout: "pipe",
       stderr: "pipe",
+      cwd: projectRoot,
       env: {
         ...process.env,
         OCTOC2_GITHUB_TOKEN: state.token,
@@ -416,7 +419,10 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
       },
     });
     const code = await proc.exited;
-    if (code !== 0) throw new Error(`Build failed (exit ${code})`);
+    if (code !== 0) {
+      const stderr = await new Response(proc.stderr).text();
+      throw new Error(`Build failed (exit ${code})${stderr ? `\n${stderr.trim()}` : ""}`);
+    }
   });
 
   p.log.success(`Beacon: ${outfile}`);
