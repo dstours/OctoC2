@@ -1,6 +1,7 @@
 // dashboard/src/hooks/useConnectionMode.ts
 import { useState, useCallback } from 'react';
 import type { ConnectionMode } from '@/types';
+import { setGitHubCoords } from '@/lib/coords';
 
 /** How long to wait for the C2 server health probe before giving up (ms). */
 const PROBE_TIMEOUT_MS = 2500;
@@ -69,6 +70,11 @@ export function useConnectionMode(pat: string): ConnectionModeResult {
 
         if (res.ok) {
           const ms = Math.round(performance.now() - t0);
+          // Cache repo coords from health response for settings/display
+          try {
+            const data = await res.json() as { owner?: string; repo?: string };
+            if (data.owner && data.repo) setGitHubCoords(data.owner, data.repo);
+          } catch { /* ignore parse errors */ }
           setLatencyMs(ms);
           setMode('live');
           setLoading(false);

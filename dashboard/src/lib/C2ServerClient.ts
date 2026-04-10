@@ -113,12 +113,18 @@ export class C2ServerClient {
     return res.json() as Promise<T>;
   }
 
-  /** Probe the server health endpoint. Returns ok + round-trip latency. */
-  async health(): Promise<{ ok: boolean; latencyMs: number }> {
+  /** Probe the server health endpoint. Returns ok + round-trip latency + repo coords. */
+  async health(): Promise<{ ok: boolean; latencyMs: number; owner: string | null; repo: string | null }> {
     const start = Date.now();
     const res   = await fetch(`${this.serverUrl}/api/health`);
     const latencyMs = Date.now() - start;
-    return { ok: res.ok, latencyMs };
+    const data = await res.json().catch(() => ({})) as { ok?: boolean; owner?: string; repo?: string };
+    return {
+      ok: res.ok,
+      latencyMs,
+      owner: data.owner ?? null,
+      repo:  data.repo  ?? null,
+    };
   }
 
   /** GET /api/beacons — returns all beacons from the server registry. */

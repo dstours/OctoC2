@@ -120,7 +120,12 @@ export class DashboardHttpServer {
       }
 
       if (req.method === 'GET' && pathname === '/api/health') {
-        return this.json({ ok: true, serverTime: new Date().toISOString() });
+        return this.json({
+          ok: true,
+          serverTime: new Date().toISOString(),
+          owner: this.githubConfig?.owner ?? null,
+          repo:  this.githubConfig?.repo  ?? null,
+        });
       }
 
       // WebSocket upgrade for beacon channel

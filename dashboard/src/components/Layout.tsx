@@ -2,6 +2,7 @@
 import { useState, useEffect } from 'react';
 import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { Radio, Shield, Terminal, Settings, RefreshCw, LogOut, Menu } from 'lucide-react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '@/context/AuthContext';
 import { OctoLogo } from '@/assets/OctoLogo';
 import { ConnectionBadge } from './ConnectionBadge';
@@ -44,6 +45,7 @@ function Sidebar() {
 export function Layout() {
   const { mode, latencyMs, logout } = useAuth();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
@@ -93,7 +95,7 @@ export function Layout() {
           <ConnectionBadge mode={mode} latencyMs={latencyMs} />
 
           <button
-            onClick={() => window.location.reload()}
+            onClick={() => queryClient.invalidateQueries()}
             className="p-1.5 text-gray-600 hover:text-gray-300 transition-colors duration-150"
             title="Refresh"
             aria-label="Refresh"
