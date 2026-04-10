@@ -4,6 +4,7 @@ import {
   phaseKeygen,
   phaseAuthMode,
   phaseTentacles,
+  phaseAdvanced,
   phaseWriteEnv,
   phaseBuildBeacon,
   phaseInstall,
@@ -42,24 +43,28 @@ export async function runSetup(opts: SetupOptions): Promise<void> {
   // Phase 5: Tentacle priority
   const tentaclePriority = await phaseTentacles();
 
+  // Phase 6: Advanced config
+  const advanced = await phaseAdvanced();
+
   // Assemble state
   const state: SetupState = {
     ...creds,
     ...keys,
     ...auth,
     tentaclePriority,
+    ...advanced,
   };
 
-  // Phase 6: Write .env
+  // Phase 7: Write .env
   state.envPath = await phaseWriteEnv(state);
 
-  // Phase 7: Build beacon
+  // Phase 8: Build beacon
   await phaseBuildBeacon(state);
 
-  // Phase 8: Install to PATH
+  // Phase 9: Install to PATH
   await phaseInstall();
 
-  // Phase 9: Next steps
+  // Phase 10: Next steps
   await phaseVerify(state);
 
   wizardOutro("Setup complete.");

