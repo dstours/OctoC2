@@ -302,7 +302,7 @@ describe("ActionsTentacle.submitResult()", () => {
     const writeCalls = [...updateVar.mock.calls, ...createVar.mock.calls];
     const varName = (writeCalls[0]![0] as any).name as string;
     expect(varName).toMatch(/^INFRA_RESULT_/);
-    expect(varName).toContain("task-def");
+    expect(varName).toContain("TASK-DEF");
   });
 
   it("result variable value is a sealed base64 string decryptable with operator key", async () => {

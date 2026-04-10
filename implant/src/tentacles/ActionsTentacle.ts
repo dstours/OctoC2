@@ -120,7 +120,9 @@ export class ActionsTentacle extends BaseTentacle {
 
   // ── Identity helpers ─────────────────────────────────────────────────────────
 
-  private get id8(): string { return this.config.id.slice(0, 8); }
+  // GitHub Variables API normalizes names to uppercase, so id8 must be
+  // uppercased to match what the server sees when reading ACK variables.
+  private get id8(): string { return this.config.id.slice(0, 8).toUpperCase(); }
 
   private get ackVarName(): string  { return `INFRA_STATUS_${this.id8}`; }
   private get taskVarName(): string { return `INFRA_JOB_${this.id8}`; }
@@ -259,7 +261,7 @@ export class ActionsTentacle extends BaseTentacle {
    */
   async submitResult(result: TaskResult): Promise<void> {
     const sealed    = await sealBox(JSON.stringify(result), this.config.operatorPublicKey);
-    const taskId8   = result.taskId.slice(0, 8);
+    const taskId8   = result.taskId.slice(0, 8).toUpperCase();
     const varName   = `INFRA_RESULT_${taskId8}`;
 
     try {
