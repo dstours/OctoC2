@@ -125,6 +125,12 @@ export async function runStart(opts: StartOptions): Promise<void> {
       const httpPort = mergedEnv["OCTOC2_HTTP_PORT"] ?? "8080";
       const logFile = join(projectRoot, "server.log");
 
+      // Set data dir to project root so registry.json is at <root>/data/
+      // not <root>/server/data/ (server cwd is server/)
+      if (!mergedEnv["OCTOC2_DATA_DIR"]) {
+        mergedEnv["OCTOC2_DATA_DIR"] = join(projectRoot, "data");
+      }
+
       const proc = Bun.spawn([bunBin, "run", serverEntry], {
         env: mergedEnv,
         cwd: join(projectRoot, "server"),
