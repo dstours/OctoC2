@@ -13,7 +13,7 @@ import {
   type SetupState,
 } from "./setup/phases.ts";
 import { wizardIntro, wizardOutro, promptSelect, promptText, promptConfirm } from "./setup/prompts.ts";
-import { loadEnvFile } from "./service.ts";
+import { loadEnvFile, findProjectRoot } from "./service.ts";
 import * as p from "@clack/prompts";
 
 const DIM   = "\x1b[2m";
@@ -66,7 +66,7 @@ export async function runSetup(opts: SetupOptions): Promise<void> {
 
   if (mode === "import") {
     const { resolve } = await import("node:path");
-    const defaultPath = resolve(process.cwd().replace(/\/octoctl$/, ""), ".env");
+    const defaultPath = resolve(findProjectRoot(), ".env");
 
     const envPath = await promptText({
       message: "Path to existing .env file",

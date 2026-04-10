@@ -85,7 +85,7 @@ export interface StartOptions {
  * Find the OctoC2 project root by walking up from cwd looking for
  * a directory that contains both server/ and implant/.
  */
-function findProjectRoot(): string {
+export function findProjectRoot(): string {
   let dir = process.cwd();
   for (let i = 0; i < 5; i++) {
     if (existsSync(join(dir, "server", "src", "index.ts")) && existsSync(join(dir, "implant"))) {

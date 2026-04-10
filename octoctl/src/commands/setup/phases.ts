@@ -3,6 +3,7 @@ import * as p from "@clack/prompts";
 import { Octokit } from "@octokit/rest";
 import { generateOperatorKeyPair, bytesToBase64 } from "../../lib/crypto.ts";
 import { checkRepo } from "./validate.ts";
+import { findProjectRoot } from "../service.ts";
 import {
   wizardIntro, wizardOutro, sectionHeader, withSpinner,
   promptPassword, promptText, promptSelect, promptConfirm, maskToken,
@@ -549,7 +550,7 @@ export async function phaseWriteEnv(state: SetupState): Promise<string> {
   sectionHeader("7/10  Environment File");
 
   const { resolve } = await import("node:path");
-  const defaultPath = resolve(process.cwd().replace(/\/octoctl$/, ""), ".env");
+  const defaultPath = resolve(findProjectRoot(), ".env");
 
   const envPath = await promptText({
     message: "Write .env to",
@@ -627,7 +628,7 @@ export async function phaseBuildBeacon(state: SetupState): Promise<string | unde
   await withSpinner("Compiling beacon", async () => {
     const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
     // build-beacon expects cwd = project root (looks for ./implant/src/index.ts)
-    const projectRoot = process.cwd().replace(/\/octoctl$/, "");
+    const projectRoot = findProjectRoot();
     const proc = Bun.spawn([bunBin, ...args], {
       stdout: "pipe",
       stderr: "pipe",
@@ -701,7 +702,7 @@ export async function phaseDeadDrop(state: SetupState, beaconId?: string): Promi
 
   await withSpinner("Creating dead-drop gist", async () => {
     const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
-    const projectRoot = process.cwd().replace(/\/octoctl$/, "");
+    const projectRoot = findProjectRoot();
     const proc = Bun.spawn([
       bunBin, "run", "octoctl/src/index.ts", "drop", "create",
       "--beacon", beaconId.slice(0, 8),
@@ -743,7 +744,7 @@ export async function phaseInstall(): Promise<void> {
     return;
   }
 
-  const projectRoot = process.cwd().replace(/\/octoctl$/, "");
+  const projectRoot = findProjectRoot();
   const scriptContent = `#!/bin/sh\nexec bun "${projectRoot}/octoctl/src/index.ts" "$@"\n`;
   const targetPath = "/usr/local/bin/octoctl";
 
