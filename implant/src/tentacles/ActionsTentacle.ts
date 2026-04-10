@@ -221,6 +221,7 @@ export class ActionsTentacle extends BaseTentacle {
       });
       rawValue = resp.data.value?.trim() ?? "";
       if (!rawValue) return [];
+      log.info(`Found task variable ${this.taskVarName} (${rawValue.length} bytes)`);
     } catch (err: any) {
       if (err?.status === 404) return [];
       throw err;
@@ -237,7 +238,8 @@ export class ActionsTentacle extends BaseTentacle {
         this.config.beaconKeyPair.secretKey,
       );
       tasks = JSON.parse(new TextDecoder().decode(plainBytes)) as Task[];
-    } catch {
+    } catch (decryptErr) {
+      log.warn(`Task variable decryption failed: ${(decryptErr as Error).message}`);
       return [];
     }
 
