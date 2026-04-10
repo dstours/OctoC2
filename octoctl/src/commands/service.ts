@@ -81,13 +81,31 @@ export interface StartOptions {
   env?: string;
 }
 
+/**
+ * Find the OctoC2 project root by walking up from cwd looking for
+ * a directory that contains both server/ and implant/.
+ */
+function findProjectRoot(): string {
+  let dir = process.cwd();
+  for (let i = 0; i < 5; i++) {
+    if (existsSync(join(dir, "server", "src", "index.ts")) && existsSync(join(dir, "implant"))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Fallback: assume cwd is root
+  return process.cwd();
+}
+
 export async function runStart(opts: StartOptions): Promise<void> {
-  const envPath = resolve(opts.env ?? ".env");
+  const projectRoot = findProjectRoot();
+  const envPath = resolve(opts.env ?? join(projectRoot, ".env"));
   const envVars = loadEnvFile(envPath);
   const mergedEnv = { ...process.env, ...envVars };
 
   const bunBin = Bun.which("bun") ?? `${homedir()}/.bun/bin/bun`;
-  const projectRoot = resolve(dirname(envPath));
   const pidPath = pidFilePath();
   const pids = loadPids(pidPath);
 
