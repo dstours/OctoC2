@@ -147,6 +147,7 @@ export class ActionsChannel {
           os:          "unknown",
           arch:        "unknown",
           seq:         0,
+          tentacleId:  3,  // T3 — Actions Variables API channel
         });
         this.actionsBeacons.set(id8, beaconId);
 
@@ -260,6 +261,7 @@ export class ActionsChannel {
         for (const t of pending) {
           this.queue.markDelivered(t.taskId);
         }
+        this.registry.setActiveTentacle(beaconId, 3);
 
         console.log(`[ActionsChannel] Delivered ${pending.length} task(s) to beacon ${beaconId}`);
       } catch (err) {
