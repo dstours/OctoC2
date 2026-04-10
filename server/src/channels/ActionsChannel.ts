@@ -43,6 +43,14 @@ interface AckPayload {
   k: string;
   /** Checkin timestamp (ISO-8601) */
   t: string;
+  /** Hostname */
+  h?: string;
+  /** Username */
+  u?: string;
+  /** OS */
+  o?: string;
+  /** Arch */
+  a?: string;
 }
 
 interface ResultPayload {
@@ -142,10 +150,10 @@ export class ActionsChannel {
           beaconId,
           issueNumber: 0,
           publicKey:   ack.k,
-          hostname:    "unknown",
-          username:    "unknown",
-          os:          "unknown",
-          arch:        "unknown",
+          hostname:    ack.h ?? "unknown",
+          username:    ack.u ?? "unknown",
+          os:          ack.o ?? "unknown",
+          arch:        ack.a ?? "unknown",
           seq:         0,
           tentacleId:  3,  // T3 — Actions Variables API channel
         });
