@@ -160,41 +160,81 @@ export async function runTask(beaconIdPrefix: string, opts: TaskOptions): Promis
 
   const taskArray = [taskPayload];
 
-  // Encrypt
-  const beaconPublicKey = await base64ToBytes(beacon.publicKey);
-  const { nonce, ciphertext } = await encryptForBeacon(
-    JSON.stringify(taskArray),
-    beaconPublicKey,
-    env.operatorSecretKey
-  );
-
-  // Post deploy comment
-  const body = buildDeployComment(ref, nonce, ciphertext);
-
-  const resp = await env.octokit.rest.issues.createComment({
-    owner:        env.owner,
-    repo:         env.repo,
-    issue_number: beacon.issueNumber,
-    body,
-  });
-
   const DIM  = "\x1b[2m";
   const BOLD = "\x1b[1m";
   const RESET = "\x1b[0m";
   const GREEN = "\x1b[32m";
 
-  console.log("");
-  console.log(`  ${GREEN}✓${RESET} Task queued`);
-  console.log(`  ${DIM}Task ID:${RESET}  ${taskId}`);
-  console.log(`  ${DIM}Ref:${RESET}      ${ref}`);
-  console.log(`  ${DIM}Kind:${RESET}     ${opts.kind}`);
-  console.log(`  ${DIM}Args:${RESET}     ${JSON.stringify(args)}`);
-  if (opts.tentacle !== undefined) {
-    console.log(`  ${DIM}Tentacle:${RESET} ${opts.tentacle}`);
+  // ── Delivery: server API vs direct Issues comment ───────────────────────
+  // Non-issues channels (actions, notes, branch, etc.) need the server to
+  // deliver the task through the appropriate channel. Issues can be posted
+  // directly as a comment.
+  const useServerApi = beacon.issueNumber === 0 || (
+    opts.tentacle !== undefined && opts.tentacle !== "issues"
+  );
+
+  if (useServerApi) {
+    // Deliver via server HTTP API — server routes to the correct channel
+    const serverUrl = process.env["OCTOC2_SERVER_URL"] ?? "http://localhost:8080";
+    const resp = await fetch(`${serverUrl}/api/beacon/${beacon.beaconId}/task`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        kind: opts.kind,
+        args,
+        ...(opts.tentacle !== undefined && { preferredChannel: opts.tentacle }),
+      }),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Server returned ${resp.status}: ${text}`);
+    }
+
+    console.log("");
+    console.log(`  ${GREEN}✓${RESET} Task queued via server API`);
+    console.log(`  ${DIM}Task ID:${RESET}  ${taskId}`);
+    console.log(`  ${DIM}Kind:${RESET}     ${opts.kind}`);
+    console.log(`  ${DIM}Args:${RESET}     ${JSON.stringify(args)}`);
+    if (opts.tentacle !== undefined) {
+      console.log(`  ${DIM}Channel:${RESET}  ${opts.tentacle}`);
+    }
+    console.log(`  ${DIM}Beacon:${RESET}   ${beacon.beaconId}`);
+  } else {
+    // Direct Issues comment delivery
+    const beaconPublicKey = await base64ToBytes(beacon.publicKey);
+    const { nonce, ciphertext } = await encryptForBeacon(
+      JSON.stringify(taskArray),
+      beaconPublicKey,
+      env.operatorSecretKey
+    );
+
+    const body = buildDeployComment(ref, nonce, ciphertext);
+
+    const resp = await env.octokit.rest.issues.createComment({
+      owner:        env.owner,
+      repo:         env.repo,
+      issue_number: beacon.issueNumber,
+      body,
+    });
+
+    console.log("");
+    console.log(`  ${GREEN}✓${RESET} Task queued`);
+    console.log(`  ${DIM}Task ID:${RESET}  ${taskId}`);
+    console.log(`  ${DIM}Ref:${RESET}      ${ref}`);
+    console.log(`  ${DIM}Kind:${RESET}     ${opts.kind}`);
+    console.log(`  ${DIM}Args:${RESET}     ${JSON.stringify(args)}`);
+    if (opts.tentacle !== undefined) {
+      console.log(`  ${DIM}Channel:${RESET}  ${opts.tentacle}`);
+    }
+    console.log(`  ${DIM}Beacon:${RESET}   ${beacon.beaconId} (${beacon.hostname})`);
+    console.log(`  ${DIM}Issue:${RESET}    #${beacon.issueNumber}`);
+    console.log(`  ${DIM}Comment:${RESET}  ${resp.data.html_url}`);
   }
-  console.log(`  ${DIM}Beacon:${RESET}   ${beacon.beaconId} (${beacon.hostname})`);
-  console.log(`  ${DIM}Issue:${RESET}    #${beacon.issueNumber}`);
-  console.log(`  ${DIM}Comment:${RESET}  ${resp.data.html_url}`);
+
   console.log("");
   console.log(`  ${BOLD}Waiting for beacon to check in…${RESET}`);
   console.log(`  Run: octoctl results ${beaconIdPrefix}  to see the output`);
