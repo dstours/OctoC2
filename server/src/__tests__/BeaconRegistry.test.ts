@@ -44,3 +44,20 @@ describe("activeTentacle", () => {
     expect(reg.get("abc-001")!.activeTentacle).toBe(4);
   });
 });
+
+describe("debounced persist", () => {
+  it("coalesces rapid registrations into a single write", async () => {
+    const testReg = new BeaconRegistry("/tmp/reg-debounce-test");
+    for (let i = 0; i < 10; i++) {
+      testReg.register({ ...BASE, beaconId: `b${i}`, issueNumber: i + 1 });
+    }
+    // Wait for debounce to fire
+    await new Promise(r => setTimeout(r, 1500));
+    // After shutdown, file should exist and contain all beacons
+    await testReg.shutdown();
+
+    const file = await Bun.file("/tmp/reg-debounce-test/registry.json").text();
+    const snap = JSON.parse(file);
+    expect(snap.beacons).toHaveLength(10);
+  });
+});

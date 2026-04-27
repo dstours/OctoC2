@@ -49,6 +49,10 @@ export interface QueuedTask {
 export class TaskQueue {
   /** beaconId → ordered list of tasks */
   private readonly queues = new Map<string, QueuedTask[]>();
+  /** taskId → QueuedTask (O(1) lookup) */
+  private readonly taskIndex = new Map<string, QueuedTask>();
+  /** ref → QueuedTask (O(1) lookup) */
+  private readonly refIndex = new Map<string, QueuedTask>();
 
   /**
    * Add a new task for a beacon. Generates a short ref token used in the
@@ -80,6 +84,8 @@ export class TaskQueue {
     const queue = this.queues.get(beaconId) ?? [];
     queue.push(task);
     this.queues.set(beaconId, queue);
+    this.taskIndex.set(taskId, task);
+    this.refIndex.set(ref, task);
 
     console.log(`[TaskQueue] Queued task ${taskId} (${kind}) for beacon ${beaconId}`);
     return task;
@@ -96,20 +102,12 @@ export class TaskQueue {
   }
 
   getTask(taskId: string): QueuedTask | undefined {
-    for (const queue of this.queues.values()) {
-      const task = queue.find(t => t.taskId === taskId);
-      if (task) return task;
-    }
-    return undefined;
+    return this.taskIndex.get(taskId);
   }
 
   /** Find a task by its short ref token. */
   getTaskByRef(ref: string): QueuedTask | undefined {
-    for (const queue of this.queues.values()) {
-      const task = queue.find(t => t.ref === ref);
-      if (task) return task;
-    }
-    return undefined;
+    return this.refIndex.get(ref);
   }
 
   /**
