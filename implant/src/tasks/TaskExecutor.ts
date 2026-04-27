@@ -81,7 +81,6 @@ export class TaskExecutor {
           return await this.executeLoadModule(task, beaconId, startMs);
 
         case "evasion":
-        case "openhulud":
           return await this.executeEvasion(task, beaconId, startMs);
 
         case "upload":

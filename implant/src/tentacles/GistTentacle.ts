@@ -95,7 +95,7 @@ export class GistTentacle extends BaseTentacle {
           [this.ackFilename]: { content: ackContent },
         },
       } as any);
-      this.ackGistId = ackResp.data.id;
+      this.ackGistId = ackResp.data.id ?? null;
       this.ackSent = true;
     }
 

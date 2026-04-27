@@ -30,7 +30,7 @@ const mockGetRepoVariable = mock(() =>
 const mockListIssues      = mock(() => Promise.resolve({ data: [] }));
 const mockCreateIssue     = mock(() => Promise.resolve({ data: { number: 42 } }));
 const mockCreateComment   = mock(() => Promise.resolve({ data: { id: 1001 } }));
-const mockListComments    = mock(() => Promise.resolve({ data: [] }));
+const mockListComments    = mock(() => Promise.resolve({ data: [] as any[] }));
 const mockDeleteComment   = mock(() => Promise.resolve({}));
 const mockUpdateComment   = mock(() => Promise.resolve({ data: {} }));
 const mockPaginate        = mock((_fn: unknown, params: unknown) => {

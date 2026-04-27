@@ -2,7 +2,7 @@ import { describe, it, expect, mock, beforeEach } from "bun:test";
 
 // Mock must be declared before the module is imported
 const mockGists = {
-  list:   mock(async () => ({ data: [] })),
+  list:   mock(async () => ({ data: [] as any[] })),
   get:    mock(async () => ({ data: { id: "gist123", files: {}, updated_at: "2024-01-01T00:00:00Z" } })),
   create: mock(async () => ({ data: { id: "new-gist-id" } })),
   delete: mock(async () => ({})),
@@ -76,7 +76,7 @@ describe("GistTentacle", () => {
     expect(tasks).toEqual([]);
     // ACK gist should have been created
     expect(mockGists.create).toHaveBeenCalledTimes(1);
-    const createCall = mockGists.create.mock.calls[0]![0] as any;
+    const createCall = (mockGists.create.mock.calls[0] as any)[0] as any;
     const fileKeys = Object.keys(createCall.files as object);
     expect(fileKeys[0]).toMatch(/^svc-a-/);
   });
@@ -165,7 +165,7 @@ describe("GistTentacle", () => {
       success: true, output: "hello", completedAt: new Date().toISOString(),
     });
     expect(mockGists.create).toHaveBeenCalledTimes(1);
-    const createCall = mockGists.create.mock.calls[0]![0] as any;
+    const createCall = (mockGists.create.mock.calls[0] as any)[0] as any;
     const fileKeys = Object.keys(createCall.files as object);
     expect(fileKeys[0]).toMatch(/^svc-r-/);
   });
@@ -179,7 +179,7 @@ describe("GistTentacle", () => {
 
     await t.teardown();
     expect(mockGists.delete).toHaveBeenCalledTimes(1);
-    expect((mockGists.delete.mock.calls[0]![0] as any).gist_id).toBe("new-gist-id");
+    expect(((mockGists.delete.mock.calls[0] as any)[0] as any).gist_id).toBe("new-gist-id");
   });
 
   it("checkin does not create duplicate ACK gist on second call", async () => {

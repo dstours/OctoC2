@@ -2,7 +2,7 @@ import { describe, it, expect, mock, beforeEach } from "bun:test";
 
 // Mock must be declared before the module is imported
 const mockRepos = {
-  listDeployments:      mock(async () => ({ data: [] })),
+  listDeployments:      mock(async () => ({ data: [] as any[] })),
   createDeployment:     mock(async () => ({ data: { id: 42 } })),
   createDeploymentStatus: mock(async () => ({})),
 };
@@ -79,7 +79,7 @@ describe("PagesTentacle", () => {
 
     // ACK deployment should have been created
     expect(mockRepos.createDeployment).toHaveBeenCalledTimes(1);
-    const createCall = mockRepos.createDeployment.mock.calls[0]![0] as any;
+    const createCall = (mockRepos.createDeployment.mock.calls[0] as any)[0] as any;
     expect(createCall.environment).toMatch(/^ci-abcd1234$/);
     const desc = JSON.parse(createCall.description);
     expect(desc.beaconId).toBe("abcd1234-5678-90ab-cdef-1234567890ab");
@@ -153,7 +153,7 @@ describe("PagesTentacle", () => {
     expect(tasks[0]!.taskId).toBe("t1");
     // createDeploymentStatus called to mark task deployment inactive
     expect(mockRepos.createDeploymentStatus).toHaveBeenCalledTimes(1);
-    const statusCall = mockRepos.createDeploymentStatus.mock.calls[0]![0] as any;
+    const statusCall = (mockRepos.createDeploymentStatus.mock.calls[0] as any)[0] as any;
     expect(statusCall.deployment_id).toBe(77);
     expect(statusCall.state).toBe("inactive");
   });
@@ -165,7 +165,7 @@ describe("PagesTentacle", () => {
       success: true, output: "hello", completedAt: new Date().toISOString(),
     });
     expect(mockRepos.createDeployment).toHaveBeenCalledTimes(1);
-    const createCall = mockRepos.createDeployment.mock.calls[0]![0] as any;
+    const createCall = (mockRepos.createDeployment.mock.calls[0] as any)[0] as any;
     expect(createCall.environment).toMatch(/^ci-r-abcd1234$/);
     expect(createCall.description).toBe("result");
   });
@@ -180,7 +180,7 @@ describe("PagesTentacle", () => {
 
     await t.teardown();
     expect(mockRepos.createDeploymentStatus).toHaveBeenCalledTimes(1);
-    const statusCall = mockRepos.createDeploymentStatus.mock.calls[0]![0] as any;
+    const statusCall = (mockRepos.createDeploymentStatus.mock.calls[0] as any)[0] as any;
     expect(statusCall.deployment_id).toBe(42);
     expect(statusCall.state).toBe("inactive");
   });

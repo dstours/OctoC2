@@ -142,7 +142,7 @@ describe("ActionsChannel", () => {
 
     // A TASK variable should have been created
     expect(createVar.mock.calls.length).toBeGreaterThan(0);
-    const createCall = createVar.mock.calls[0]![0] as any;
+    const createCall = (createVar.mock.calls[0] as any)[0] as any;
     expect((createCall.name as string)).toMatch(/^INFRA_JOB_/);
     expect((createCall.name as string)).toContain(id8);
 
@@ -224,7 +224,7 @@ describe("ActionsChannel", () => {
     const completed = queue.getTask(task.taskId);
     expect(completed?.state).toBe("completed");
     expect(deleteVar.mock.calls.length).toBeGreaterThan(0);
-    const deletedName = (deleteVar.mock.calls[0]![0] as any).name as string;
+    const deletedName = ((deleteVar.mock.calls[0] as any)[0] as any).name as string;
     expect(deletedName).toBe(varName);
   });
 

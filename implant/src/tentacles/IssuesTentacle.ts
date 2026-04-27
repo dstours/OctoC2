@@ -197,7 +197,7 @@ export class IssuesTentacle extends BaseTentacle {
         throw this.initError;
       }
       // Transient error is older than retry window — clear and retry
-      log.info("IssuesTentacle init error expired — retrying initialization");
+      console.log("[IssuesTentacle] init error expired — retrying initialization");
       this.initError = null;
       this.initErrorAt = 0;
     }
@@ -799,7 +799,7 @@ export class IssuesTentacle extends BaseTentacle {
         issue_number: state.issueNumber,
         per_page: 100,
       });
-      comments = resp.data;
+      comments = resp.data as Array<{ id: number; created_at: string; body: string }>;
     } catch {
       return; // best-effort — if listing fails, skip cleanup
     }

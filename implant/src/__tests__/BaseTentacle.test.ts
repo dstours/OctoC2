@@ -57,7 +57,7 @@ class TestTentacle extends BaseTentacle {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-function makeConfig(overrides: Partial<Parameters<typeof TestTentacle>[0]> = {}) {
+function makeConfig(overrides: any = {}) {
   return {
     id:    "test-beacon-id",
     repo:  { owner: "op", name: "c2" },

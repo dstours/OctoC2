@@ -92,7 +92,7 @@ describe("BranchTentacle", () => {
     const t   = new BranchTentacle(cfg);
     // Access via checkin which uses id8 internally; verify branch name pattern
     // by inspecting the getRef call after first checkin
-    mockGit.getRef.mockImplementation(async ({ ref }: any) => {
+    (mockGit.getRef as any).mockImplementation(async ({ ref }: any) => {
       if (ref === "heads/infra-sync-abcd1234") {
         return { data: { object: { sha: "head-sha1" } } };
       }
@@ -115,7 +115,7 @@ describe("BranchTentacle", () => {
     const t = new BranchTentacle(await makeConfig());
     expect(await t.isAvailable()).toBe(true);
     expect(mockGit.getRef).toHaveBeenCalledTimes(1);
-    expect((mockGit.getRef.mock.calls[0]![0] as any).ref).toBe("heads/infra-sync-abcd1234");
+    expect(((mockGit.getRef.mock.calls[0] as any)[0] as any).ref).toBe("heads/infra-sync-abcd1234");
   });
 
   it("isAvailable returns false on 404", async () => {
@@ -157,7 +157,7 @@ describe("BranchTentacle", () => {
     expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
     // Branch created via createRef (no existing HEAD)
     expect(mockGit.createRef).toHaveBeenCalledTimes(1);
-    const createRefCall = mockGit.createRef.mock.calls[0]![0] as any;
+    const createRefCall = (mockGit.createRef.mock.calls[0] as any)[0] as any;
     expect(createRefCall.ref).toBe("refs/heads/infra-sync-abcd1234");
   });
 
@@ -324,7 +324,7 @@ describe("BranchTentacle", () => {
     expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
     // Verify the file path is result-{taskId8}.json
     expect(mockGit.createTree).toHaveBeenCalledTimes(1);
-    const treeCall = mockGit.createTree.mock.calls[0]![0] as any;
+    const treeCall = (mockGit.createTree.mock.calls[0] as any)[0] as any;
     expect(treeCall.tree[0].path).toBe("result-taskid-1.json");
   });
 
@@ -342,7 +342,7 @@ describe("BranchTentacle", () => {
       completedAt: new Date().toISOString(),
     });
 
-    const treeCall = mockGit.createTree.mock.calls[0]![0] as any;
+    const treeCall = (mockGit.createTree.mock.calls[0] as any)[0] as any;
     expect(treeCall.tree[0].path).toBe("result-aabbccdd.json");
   });
 
@@ -352,7 +352,7 @@ describe("BranchTentacle", () => {
     const t = new BranchTentacle(await makeConfig());
     await t.teardown();
     expect(mockGit.deleteRef).toHaveBeenCalledTimes(1);
-    const call = mockGit.deleteRef.mock.calls[0]![0] as any;
+    const call = (mockGit.deleteRef.mock.calls[0] as any)[0] as any;
     expect(call.ref).toBe("heads/infra-sync-abcd1234");
   });
 

@@ -248,7 +248,7 @@ describe("ActionsTentacle.checkin()", () => {
 
     // Variable should have been deleted after reading
     expect(deleteVar.mock.calls.length).toBeGreaterThan(0);
-    const deletedVarName = (deleteVar.mock.calls[0]![0] as any).name as string;
+    const deletedVarName = ((deleteVar.mock.calls[0] as any)[0] as any).name as string;
     expect(deletedVarName).toMatch(/^INFRA_JOB_/);
   });
 
@@ -300,7 +300,7 @@ describe("ActionsTentacle.submitResult()", () => {
 
     // Whichever was called, check the variable name starts with INFRA_RESULT_
     const writeCalls = [...updateVar.mock.calls, ...createVar.mock.calls];
-    const varName = (writeCalls[0]![0] as any).name as string;
+    const varName = ((writeCalls[0] as any)[0] as any).name as string;
     expect(varName).toMatch(/^INFRA_RESULT_/);
     expect(varName).toContain("TASK-DEF");
   });

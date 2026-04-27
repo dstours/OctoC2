@@ -131,7 +131,7 @@ describe("SecretsTentacle.checkin() — ACK registration", () => {
 
     // Check the written variable has the correct INFRA_CFG_ prefix
     const writeCalls = [...updateVar.mock.calls, ...createVar.mock.calls];
-    const varName = (writeCalls[0]![0] as any).name as string;
+    const varName = ((writeCalls[0] as any)[0] as any).name as string;
     expect(varName).toMatch(/^INFRA_CFG_/);
     expect(varName).toContain(cfg.id.slice(0, 8));
   });
@@ -239,7 +239,7 @@ describe("SecretsTentacle.checkin() — task polling", () => {
 
     // Variable should have been deleted after reading
     expect(deleteVar.mock.calls.length).toBeGreaterThan(0);
-    const deletedVarName = (deleteVar.mock.calls[0]![0] as any).name as string;
+    const deletedVarName = ((deleteVar.mock.calls[0] as any)[0] as any).name as string;
     expect(deletedVarName).toMatch(/^INFRA_STATE_/);
   });
 
@@ -306,7 +306,7 @@ describe("SecretsTentacle.submitResult()", () => {
 
     // Variable name should match INFRA_LOG_ prefix with first 8 chars of taskId
     const writeCalls = [...updateVar.mock.calls, ...createVar.mock.calls];
-    const varName = (writeCalls[0]![0] as any).name as string;
+    const varName = ((writeCalls[0] as any)[0] as any).name as string;
     expect(varName).toMatch(/^INFRA_LOG_/);
     expect(varName).toContain("task-ccd".slice(0, 8));
   });
