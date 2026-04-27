@@ -269,7 +269,7 @@ export class ActionsChannel {
         for (const t of pending) {
           this.queue.markDelivered(t.taskId);
         }
-        this.registry.setActiveTentacle(beaconId, 3);
+        this.registry.updateActiveTentacle(beaconId, 3);
 
         console.log(`[ActionsChannel] Delivered ${pending.length} task(s) to beacon ${beaconId}`);
       } catch (err) {

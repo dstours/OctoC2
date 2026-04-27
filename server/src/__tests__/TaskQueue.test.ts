@@ -23,7 +23,7 @@ describe("TaskQueue O(1) lookups", () => {
   });
 
   it("markDelivered updates state and works via O(1) lookup", () => {
-    const task = queue.queueTask("beacon-2", "exec", { cmd: "id" });
+    const task = queue.queueTask("beacon-2", "shell", { cmd: "id" });
     const ok = queue.markDelivered(task.taskId);
     expect(ok).toBe(true);
     expect(queue.getTask(task.taskId)!.state).toBe("delivered");
