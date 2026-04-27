@@ -889,3 +889,76 @@ describe("IssuesTentacle — GitHub App auth", () => {
     expect(mockCreateComment.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+
+describe("IssuesTentacle — init retry logic", () => {
+  it("retries initialization after a transient error ages out", async () => {
+    // Force a transient error on first init by making getRepoVariable fail with 500
+    let callCount = 0;
+    mockGetRepoVariable.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        const err = new Error("Internal Server Error") as any;
+        err.status = 500;
+        return Promise.reject(err);
+      }
+      return Promise.resolve({ data: { value: "test-pubkey-val" } });
+    });
+
+    const t = makeTentacle();
+    // Shorten the retry window for testing
+    (IssuesTentacle as any).INIT_RETRY_MS = 50;
+
+    // First init should fail with 500
+    await expect(t.checkin({
+      beaconId: "b1", publicKey: "pk", hostname: "h", username: "u",
+      os: "linux", arch: "x64", pid: 1, checkinAt: new Date().toISOString(),
+    })).rejects.toThrow("Internal Server Error");
+
+    // Wait for retry window to elapse
+    await new Promise(r => setTimeout(r, 100));
+
+    // Second init should succeed now that the error has aged out
+    // (Note: other parts of _initialize may still fail in this minimal mock setup,
+    // but the key assertion is that initError is cleared and _initialize is called again)
+    mockListIssues.mockImplementation(() => Promise.resolve({ data: [] }));
+    mockCreateIssue.mockImplementation(() => Promise.resolve({ data: { number: 99 } }));
+    mockCreateComment.mockImplementation(() => Promise.resolve({ data: { id: 2001 } }));
+
+    // We expect this to at least reach the issue creation step (not throw the old 500)
+    try {
+      await t.checkin({
+        beaconId: "b1", publicKey: "pk", hostname: "h", username: "u",
+        os: "linux", arch: "x64", pid: 1, checkinAt: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      // If it fails, it should NOT be the original 500 error
+      expect(err.message).not.toBe("Internal Server Error");
+    }
+  });
+
+  it("does NOT retry fatal auth errors (401/403)", async () => {
+    mockGetRepoVariable.mockImplementation(() => {
+      const err = new Error("Bad credentials") as any;
+      err.status = 401;
+      return Promise.reject(err);
+    });
+
+    const t = makeTentacle();
+    (IssuesTentacle as any).INIT_RETRY_MS = 50;
+
+    await expect(t.checkin({
+      beaconId: "b1", publicKey: "pk", hostname: "h", username: "u",
+      os: "linux", arch: "x64", pid: 1, checkinAt: new Date().toISOString(),
+    })).rejects.toThrow("Bad credentials");
+
+    // Wait past retry window
+    await new Promise(r => setTimeout(r, 100));
+
+    // Should still throw the same fatal error
+    await expect(t.checkin({
+      beaconId: "b1", publicKey: "pk", hostname: "h", username: "u",
+      os: "linux", arch: "x64", pid: 1, checkinAt: new Date().toISOString(),
+    })).rejects.toThrow("Bad credentials");
+  });
+});

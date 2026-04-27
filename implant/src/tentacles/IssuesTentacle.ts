@@ -132,7 +132,9 @@ export class IssuesTentacle extends BaseTentacle {
 
   private initialized = false;
   private initError: Error | null = null;
+  private initErrorAt = 0;
   private initPromise: Promise<void> | null = null;
+  private static readonly INIT_RETRY_MS = 5 * 60 * 1000; // retry transient errors after 5 min
 
   private operatorPublicKey: Uint8Array | null = null;
   private state: BeaconState | null = null;
@@ -190,17 +192,38 @@ export class IssuesTentacle extends BaseTentacle {
     if (this.initialized) return;
 
     // Surface a persistent init error immediately (don't retry fatal failures)
-    if (this.initError) throw this.initError;
+    if (this.initError) {
+      if (this.isFatalError(this.initError) || Date.now() - this.initErrorAt < IssuesTentacle.INIT_RETRY_MS) {
+        throw this.initError;
+      }
+      // Transient error is older than retry window — clear and retry
+      log.info("IssuesTentacle init error expired — retrying initialization");
+      this.initError = null;
+      this.initErrorAt = 0;
+    }
 
     // Deduplicate concurrent calls (e.g. checkin + submitResult race)
     if (!this.initPromise) {
       this.initPromise = this._initialize().catch((err) => {
         this.initError = err as Error;
+        this.initErrorAt = Date.now();
         this.initPromise = null;
         throw err;
       });
     }
     await this.initPromise;
+  }
+
+  /**
+   * Classify an error as fatal (auth/config) or transient (network/rate-limit).
+   * Fatal errors are never retried; transient errors are retried after INIT_RETRY_MS.
+   */
+  private isFatalError(err: Error): boolean {
+    const status = (err as any).status as number | undefined;
+    if (status === 401 || status === 403 || status === 404) return true;
+    const msg = err.message.toLowerCase();
+    if (msg.includes("bad credentials") || msg.includes("not found")) return true;
+    return false;
   }
 
   private async _initialize(): Promise<void> {
