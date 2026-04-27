@@ -273,7 +273,7 @@ describe("BeaconGrpcService", () => {
 
   describe("start() / stop()", () => {
     it("binds and releases a TCP port", async () => {
-      const { createServer } = await import("node:net");
+      const { createServer, createConnection } = await import("node:net");
       // Find a free port
       const port = await new Promise<number>((resolve, reject) => {
         const srv = createServer();
@@ -284,19 +284,32 @@ describe("BeaconGrpcService", () => {
         srv.on("error", reject);
       });
 
-      await svc.start(port);
+      // Bind to 127.0.0.1 so the collision test is consistent across platforms
+      // (macOS allows 127.0.0.1 bind when 0.0.0.0 is already bound)
+      await svc.start(port, "127.0.0.1");
       try {
-        // Port should be in use now — binding the same port should fail
+        // Port should be listening now — a connection should succeed
         await expect(
           new Promise<void>((resolve, reject) => {
-            const s = createServer();
-            s.listen(port, "127.0.0.1", () => { s.close(); resolve(); });
-            s.on("error", reject);
+            const c = createConnection(port, "127.0.0.1", () => {
+              c.destroy();
+              resolve();
+            });
+            c.on("error", reject);
           })
-        ).rejects.toThrow();
+        ).resolves.toBeUndefined();
       } finally {
         await svc.stop();
       }
+
+      // After stop(), the port should be released — binding should succeed
+      await expect(
+        new Promise<void>((resolve, reject) => {
+          const s = createServer();
+          s.listen(port, "127.0.0.1", () => { s.close(); resolve(); });
+          s.on("error", reject);
+        })
+      ).resolves.toBeUndefined();
     });
   });
 });
