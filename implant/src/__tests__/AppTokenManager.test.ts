@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeAll } from "bun:test";
+import { describe, it, expect, beforeAll, beforeEach } from "bun:test";
 import { generateKeyPairSync, createPublicKey } from "node:crypto";
-import { AppTokenManager, buildTokenGetter } from "../lib/AppTokenManager.ts";
+import { AppTokenManager, buildTokenGetter, getSharedTokenGetter, clearTokenManagerCache } from "../lib/AppTokenManager.ts";
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -254,5 +254,143 @@ describe("buildTokenGetter", () => {
       appPrivateKey: TEST_PEM,
     });
     expect(await getter()).toBe("ghp_fallback_pat");
+  });
+});
+
+describe("getSharedTokenGetter", () => {
+  beforeEach(() => {
+    clearTokenManagerCache();
+  });
+
+  it("returns a PAT getter when no App config is provided", async () => {
+    const getter = getSharedTokenGetter({ token: "ghp_test_pat" });
+    expect(await getter()).toBe("ghp_test_pat");
+  });
+
+  it("reuses the same AppTokenManager for identical credentials", async () => {
+    let callCount = 0;
+    const mock = mockTokenServer({
+      onRequest: () => { callCount++; },
+    });
+    try {
+      // Patch global fetch so AppTokenManager talks to our mock
+      const origFetch = globalThis.fetch;
+      (globalThis as any).fetch = async (input: any, init?: any) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/app/installations/")) {
+          const patched = url.replace("https://api.github.com", mock.url);
+          return origFetch(patched, init);
+        }
+        return origFetch(input, init);
+      };
+
+      const getter1 = getSharedTokenGetter({
+        token: "ghp_fallback",
+        appId: 12345,
+        installationId: 99999,
+        appPrivateKey: TEST_PEM,
+      });
+      const getter2 = getSharedTokenGetter({
+        token: "ghp_fallback",
+        appId: 12345,
+        installationId: 99999,
+        appPrivateKey: TEST_PEM,
+      });
+
+      // Both getters should point to the same underlying manager
+      expect(getter1).toBe(getter2);
+
+      // Calling both should only hit the mock server once (shared cache)
+      const t1 = await getter1();
+      const t2 = await getter2();
+      expect(t1).toBe(t2);
+      expect(callCount).toBe(1);
+
+      (globalThis as any).fetch = origFetch;
+    } finally {
+      mock.stop();
+    }
+  });
+
+  it("creates separate managers for different appIds", async () => {
+    let callCount = 0;
+    const mock = mockTokenServer({
+      onRequest: () => { callCount++; },
+    });
+    try {
+      const origFetch = globalThis.fetch;
+      (globalThis as any).fetch = async (input: any, init?: any) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/app/installations/")) {
+          const patched = url.replace("https://api.github.com", mock.url);
+          return origFetch(patched, init);
+        }
+        return origFetch(input, init);
+      };
+
+      const getter1 = getSharedTokenGetter({
+        token: "ghp_fallback",
+        appId: 11111,
+        installationId: 99999,
+        appPrivateKey: TEST_PEM,
+      });
+      const getter2 = getSharedTokenGetter({
+        token: "ghp_fallback",
+        appId: 22222,
+        installationId: 99999,
+        appPrivateKey: TEST_PEM,
+      });
+
+      expect(getter1).not.toBe(getter2);
+      await getter1();
+      await getter2();
+      expect(callCount).toBe(2);
+
+      (globalThis as any).fetch = origFetch;
+    } finally {
+      mock.stop();
+    }
+  });
+
+  it("creates a new manager after cache clear", async () => {
+    let callCount = 0;
+    const mock = mockTokenServer({
+      onRequest: () => { callCount++; },
+    });
+    try {
+      const origFetch = globalThis.fetch;
+      (globalThis as any).fetch = async (input: any, init?: any) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/app/installations/")) {
+          const patched = url.replace("https://api.github.com", mock.url);
+          return origFetch(patched, init);
+        }
+        return origFetch(input, init);
+      };
+
+      const getter1 = getSharedTokenGetter({
+        token: "ghp_fallback",
+        appId: 12345,
+        installationId: 99999,
+        appPrivateKey: TEST_PEM,
+      });
+      await getter1();
+      expect(callCount).toBe(1);
+
+      clearTokenManagerCache();
+
+      const getter2 = getSharedTokenGetter({
+        token: "ghp_fallback",
+        appId: 12345,
+        installationId: 99999,
+        appPrivateKey: TEST_PEM,
+      });
+      await getter2();
+      expect(callCount).toBe(2);
+
+      (globalThis as any).fetch = origFetch;
+    } finally {
+      mock.stop();
+    }
   });
 });

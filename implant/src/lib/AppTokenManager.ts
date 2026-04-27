@@ -19,8 +19,8 @@
 
 import { SignJWT } from "jose";
 import { createPrivateKey } from "node:crypto";
+import { GH_UA } from "./constants.ts";
 
-const GH_UA = "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0";
 const BUFFER_MS = 5 * 60 * 1000; // refresh 5 min before expiry
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -32,6 +32,14 @@ export interface AppAuthConfig {
   installationId: number;
   /** App private key as a PEM string (RSA-2048+) */
   appPrivateKey: string;
+}
+
+// ── Singleton cache ───────────────────────────────────────────────────────────
+
+const managerCache = new Map<string, () => Promise<string>>();
+
+function cacheKey(config: AppAuthConfig): string {
+  return `${config.appId}:${config.installationId}`;
 }
 
 // ── AppTokenManager ───────────────────────────────────────────────────────────
@@ -91,7 +99,7 @@ export class AppTokenManager {
   }
 }
 
-// ── Convenience factory ───────────────────────────────────────────────────────
+// ── Convenience factories ─────────────────────────────────────────────────────
 
 /**
  * Return an async token getter suitable for Octokit's `auth` option.
@@ -122,4 +130,41 @@ export function buildTokenGetter(config: {
   }
   // PAT fallback — static, no refresh needed
   return () => Promise.resolve(config.token);
+}
+
+/**
+ * Return a shared token getter, re-using the same AppTokenManager instance
+ * for identical App credentials. This avoids redundant JWT signing when
+ * multiple tentacles are active with the same GitHub App config.
+ */
+export function getSharedTokenGetter(config: {
+  token: string;
+  appId?: number;
+  installationId?: number;
+  appPrivateKey?: string;
+}): () => Promise<string> {
+  if (config.appId && config.installationId && config.appPrivateKey) {
+    const key = cacheKey({
+      appId: config.appId,
+      installationId: config.installationId,
+      appPrivateKey: config.appPrivateKey,
+    });
+    let getter = managerCache.get(key);
+    if (!getter) {
+      const manager = new AppTokenManager({
+        appId: config.appId,
+        installationId: config.installationId,
+        appPrivateKey: config.appPrivateKey,
+      });
+      getter = () => manager.getToken();
+      managerCache.set(key, getter);
+    }
+    return getter;
+  }
+  return () => Promise.resolve(config.token);
+}
+
+/** Clear the singleton cache. Useful in tests to ensure isolation. */
+export function clearTokenManagerCache(): void {
+  managerCache.clear();
 }

@@ -11,6 +11,7 @@
 
 import { createHash }                    from "node:crypto";
 import { openSealBox, derivePublicKey }  from "../crypto/sodium.ts";
+import { GH_UA }                         from "../lib/constants.ts";
 import type { TentacleKind, RelayConfig, ProxyConfig } from "../types.ts";
 
 const RESOLVE_TIMEOUT_MS = 10_000;
@@ -59,7 +60,7 @@ export class DeadDropResolver {
             headers: {
               Authorization: `Bearer ${this.token}`,
               Accept: "application/vnd.github+json",
-              "User-Agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0",
+              "User-Agent": GH_UA,
             },
             signal: controller.signal,
           }

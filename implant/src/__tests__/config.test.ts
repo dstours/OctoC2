@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 
 // parseProxyRepos is exported from index.ts for testing — see step 3.
-import { parseProxyRepos, parseCleanupDays } from "../index.ts";
+import { parseProxyRepos, parseCleanupDays, parseTentaclePriority } from "../index.ts";
 import type { ProxyConfig } from "../types.ts";
 
 describe("parseProxyRepos", () => {
@@ -91,5 +91,74 @@ describe("parseCleanupDays", () => {
   it("returns 3 for '3'", () => {
     process.env["SVC_CLEANUP_DAYS"] = "3";
     expect(parseCleanupDays()).toBe(3);
+  });
+});
+
+
+describe("parseTentaclePriority", () => {
+  const orig = process.env["SVC_TENTACLE_PRIORITY"];
+  const origGrpcDirect = process.env["SVC_GRPC_DIRECT"];
+  const origHttpUrl = process.env["SVC_HTTP_URL"];
+  const origProxyRepos = process.env["SVC_PROXY_REPOS"];
+
+  afterEach(() => {
+    if (orig === undefined) delete process.env["SVC_TENTACLE_PRIORITY"];
+    else process.env["SVC_TENTACLE_PRIORITY"] = orig;
+
+    if (origGrpcDirect === undefined) delete process.env["SVC_GRPC_DIRECT"];
+    else process.env["SVC_GRPC_DIRECT"] = origGrpcDirect;
+
+    if (origHttpUrl === undefined) delete process.env["SVC_HTTP_URL"];
+    else process.env["SVC_HTTP_URL"] = origHttpUrl;
+
+    if (origProxyRepos === undefined) delete process.env["SVC_PROXY_REPOS"];
+    else process.env["SVC_PROXY_REPOS"] = origProxyRepos;
+  });
+
+  it("auto-detects codespaces when SVC_GRPC_DIRECT is set", () => {
+    delete process.env["SVC_TENTACLE_PRIORITY"];
+    process.env["SVC_GRPC_DIRECT"] = "localhost:50051";
+    expect(parseTentaclePriority()).toEqual(["codespaces", "issues"]);
+  });
+
+  it("auto-detects http when SVC_HTTP_URL is set", () => {
+    delete process.env["SVC_TENTACLE_PRIORITY"];
+    process.env["SVC_HTTP_URL"] = "http://localhost:8080";
+    expect(parseTentaclePriority()).toEqual(["http", "issues"]);
+  });
+
+  it("auto-detects proxy when SVC_PROXY_REPOS is non-empty", () => {
+    delete process.env["SVC_TENTACLE_PRIORITY"];
+    process.env["SVC_PROXY_REPOS"] = JSON.stringify([{ owner: "a", repo: "b", innerKind: "issues" }]);
+    expect(parseTentaclePriority()).toEqual(["proxy", "issues"]);
+  });
+
+  it("falls back to issues when no env vars are set", () => {
+    delete process.env["SVC_TENTACLE_PRIORITY"];
+    delete process.env["SVC_GRPC_DIRECT"];
+    delete process.env["SVC_HTTP_URL"];
+    delete process.env["SVC_PROXY_REPOS"];
+    expect(parseTentaclePriority()).toEqual(["issues"]);
+  });
+
+  it("parses a valid comma-separated priority list", () => {
+    process.env["SVC_TENTACLE_PRIORITY"] = "codespaces,notes,issues";
+    expect(parseTentaclePriority()).toEqual(["codespaces", "notes", "issues"]);
+  });
+
+  it("silently drops invalid entries and warns", () => {
+    process.env["SVC_TENTACLE_PRIORITY"] = "codesapces,issues";
+    const result = parseTentaclePriority();
+    expect(result).toEqual(["issues"]);
+  });
+
+  it("returns issues when all entries are invalid", () => {
+    process.env["SVC_TENTACLE_PRIORITY"] = "codesapces,proxyy,stegoo";
+    expect(parseTentaclePriority()).toEqual(["issues"]);
+  });
+
+  it("trims whitespace around entries", () => {
+    process.env["SVC_TENTACLE_PRIORITY"] = "  notes  ,  gist  , issues ";
+    expect(parseTentaclePriority()).toEqual(["notes", "gist", "issues"]);
   });
 });
