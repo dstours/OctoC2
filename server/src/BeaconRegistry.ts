@@ -50,6 +50,8 @@ export class BeaconRegistry {
   private readonly dataDir: string;
   private readonly persistPath: string;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly DEBOUNCE_MS = 1000;
 
   constructor(dataDir = process.env["OCTOC2_DATA_DIR"] ?? "./data") {
     this.dataDir     = dataDir;
@@ -98,6 +100,10 @@ export class BeaconRegistry {
     if (this.saveTimer) {
       clearInterval(this.saveTimer);
       this.saveTimer = null;
+    }
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
     }
     await this.persist();
   }
@@ -149,11 +155,9 @@ export class BeaconRegistry {
       `on issue #${data.issueNumber}`
     );
 
-    // Persist immediately so registry.json reflects the new beacon without
-    // waiting for the 5-minute auto-save interval.
-    this.persist().catch((err) =>
-      console.warn("[Registry] Persist on registration failed:", (err as Error).message)
-    );
+    // Debounce persist so rapid registrations (e.g. 10 beacons checking in
+    // within the same second) coalesce into a single disk write.
+    this.debouncedPersist();
 
     return record;
   }
@@ -238,6 +242,19 @@ export class BeaconRegistry {
         console.log(`[Registry] Beacon ${record.beaconId} (${record.hostname}) marked dormant`);
       }
     }
+  }
+
+  /** Queue a persist with 1-second debounce. Multiple calls within the window coalesce. */
+  private debouncedPersist(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      this.persist().catch((err) =>
+        console.warn("[Registry] Debounced persist failed:", (err as Error).message)
+      );
+    }, BeaconRegistry.DEBOUNCE_MS);
   }
 
   private async persist(): Promise<void> {
