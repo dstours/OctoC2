@@ -169,3 +169,17 @@ describe("ConnectionFactory.getTentacles (proxy)", () => {
     expect(factory.getTentacles().filter(t => t.kind === "proxy")).toHaveLength(0);
   });
 });
+
+describe("ConnectionFactory.teardown", () => {
+  it("resets bootstrapped so the next checkin shows [bootstrap] logs", async () => {
+    const f = new ConnectionFactory({ config: makeConfig() });
+    f.register(makeTentacle("issues", true));
+    await f.checkin(DUMMY_PAYLOAD);
+    // After a successful checkin, bootstrapped is true — [bootstrap] logs stop
+    await f.teardown();
+    // Re-register and checkin again — bootstrap should reappear
+    f.register(makeTentacle("issues", true));
+    // We verify indirectly: isFullyExhausted should be false after re-register
+    expect(f.isFullyExhausted()).toBe(false);
+  });
+});

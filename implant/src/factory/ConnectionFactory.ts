@@ -355,5 +355,6 @@ export class ConnectionFactory {
     );
     this.registry.clear();
     this.proxyEntries = [];
+    this.bootstrapped = false;
   }
 }
