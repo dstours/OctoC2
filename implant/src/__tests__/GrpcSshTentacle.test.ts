@@ -2,13 +2,17 @@
  * OctoC2 — GrpcSshTentacle unit tests
  *
  * All tests use SVC_GRPC_DIRECT=localhost:<port> — no SSH or Codespace needed.
- * A real grpc-test-server subprocess is spawned in beforeAll.
+ * A real gRPC test server is started inline (same process) to avoid subprocess
+ * spawn issues across platforms and security tooling.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { createServer }  from "node:net";
 import type { AddressInfo } from "node:net";
-import { join }          from "node:path";
+
+import * as grpc        from "@grpc/grpc-js";
+import * as protoLoader from "@grpc/proto-loader";
+import { join }         from "node:path";
 
 import { GrpcSshTentacle }  from "../tentacles/GrpcSshTentacle.ts";
 import { ConnectionFactory } from "../factory/ConnectionFactory.ts";
@@ -36,7 +40,7 @@ function findFreePort(): Promise<number> {
 
 // ── Test fixtures ──────────────────────────────────────────────────────────────
 
-const REPO_ROOT = join(import.meta.dir, "../../..");
+const PROTO_PATH = join(import.meta.dir, "../../../proto/svc.proto");
 
 function makeConfig(overrides: Partial<BeaconConfig> = {}): BeaconConfig {
   return {
@@ -63,10 +67,68 @@ const TEST_PAYLOAD: CheckinPayload = {
   checkinAt: new Date().toISOString(),
 };
 
-// ── Lifecycle ──────────────────────────────────────────────────────────────────
+// ── Inline gRPC test server ────────────────────────────────────────────────────
 
 let testPort: number;
-let serverProc: ReturnType<typeof Bun.spawn>;
+let grpcServer: grpc.Server | null = null;
+
+async function startInlineGrpcServer(port: number): Promise<void> {
+  const packageDef = await protoLoader.load(PROTO_PATH, {
+    keepCase: false,
+    longs:    String,
+    enums:    String,
+    defaults: true,
+    oneofs:   true,
+  });
+
+  const proto = grpc.loadPackageDefinition(packageDef) as Record<string, any>;
+  const BeaconService = (proto["svc"] as Record<string, any>)["BeaconService"] as grpc.ServiceClientConstructor;
+
+  grpcServer = new grpc.Server();
+  grpcServer.addService(BeaconService.service, {
+    checkin: (_call: grpc.ServerUnaryCall<unknown, unknown>, callback: grpc.sendUnaryData<unknown>) => {
+      callback(null, {
+        pendingTasks: [
+          {
+            id:        "test-task-1",
+            kind:      "shell",
+            argsJson:  JSON.stringify({ cmd: "echo grpc-ok" }),
+            issuedAt:  new Date().toISOString(),
+          },
+        ],
+      });
+    },
+
+    submitResult: (call: grpc.ServerUnaryCall<unknown, unknown>, callback: grpc.sendUnaryData<unknown>) => {
+      console.log("[grpc-test-server] SubmitResult:", JSON.stringify((call as any).request, null, 2));
+      callback(null, { accepted: true, message: "ok" });
+    },
+  });
+
+  return new Promise((resolve, reject) => {
+    grpcServer!.bindAsync(
+      `localhost:${port}`,
+      grpc.ServerCredentials.createInsecure(),
+      (err) => {
+        if (err) return reject(err);
+        resolve();
+      }
+    );
+  });
+}
+
+function stopInlineGrpcServer(): Promise<void> {
+  if (!grpcServer) return Promise.resolve();
+  return new Promise((resolve) => {
+    grpcServer!.tryShutdown((err) => {
+      if (err) grpcServer!.forceShutdown();
+      grpcServer = null;
+      resolve();
+    });
+  });
+}
+
+// ── Lifecycle ──────────────────────────────────────────────────────────────────
 
 beforeAll(async () => {
   // Clear SSH env vars so they don't interfere
@@ -74,25 +136,13 @@ beforeAll(async () => {
   delete process.env["SVC_GITHUB_USER"];
 
   testPort = await findFreePort();
-
-  serverProc = Bun.spawn({
-    cmd: [process.execPath, "run", "scripts/grpc-test-server.ts"],
-    cwd: REPO_ROOT,
-    env: { ...process.env, GRPC_TEST_PORT: String(testPort) },
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  // Give the server time to bind
-  await new Promise((r) => setTimeout(r, 2000));
-
+  await startInlineGrpcServer(testPort);
   process.env["SVC_GRPC_DIRECT"] = `localhost:${testPort}`;
 });
 
 afterAll(async () => {
   delete process.env["SVC_GRPC_DIRECT"];
-  try { serverProc?.kill("SIGTERM"); } catch {}
-  await new Promise((r) => setTimeout(r, 300));
+  await stopInlineGrpcServer();
 });
 
 // ── isAvailable() ──────────────────────────────────────────────────────────────
