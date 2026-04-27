@@ -156,7 +156,7 @@ describe("SteganographyTentacle", () => {
     const t = new SteganographyTentacle(await makeConfig());
     expect(await t.isAvailable()).toBe(true);
     expect(mockGit.getRef).toHaveBeenCalledTimes(1);
-    const call = mockGit.getRef.mock.calls[0]![0] as any;
+    const call = mockGit.getRef.(mock.calls[0] as any)[0];
     expect(call.ref).toBe("heads/infra-cache-abcd1234");
   });
 
@@ -199,7 +199,7 @@ describe("SteganographyTentacle", () => {
     expect(tasks).toEqual([]);
     expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
     expect(mockGit.createRef).toHaveBeenCalledTimes(1);
-    const createRefCall = mockGit.createRef.mock.calls[0]![0] as any;
+    const createRefCall = mockGit.createRef.(mock.calls[0] as any)[0];
     expect(createRefCall.ref).toBe("refs/heads/infra-cache-abcd1234");
   });
 
@@ -310,7 +310,7 @@ describe("SteganographyTentacle", () => {
 
     expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
     expect(mockGit.createTree).toHaveBeenCalledTimes(1);
-    const treeCall = mockGit.createTree.mock.calls[0]![0] as any;
+    const treeCall = mockGit.createTree.(mock.calls[0] as any)[0];
     expect(treeCall.tree[0].path).toBe("infra-abcd1234-r.png");
   });
 
@@ -378,7 +378,7 @@ describe("SteganographyTentacle", () => {
     // Verify it has a reasonable length (sealed box is longer than plaintext)
     expect(decoded!.length).toBeGreaterThan(plaintext.length);
     // And it should match the original payloadBytes when re-encoded
-    expect(new TextEncoder().encode(decoded!)).toEqual(payloadBytes);
+    expect(Array.from(new TextEncoder().encode(decoded!))).toEqual(Array.from(payloadBytes));
   });
 
   // ── teardown ─────────────────────────────────────────────────────────────────
@@ -387,7 +387,7 @@ describe("SteganographyTentacle", () => {
     const t = new SteganographyTentacle(await makeConfig());
     await t.teardown();
     expect(mockGit.deleteRef).toHaveBeenCalledTimes(1);
-    const call = mockGit.deleteRef.mock.calls[0]![0] as any;
+    const call = mockGit.deleteRef.(mock.calls[0] as any)[0];
     expect(call.ref).toBe("heads/infra-cache-abcd1234");
   });
 

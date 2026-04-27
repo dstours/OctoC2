@@ -64,7 +64,7 @@ describe("selfDelete", () => {
     const result = await selfDelete();
     // Should reference argv[1] in the result message
     expect(result).toContain("fake-beacon-script");
-    process.argv[1] = origArgv1;
+    process.argv[1] = origArgv1 as string;
   });
 });
 
