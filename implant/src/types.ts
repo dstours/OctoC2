@@ -105,6 +105,8 @@ export interface TaskResult {
   completedAt: string;
   /** Signed with beacon's secret key so operator can verify authenticity */
   signature?: string;
+  /** Optional execution metadata (e.g. shellInvoked, exitCode) */
+  metadata?: Record<string, unknown>;
 }
 
 // ── Checkin / heartbeat ────────────────────────────────────────────────────────

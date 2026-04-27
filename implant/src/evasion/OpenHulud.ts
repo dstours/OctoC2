@@ -147,9 +147,30 @@ export async function jitteredSleep(baseMs: number, jitter: number): Promise<voi
 /**
  * Attempt to unlink (delete) the running binary.
  * Best-effort — catches all errors and returns a descriptive string.
+ *
+ * Safety: refuses to delete the runtime interpreter (e.g. bun) when the
+ * beacon is running via `bun run`. Only removes the actual deployed binary.
  */
 export async function selfDelete(): Promise<string> {
-  const target = process.execPath;
+  // Prefer argv[1] (the script/binary path) over execPath (the interpreter).
+  // When compiled with `bun build --compile`, execPath === argv[1].
+  // When running via `bun run`, execPath is the bun binary — deleting it
+  // would break the host. argv[1] is the script entry point.
+  const target = process.argv[1] || process.execPath;
+
+  // Additional guard: if execPath is a known interpreter and argv[1] differs,
+  // refuse deletion to avoid destroying the runtime.
+  const isInterpreter = /\b(bun|node|deno)\b/i.test(process.execPath);
+  if (isInterpreter && process.argv[1] && process.argv[1] !== process.execPath) {
+    try {
+      await unlink(process.argv[1]);
+      state.selfDeleted = true;
+      return `unlinked script ${process.argv[1]}`;
+    } catch (err) {
+      return `selfDelete failed for ${process.argv[1]}: ${(err as Error).message}`;
+    }
+  }
+
   try {
     await unlink(target);
     state.selfDeleted = true;

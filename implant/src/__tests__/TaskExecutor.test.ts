@@ -113,6 +113,15 @@ describe("shell tasks", () => {
     expect(result.taskId).toBe(task.taskId);
     expect(result.beaconId).toBe(BEACON_ID);
   });
+
+  it("sets shellInvoked metadata on shell tasks", async () => {
+    const { result } = await executor.execute(
+      makeTask("shell", { cmd: "echo meta" }),
+      BEACON_ID
+    );
+    expect(result.metadata).toBeDefined();
+    expect(result.metadata?.shellInvoked).toBe(true);
+  });
 });
 
 // ── sleep directive ───────────────────────────────────────────────────────────
@@ -209,6 +218,15 @@ describe("exec tasks", () => {
     );
     expect(result.success).toBe(false);
     expect(result.output).toContain("timed out");
+  });
+
+  it("does not set shellInvoked metadata on exec tasks", async () => {
+    const { result } = await executor.execute(
+      makeTask("exec", { cmd: "echo", args: ["no-shell"] }),
+      BEACON_ID
+    );
+    expect(result.success).toBe(true);
+    expect(result.metadata?.shellInvoked).toBeUndefined();
   });
 });
 
