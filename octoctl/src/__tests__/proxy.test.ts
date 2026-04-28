@@ -1,7 +1,42 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, mock } from "bun:test";
 import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// tentacles.test.ts mocks ../lib/registry.ts globally with mock.module.
+// Bun's mock.module persists across test files, so proxy tests that rely
+// on real registry I/O would see the stale mock. We restore the real
+// implementation here BEFORE ../commands/proxy.ts is imported.
+mock.module("../lib/registry.ts", () => ({
+  registryPath: (dataDir?: string) =>
+    join(dataDir ?? process.env["OCTOC2_DATA_DIR"] ?? "./data", "registry.json"),
+  loadRegistry: async (dataDir?: string) => {
+    const path = join(dataDir ?? process.env["OCTOC2_DATA_DIR"] ?? "./data", "registry.json");
+    if (!existsSync(path)) return [];
+    try {
+      const raw = await readFile(path, "utf8");
+      const snap = JSON.parse(raw) as { version: number; savedAt: string; beacons: unknown[] };
+      if (snap.version !== 1) return [];
+      return snap.beacons;
+    } catch {
+      return [];
+    }
+  },
+  getBeacon: async (beaconId: string, dataDir?: string) => {
+    const path = join(dataDir ?? process.env["OCTOC2_DATA_DIR"] ?? "./data", "registry.json");
+    if (!existsSync(path)) return undefined;
+    try {
+      const raw = await readFile(path, "utf8");
+      const snap = JSON.parse(raw) as { version: number; beacons: Array<{ beaconId: string }> };
+      if (snap.version !== 1) return undefined;
+      return snap.beacons.find(b => b.beaconId === beaconId || b.beaconId.startsWith(beaconId));
+    } catch {
+      return undefined;
+    }
+  },
+}));
+
 import {
   proxyCreate,
   proxyList,

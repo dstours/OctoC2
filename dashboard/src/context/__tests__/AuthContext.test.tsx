@@ -123,8 +123,7 @@ describe('AuthContext', () => {
         { wrapper: Wrapper },
       );
       await act(async () => screen.getByText('login').click());
-      expect(localStorage.setItem).not.toHaveBeenCalled();
-      expect(sessionStorage.setItem).not.toHaveBeenCalled();
+      expect(Storage.prototype.setItem).not.toHaveBeenCalled();
     });
   });
 
@@ -174,8 +173,7 @@ describe('AuthContext', () => {
         { wrapper: Wrapper },
       );
       await act(async () => screen.getByText('setPrivkey').click());
-      expect(localStorage.setItem).not.toHaveBeenCalled();
-      expect(sessionStorage.setItem).not.toHaveBeenCalled();
+      expect(Storage.prototype.setItem).not.toHaveBeenCalled();
     });
   });
 
