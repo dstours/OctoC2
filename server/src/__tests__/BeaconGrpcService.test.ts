@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as grpc from "@grpc/grpc-js";
+import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -134,11 +135,23 @@ async function bindPort(port: number): Promise<void> {
   });
 }
 
+function findOpenSsl(): string {
+  const onPath = Bun.which("openssl");
+  if (onPath) return onPath;
+  for (const candidate of [
+    "C:\\Program Files\\Git\\usr\\bin\\openssl.exe",
+    "C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe",
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error("openssl is required for the local gRPC TLS test");
+}
+
 async function ephemeralTls(): Promise<{ dir: string; tls: GrpcTlsConfig }> {
+  const openssl = findOpenSsl();
   const dir = await mkdtemp(join(tmpdir(), "octoc2-grpc-tls-"));
   const key = join(dir, "server.key");
   const cert = join(dir, "server.crt");
-  const openssl = "C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe";
   const proc = Bun.spawn([
     openssl,
     "req",
