@@ -1,8 +1,12 @@
-<p align="center">
-  <img src="docs-site/public/logo.png" alt="OctoC2" width="150" />
-</p>
+<!--
+  ╔═══════════════════════════════════════╗
+  ║  OctoC2 — GitHub-Native C2 Framework  ║
+  ╚═══════════════════════════════════════╝
+-->
 
-<h1 align="center">OctoC2</h1>
+<p align="center">
+  <img src="docs-site/public/logo.png" alt="OctoC2" width="260" />
+</p>
 
 <p align="center">
   A GitHub-native, encrypted control plane for authorized systems research.
