@@ -1,9 +1,10 @@
 import { useState } from 'react'
+import { DocumentationPage } from './DocumentationPage'
+import { DOCUMENTATION, DOCUMENTATION_BY_ID, documentationUrl } from './docs'
 
 const owner = import.meta.env.VITE_GITHUB_OWNER || 'dstours'
 const repo = import.meta.env.VITE_GITHUB_REPO || 'OctoC2'
 const repositoryUrl = `https://github.com/${owner}/${repo}`
-const docsUrl = (path: string) => `${repositoryUrl}/blob/main/${path}`
 const logoUrl = `${import.meta.env.BASE_URL}logo.png`
 
 const installCommand = `bun install --frozen-lockfile
@@ -75,81 +76,6 @@ const transportGroups = [
   },
 ]
 
-const guides = [
-  {
-    title: 'Installation',
-    description: 'Install the pinned toolchain, run each component, and build platform beacon binaries.',
-    href: docsUrl('docs/INSTALLATION.md'),
-    label: 'Install',
-  },
-  {
-    title: 'GitHub setup',
-    description: 'Configure repositories, the GitHub App, least-privilege permissions, PAT roles, and rotation.',
-    href: docsUrl('docs/GITHUB_SETUP.md'),
-    label: 'Provision',
-  },
-  {
-    title: 'Quickstart',
-    description: 'Build and import a pre-enrolled beacon, then verify an accepted ping result.',
-    href: docsUrl('docs/QUICKSTART.md'),
-    label: 'First run',
-  },
-  {
-    title: 'Architecture',
-    description: 'Understand components, identity boundaries, task lifecycle, durable state, and recovery.',
-    href: docsUrl('docs/ARCHITECTURE.md'),
-    label: 'Learn',
-  },
-  {
-    title: 'Channel guide',
-    description: 'Compare every transport, permission, prerequisite, priority rule, and qualification step.',
-    href: docsUrl('docs/CHANNELS.md'),
-    label: 'Transports',
-  },
-  {
-    title: 'Configuration',
-    description: 'Look up controller, listener, beacon, OIDC, recovery, dashboard, and CLI settings.',
-    href: docsUrl('docs/CONFIGURATION.md'),
-    label: 'Reference',
-  },
-  {
-    title: 'CLI reference',
-    description: 'Use setup, enrollment, builds, inventory, tasks, results, proxy, and service commands.',
-    href: docsUrl('docs/CLI.md'),
-    label: 'Operate',
-  },
-  {
-    title: 'Operations & assurance',
-    description: 'Listener policy, lifecycle behavior, replay protection, and certificate handling.',
-    href: docsUrl('docs/PRODUCTION.md'),
-    label: 'Operate safely',
-  },
-  {
-    title: 'Recovery',
-    description: 'Provision signed recovery records and short-lived GitHub App token leases.',
-    href: docsUrl('docs/RECOVERY.md'),
-    label: 'Configure recovery',
-  },
-  {
-    title: 'Troubleshooting',
-    description: 'Diagnose GitHub errors, decrypt failures, acknowledgements, proxy, TLS, gRPC, OIDC, and state.',
-    href: docsUrl('docs/TROUBLESHOOTING.md'),
-    label: 'Diagnose',
-  },
-  {
-    title: 'Development',
-    description: 'Work with shared contracts, tests, builds, generated protocol bindings, and change checks.',
-    href: docsUrl('docs/DEVELOPMENT.md'),
-    label: 'Contribute',
-  },
-  {
-    title: 'Verification evidence',
-    description: 'Trace implementation decisions to tests, live qualifications, and cleanup records.',
-    href: docsUrl('docs/REMEDIATION_TRACEABILITY.md'),
-    label: 'Review evidence',
-  },
-]
-
 function CopyButton({ value }: { value: string }) {
   const [status, setStatus] = useState<'idle' | 'copied' | 'blocked'>('idle')
 
@@ -211,6 +137,10 @@ function SectionHeading({
 }
 
 function App() {
+  const guideId = new URLSearchParams(window.location.search).get('guide')
+  const selectedGuide = guideId ? DOCUMENTATION_BY_ID.get(guideId) : undefined
+  if (selectedGuide) return <DocumentationPage entry={selectedGuide} />
+
   return (
     <div className="site-shell">
       <header className="topbar">
@@ -341,7 +271,7 @@ function App() {
               <strong>Dashboard address</strong>
               <p>Vite binds to <code>127.0.0.1:5173</code>. The controller’s HTTPS and gRPC listeners remain disabled until their explicit enable flags and TLS material are present.</p>
             </div>
-            <a href={docsUrl('docs/QUICKSTART.md')}>Open the complete quickstart →</a>
+            <a href={documentationUrl('quickstart')}>Open the complete quickstart →</a>
           </div>
         </section>
 
@@ -392,7 +322,7 @@ function App() {
               <li><span>✓</span> Delivery leases and replay state survive restarts.</li>
               <li><span>✓</span> Unsigned remote modules are rejected.</li>
             </ul>
-            <a href={docsUrl('docs/PRODUCTION.md')}>Read the operating model →</a>
+            <a href={documentationUrl('operations')}>Read the operating model →</a>
           </div>
         </section>
 
@@ -408,7 +338,7 @@ function App() {
               <div><span>1</span><p><strong>Policy</strong><small>Dependencies, workflows, toolchains, generated proto, and documentation stay aligned.</small></p></div>
               <div><span>2</span><p><strong>Behavior</strong><small>Bun tests cover signatures, replay handling, delivery ownership, persistence, and transport behavior.</small></p></div>
               <div><span>3</span><p><strong>Artifacts</strong><small>Builds and smoke tests verify the dashboard, CLI, controller, proxy, and target beacon binaries.</small></p></div>
-              <a className="text-link" href={docsUrl('docs/REMEDIATION_TRACEABILITY.md')}>Review verification traceability →</a>
+              <a className="text-link" href={documentationUrl('verification')}>Review verification traceability →</a>
             </div>
           </div>
         </section>
@@ -420,8 +350,8 @@ function App() {
             description="Follow the first-run path or jump directly to setup, channels, configuration, operations, recovery, troubleshooting, and development references."
           />
           <div className="guide-grid">
-            {guides.map((guide) => (
-              <a className="guide-card" href={guide.href} key={guide.title}>
+            {DOCUMENTATION.map((guide) => (
+              <a className="guide-card" href={documentationUrl(guide.id)} key={guide.title}>
                 <span className="guide-label">{guide.label}</span>
                 <h3>{guide.title}</h3>
                 <p>{guide.description}</p>
@@ -438,7 +368,7 @@ function App() {
           <div><strong>OctoC2</strong><span>Encrypted multi-channel operations</span></div>
         </div>
         <div className="footer-links">
-          <a href={docsUrl('docs/README.md')}>Documentation index ↗</a>
+          <a href={documentationUrl('documentation')}>Documentation index</a>
           <a href="#quickstart">Quickstart</a>
           <a href="#security">Security</a>
           <a href="#verification">Verification</a>
