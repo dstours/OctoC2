@@ -1,30 +1,45 @@
 // dashboard/src/components/__tests__/BeaconTable.test.tsx
 import { render, screen, within, fireEvent } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
+import * as ReactRouterDom from 'react-router-dom';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { GitHubIssue } from '@/types/github';
 import type { ConnectionMode } from '@/types';
+import * as AuthContextModule from '@/context/AuthContext';
+import * as GitHubApiClientModule from '@/lib/GitHubApiClient';
+import * as C2ServerClientModule from '@/lib/C2ServerClient';
+import * as CoordsModule from '@/lib/coords';
+import { restoreModuleMocks } from '@/test/moduleMocks';
 import { BeaconTable } from '../BeaconTable';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
-// vi.hoisted ensures these are defined before vi.mock factory runs (hoisting-safe)
-const mockGetBeacons        = vi.hoisted(() => vi.fn());
-const mockNavigate          = vi.hoisted(() => vi.fn());
-const mockLiveGetBeacons    = vi.hoisted(() => vi.fn());
-const mockQueueTask         = vi.hoisted(() => vi.fn().mockResolvedValue({ taskId: 't1' }));
-const mockSubscribeEvents   = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockGetBeacons        = vi.fn();
+const mockNavigate          = vi.fn();
+const mockLiveGetBeacons    = vi.fn();
+const mockQueueTask         = vi.fn().mockResolvedValue({ taskId: 't1' });
+const mockSubscribeEvents   = vi.fn().mockResolvedValue(undefined);
 
 // Flexible auth state controlled per test
 let mockAuthMode: ConnectionMode = 'api';
-let mockAuthPat = 'ghp_test';
+let mockGitHubPat = 'ghp_test';
+let mockOperatorToken = 'operator-test';
+
+restoreModuleMocks([
+  ['@/context/AuthContext', { ...AuthContextModule }],
+  ['@/lib/GitHubApiClient', { ...GitHubApiClientModule }],
+  ['@/lib/C2ServerClient', { ...C2ServerClientModule }],
+  ['@/lib/coords', { ...CoordsModule }],
+  ['react-router-dom', { ...ReactRouterDom }],
+]);
 
 vi.mock('@/context/AuthContext', () => ({
   useAuth: () => ({
-    pat:       mockAuthPat,
+    githubPat: mockGitHubPat,
+    operatorToken: mockOperatorToken,
     mode:      mockAuthMode,
-    serverUrl: 'http://localhost:8080',
+    serverUrl: 'https://localhost:8080',
     latencyMs: null,
     privkey:   null,
     login:     vi.fn(),
@@ -36,28 +51,27 @@ vi.mock('@/context/AuthContext', () => ({
 
 // Use regular function (not arrow) so `new GitHubApiClient(...)` works correctly
 vi.mock('@/lib/GitHubApiClient', () => ({
-  GitHubApiClient: vi.fn(function (this: Record<string, unknown>) {
-    this['getBeacons'] = mockGetBeacons;
-  }),
+  GitHubApiClient: class {
+    getBeacons = mockGetBeacons;
+  },
 }));
 
 vi.mock('@/lib/C2ServerClient', () => ({
-  C2ServerClient: vi.fn(function (this: Record<string, unknown>) {
-    this['getBeacons']      = mockLiveGetBeacons;
-    this['health']          = vi.fn().mockResolvedValue({ ok: true, latencyMs: 5 });
-    this['queueTask']       = mockQueueTask;
-    this['getResults']      = vi.fn().mockResolvedValue([]);
-    this['subscribeEvents'] = mockSubscribeEvents;
-  }),
+  C2ServerClient: class {
+    getBeacons = mockLiveGetBeacons;
+    health = vi.fn().mockResolvedValue({ ok: true, latencyMs: 5 });
+    queueTask = mockQueueTask;
+    getResults = vi.fn().mockResolvedValue([]);
+    subscribeEvents = mockSubscribeEvents;
+  },
 }));
 
 vi.mock('@/lib/coords', () => ({
   getGitHubCoords: () => ({ owner: 'test-owner', repo: 'test-repo' }),
 }));
 
-vi.mock('react-router-dom', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('react-router-dom')>();
-  return { ...actual, useNavigate: () => mockNavigate };
+vi.mock('react-router-dom', () => {
+  return { ...ReactRouterDom, useNavigate: () => mockNavigate };
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -99,7 +113,8 @@ function makeWrapper() {
 
 beforeEach(() => {
   mockAuthMode = 'api';
-  mockAuthPat  = 'ghp_test';
+  mockGitHubPat = 'ghp_test';
+  mockOperatorToken = 'operator-test';
   mockNavigate.mockReset();
   mockGetBeacons.mockReset();
   mockLiveGetBeacons.mockReset();
@@ -320,6 +335,24 @@ describe('BeaconTable', () => {
       expect(screen.getByRole('combobox', { name: /sort beacons/i })).toBeInTheDocument();
     });
 
+    it('offers and preserves the canonical Secrets (7b) and HTTP (13) channel IDs', async () => {
+      mockGetBeacons.mockResolvedValue([
+        makeIssue({ number: 7, body: 'hostname: secrets-host\nos: linux\ntentacle: 7b' }),
+        makeIssue({ number: 13, body: 'hostname: http-host\nos: linux\ntentacle: 13' }),
+      ]);
+      render(<BeaconTable />, { wrapper: makeWrapper() });
+      await screen.findByText('secrets-host');
+
+      const select = screen.getByRole('combobox', { name: /filter by tentacle/i }) as HTMLSelectElement;
+      const optionValues = Array.from(select.options).map(option => option.value);
+      expect(optionValues).toContain('7b');
+      expect(optionValues).toContain('13');
+
+      fireEvent.change(select, { target: { value: '7b' } });
+      expect(screen.getByText('secrets-host')).toBeInTheDocument();
+      expect(screen.queryByText('http-host')).not.toBeInTheDocument();
+    });
+
     it('filtering by status=active hides stale and dead beacons', async () => {
       mockGetBeacons.mockResolvedValue(multiBeacons());
       render(<BeaconTable />, { wrapper: makeWrapper() });
@@ -538,18 +571,10 @@ describe('BeaconTable', () => {
       expect(screen.getByTestId('bulk-action-bar')).toBeInTheDocument();
     }
 
-    it('Queue load-module button appears in bulk action bar', async () => {
+    it('does not expose a load-module control', async () => {
       await renderLiveWithSelection();
-      expect(screen.getByRole('button', { name: /queue load-module task/i })).toBeInTheDocument();
-    });
-
-    it('Queue load-module calls queueTask with correct args', async () => {
-      await renderLiveWithSelection();
-      fireEvent.change(screen.getByRole('textbox', { name: /module name/i }), {
-        target: { value: 'mymodule' },
-      });
-      fireEvent.click(screen.getByRole('button', { name: /queue load-module task/i }));
-      expect(mockQueueTask).toHaveBeenCalledWith('b1', 'load-module', { name: 'mymodule' });
+      expect(screen.queryByRole('button', { name: /load.module/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole('textbox', { name: /module name/i })).not.toBeInTheDocument();
     });
 
     it('Persist dropdown has expected options', async () => {
@@ -561,6 +586,7 @@ describe('BeaconTable', () => {
       expect(options).toContain('launchd');
       expect(options).toContain('registry');
       expect(options).toContain('gh-runner');
+      expect(options).toContain('gh-runner-register');
     });
 
     it('Persist button disabled in non-live mode', async () => {
@@ -568,7 +594,7 @@ describe('BeaconTable', () => {
       expect(screen.getByRole('button', { name: /queue persist task/i })).toBeDisabled();
     });
 
-    it('OpenHulud dropdown has expected actions', async () => {
+    it('Evasion dropdown has only the actions supported by the bulk form', async () => {
       await renderLiveWithSelection();
       const select = screen.getByRole('combobox', { name: /evasion action/i });
       const options = Array.from(select.querySelectorAll('option')).map(o => o.value);
@@ -577,22 +603,22 @@ describe('BeaconTable', () => {
       expect(options).toContain('sleep');
       expect(options).toContain('self_delete');
       expect(options).toContain('status');
-      expect(options).toContain('propagate');
+      expect(options).not.toContain('propagate');
     });
 
-    it('OpenHulud button calls confirm before queuing', async () => {
+    it('Evasion button calls confirm before queuing', async () => {
       vi.spyOn(window, 'confirm').mockReturnValue(true);
       await renderLiveWithSelection();
-      fireEvent.click(screen.getByRole('button', { name: /queue openhulud task/i }));
+      fireEvent.click(screen.getByRole('button', { name: /queue evasion task/i }));
       expect(window.confirm).toHaveBeenCalled();
-      expect(mockQueueTask).toHaveBeenCalledWith('b1', 'openhulud', expect.objectContaining({ action: 'hide' }));
+      expect(mockQueueTask).toHaveBeenCalledWith('b1', 'evasion', { action: 'hide' });
       vi.restoreAllMocks();
     });
 
-    it('OpenHulud button does not queue when confirm cancelled', async () => {
+    it('Evasion button does not queue when confirm cancelled', async () => {
       vi.spyOn(window, 'confirm').mockReturnValue(false);
       await renderLiveWithSelection();
-      fireEvent.click(screen.getByRole('button', { name: /queue openhulud task/i }));
+      fireEvent.click(screen.getByRole('button', { name: /queue evasion task/i }));
       expect(window.confirm).toHaveBeenCalled();
       expect(mockQueueTask).not.toHaveBeenCalled();
       vi.restoreAllMocks();
@@ -616,36 +642,10 @@ describe('BeaconTable', () => {
       vi.restoreAllMocks();
     });
 
-    it('Stego dropdown has expected actions', async () => {
+    it('does not expose unsupported OpenHulud or Stego task controls', async () => {
       await renderLiveWithSelection();
-      const select = screen.getByRole('combobox', { name: /stego action/i });
-      const options = Array.from(select.querySelectorAll('option')).map(o => o.value);
-      expect(options).toContain('ack');
-      expect(options).toContain('encode');
-      expect(options).toContain('decode');
-    });
-
-    it('Stego button calls confirm before queuing', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
-      await renderLiveWithSelection();
-      fireEvent.click(screen.getByRole('button', { name: /queue stego task/i }));
-      expect(window.confirm).toHaveBeenCalled();
-      expect(mockQueueTask).toHaveBeenCalledWith('b1', 'stego', expect.objectContaining({ action: 'encode' }));
-      vi.restoreAllMocks();
-    });
-
-    it('Stego button does not queue when confirm cancelled', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(false);
-      await renderLiveWithSelection();
-      fireEvent.click(screen.getByRole('button', { name: /queue stego task/i }));
-      expect(window.confirm).toHaveBeenCalled();
-      expect(mockQueueTask).not.toHaveBeenCalled();
-      vi.restoreAllMocks();
-    });
-
-    it('Stego button disabled in non-live mode', async () => {
-      await renderApiWithSelection();
-      expect(screen.getByRole('button', { name: /queue stego task/i })).toBeDisabled();
+      expect(screen.queryByRole('button', { name: /openhulud|stego/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole('combobox', { name: /stego action/i })).not.toBeInTheDocument();
     });
 
     it('View Results link appears and points to /results?beacons=<ids>', async () => {

@@ -2,8 +2,60 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 
 // parseProxyRepos is exported from index.ts for testing — see step 3.
-import { parseProxyRepos, parseCleanupDays, parseTentaclePriority } from "../index.ts";
-import type { ProxyConfig } from "../types.ts";
+import {
+  assertEd25519KeyPair,
+  assertX25519KeyPair,
+  parseCleanupDays,
+  parseProxyRepos,
+  parseRecoveryPollIntervalMs,
+  resolveGistToken,
+  parseSleepJitter,
+  parseSleepSeconds,
+  parseTentaclePriority,
+} from "../index.ts";
+import { generateKeyPair } from "../crypto/sodium.ts";
+import {
+  ed25519KeyId,
+  generateEd25519KeyPair,
+} from "@octoc2/shared";
+
+describe("provisioned identity validation", () => {
+  it("accepts matching X25519 and Ed25519 pairs", async () => {
+    const encryption = await generateKeyPair();
+    await expect(
+      assertX25519KeyPair(encryption, "test"),
+    ).resolves.toBeUndefined();
+
+    const signing = await generateEd25519KeyPair();
+    await expect(assertEd25519KeyPair(
+      signing,
+      await ed25519KeyId(signing.publicKey),
+      "test",
+    )).resolves.toBeUndefined();
+  });
+
+  it("rejects mismatched key pairs and signing key IDs", async () => {
+    const encryption = await generateKeyPair();
+    const otherEncryption = await generateKeyPair();
+    await expect(assertX25519KeyPair({
+      publicKey: encryption.publicKey,
+      secretKey: otherEncryption.secretKey,
+    }, "test")).rejects.toThrow("do not match");
+
+    const signing = await generateEd25519KeyPair();
+    const otherSigning = await generateEd25519KeyPair();
+    await expect(assertEd25519KeyPair({
+      publicKey: signing.publicKey,
+      secretKey: otherSigning.secretKey,
+    }, await ed25519KeyId(signing.publicKey), "test"))
+      .rejects.toThrow("do not match");
+    await expect(assertEd25519KeyPair(
+      signing,
+      await ed25519KeyId(otherSigning.publicKey),
+      "test",
+    )).rejects.toThrow("key ID");
+  });
+});
 
 describe("parseProxyRepos", () => {
   const orig = process.env["SVC_PROXY_REPOS"];
@@ -22,37 +74,18 @@ describe("parseProxyRepos", () => {
     expect(parseProxyRepos()).toEqual([]);
   });
 
-  it("returns [] for invalid JSON", () => {
-    process.env["SVC_PROXY_REPOS"] = "not-json";
-    expect(parseProxyRepos()).toEqual([]);
-  });
-
-  it("returns [] for non-array JSON", () => {
-    process.env["SVC_PROXY_REPOS"] = '{"owner":"x","repo":"y"}';
-    expect(parseProxyRepos()).toEqual([]);
-  });
-
-  it("filters out entries missing owner or repo", () => {
+  it("rejects every legacy static proxy declaration", () => {
     process.env["SVC_PROXY_REPOS"] = JSON.stringify([
-      { owner: "a", repo: "b", innerKind: "issues" },
-      { repo: "b", innerKind: "issues" },        // missing owner
-      { owner: "c", innerKind: "notes" },         // missing repo
+      {
+        owner: "coolcat",
+        repo: "my-dotfiles",
+        innerKind: "issues",
+        token: "persistent-proxy-token",
+      },
     ]);
-    const result = parseProxyRepos();
-    expect(result).toHaveLength(1);
-    expect(result[0]!.owner).toBe("a");
-  });
-
-  it("parses a valid array of ProxyConfig objects", () => {
-    const configs: ProxyConfig[] = [
-      { owner: "coolcat", repo: "my-dotfiles", innerKind: "issues" },
-      { owner: "devuser", repo: "config-snippets", innerKind: "notes", token: "tok123" },
-    ];
-    process.env["SVC_PROXY_REPOS"] = JSON.stringify(configs);
-    const result = parseProxyRepos();
-    expect(result).toHaveLength(2);
-    expect(result[0]).toMatchObject({ owner: "coolcat", repo: "my-dotfiles", innerKind: "issues" });
-    expect(result[1]!.token).toBe("tok123");
+    expect(() => parseProxyRepos()).toThrow(
+      "must arrive in a signed recovery record",
+    );
   });
 });
 
@@ -94,12 +127,78 @@ describe("parseCleanupDays", () => {
   });
 });
 
+describe("resolveGistToken", () => {
+  it("accepts a dedicated Gist credential", () => {
+    expect(resolveGistToken("  gist-token  ", ["repo-token"]))
+      .toBe("gist-token");
+  });
+
+  it("returns undefined when Gist is not configured", () => {
+    expect(resolveGistToken("  ", ["repo-token"])).toBeUndefined();
+  });
+
+  it("rejects credential-role collisions", () => {
+    expect(() => resolveGistToken("same-token", ["same-token"]))
+      .toThrow("SVC_GIST_TOKEN must be distinct");
+  });
+});
+
+describe("implant timing configuration", () => {
+  it("uses conservative defaults", () => {
+    expect(parseSleepSeconds(undefined)).toBe(60);
+    expect(parseSleepJitter(undefined)).toBe(0.3);
+    expect(parseRecoveryPollIntervalMs(undefined)).toBe(60_000);
+  });
+
+  it("accepts bounded explicit values", () => {
+    expect(parseSleepSeconds("120")).toBe(120);
+    expect(parseSleepJitter("0.5")).toBe(0.5);
+    expect(parseRecoveryPollIntervalMs("30000")).toBe(30_000);
+  });
+
+  it("rejects malformed or unsafe sleep configuration", () => {
+    expect(() => parseSleepSeconds("NaN")).toThrow("SVC_SLEEP");
+    expect(() => parseSleepSeconds("0")).toThrow("SVC_SLEEP");
+    expect(() => parseSleepSeconds("1.5")).toThrow("SVC_SLEEP");
+    expect(() => parseSleepSeconds("86401")).toThrow("SVC_SLEEP");
+    expect(() => parseSleepJitter("-0.1")).toThrow("SVC_JITTER");
+    expect(() => parseSleepJitter("1.1")).toThrow("SVC_JITTER");
+  });
+
+  it("rejects recovery polling that is too fast, too slow, or malformed", () => {
+    expect(() => parseRecoveryPollIntervalMs("9999")).toThrow(
+      "SVC_RECOVERY_POLL_INTERVAL_MS",
+    );
+    expect(() => parseRecoveryPollIntervalMs("2700001")).toThrow(
+      "SVC_RECOVERY_POLL_INTERVAL_MS",
+    );
+    expect(() => parseRecoveryPollIntervalMs("10000.5")).toThrow(
+      "SVC_RECOVERY_POLL_INTERVAL_MS",
+    );
+  });
+});
+
 
 describe("parseTentaclePriority", () => {
   const orig = process.env["SVC_TENTACLE_PRIORITY"];
   const origGrpcDirect = process.env["SVC_GRPC_DIRECT"];
+  const origCodespaceName = process.env["SVC_GRPC_CODESPACE_NAME"];
+  const origGitHubUser = process.env["SVC_GITHUB_USER"];
+  const origCodespacesToken =
+    process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+  const origAutoProvision =
+    process.env["SVC_AUTO_PROVISION_CODESPACE"];
   const origHttpUrl = process.env["SVC_HTTP_URL"];
-  const origProxyRepos = process.env["SVC_PROXY_REPOS"];
+
+  beforeEach(() => {
+    delete process.env["SVC_TENTACLE_PRIORITY"];
+    delete process.env["SVC_GRPC_DIRECT"];
+    delete process.env["SVC_GRPC_CODESPACE_NAME"];
+    delete process.env["SVC_GITHUB_USER"];
+    delete process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+    delete process.env["SVC_AUTO_PROVISION_CODESPACE"];
+    delete process.env["SVC_HTTP_URL"];
+  });
 
   afterEach(() => {
     if (orig === undefined) delete process.env["SVC_TENTACLE_PRIORITY"];
@@ -108,16 +207,47 @@ describe("parseTentaclePriority", () => {
     if (origGrpcDirect === undefined) delete process.env["SVC_GRPC_DIRECT"];
     else process.env["SVC_GRPC_DIRECT"] = origGrpcDirect;
 
+    if (origCodespaceName === undefined) {
+      delete process.env["SVC_GRPC_CODESPACE_NAME"];
+    } else {
+      process.env["SVC_GRPC_CODESPACE_NAME"] = origCodespaceName;
+    }
+    if (origGitHubUser === undefined) {
+      delete process.env["SVC_GITHUB_USER"];
+    } else {
+      process.env["SVC_GITHUB_USER"] = origGitHubUser;
+    }
+    if (origCodespacesToken === undefined) {
+      delete process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+    } else {
+      process.env["SVC_CODESPACES_GITHUB_TOKEN"] = origCodespacesToken;
+    }
+    if (origAutoProvision === undefined) {
+      delete process.env["SVC_AUTO_PROVISION_CODESPACE"];
+    } else {
+      process.env["SVC_AUTO_PROVISION_CODESPACE"] = origAutoProvision;
+    }
+
     if (origHttpUrl === undefined) delete process.env["SVC_HTTP_URL"];
     else process.env["SVC_HTTP_URL"] = origHttpUrl;
 
-    if (origProxyRepos === undefined) delete process.env["SVC_PROXY_REPOS"];
-    else process.env["SVC_PROXY_REPOS"] = origProxyRepos;
   });
 
   it("auto-detects codespaces when SVC_GRPC_DIRECT is set", () => {
     delete process.env["SVC_TENTACLE_PRIORITY"];
     process.env["SVC_GRPC_DIRECT"] = "localhost:50051";
+    expect(parseTentaclePriority()).toEqual(["codespaces", "issues"]);
+  });
+
+  it("requires a dedicated user credential for Codespaces SSH auto-detection", () => {
+    delete process.env["SVC_TENTACLE_PRIORITY"];
+    delete process.env["SVC_GRPC_DIRECT"];
+    process.env["SVC_GRPC_CODESPACE_NAME"] = "example-codespace";
+    process.env["SVC_GITHUB_USER"] = "example-user";
+    delete process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+    expect(parseTentaclePriority()).toEqual(["issues"]);
+
+    process.env["SVC_CODESPACES_GITHUB_TOKEN"] = "user-token";
     expect(parseTentaclePriority()).toEqual(["codespaces", "issues"]);
   });
 
@@ -127,23 +257,30 @@ describe("parseTentaclePriority", () => {
     expect(parseTentaclePriority()).toEqual(["http", "issues"]);
   });
 
-  it("auto-detects proxy when SVC_PROXY_REPOS is non-empty", () => {
-    delete process.env["SVC_TENTACLE_PRIORITY"];
-    process.env["SVC_PROXY_REPOS"] = JSON.stringify([{ owner: "a", repo: "b", innerKind: "issues" }]);
-    expect(parseTentaclePriority()).toEqual(["proxy", "issues"]);
-  });
-
   it("falls back to issues when no env vars are set", () => {
     delete process.env["SVC_TENTACLE_PRIORITY"];
     delete process.env["SVC_GRPC_DIRECT"];
+    delete process.env["SVC_GRPC_CODESPACE_NAME"];
+    delete process.env["SVC_GITHUB_USER"];
+    delete process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+    delete process.env["SVC_AUTO_PROVISION_CODESPACE"];
     delete process.env["SVC_HTTP_URL"];
-    delete process.env["SVC_PROXY_REPOS"];
     expect(parseTentaclePriority()).toEqual(["issues"]);
   });
 
   it("parses a valid comma-separated priority list", () => {
     process.env["SVC_TENTACLE_PRIORITY"] = "codespaces,notes,issues";
     expect(parseTentaclePriority()).toEqual(["codespaces", "notes", "issues"]);
+  });
+
+  it("accepts pages from the shared selectable channel catalog", () => {
+    process.env["SVC_TENTACLE_PRIORITY"] = "pages,issues";
+    expect(parseTentaclePriority()).toEqual(["pages", "issues"]);
+  });
+
+  it("fails closed for cataloged but unavailable legacy channels", () => {
+    process.env["SVC_TENTACLE_PRIORITY"] = "pull_request";
+    expect(parseTentaclePriority()).toEqual(["issues"]);
   });
 
   it("silently drops invalid entries and warns", () => {

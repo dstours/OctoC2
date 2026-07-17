@@ -12,6 +12,7 @@
  *   5. Return { name, user } so GrpcSshTentacle can open the SSH tunnel.
  *
  * Environment variables read:
+ *   SVC_CODESPACES_GITHUB_TOKEN — explicit user-scoped runtime credential
  *   SVC_GRPC_CODESPACE_NAME  — skip provisioning if already set (use existing)
  *   SVC_GITHUB_USER          — skip /user lookup if already set
  *   SVC_CODESPACE_WAIT_MS    — max ms to wait for Available state (default: 120 000)

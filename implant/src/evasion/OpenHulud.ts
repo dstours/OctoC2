@@ -17,8 +17,9 @@
 import { unlink, readFile, writeFile, mkdir } from "node:fs/promises";
 import { execFile }  from "node:child_process";
 import { promisify } from "node:util";
-import { join }      from "node:path";
+import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
+import type { SelfDeleteOutcome } from "../tasks/TaskDirective.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -151,32 +152,56 @@ export async function jitteredSleep(baseMs: number, jitter: number): Promise<voi
  * Safety: refuses to delete the runtime interpreter (e.g. bun) when the
  * beacon is running via `bun run`. Only removes the actual deployed binary.
  */
-export async function selfDelete(): Promise<string> {
-  // Prefer argv[1] (the script/binary path) over execPath (the interpreter).
-  // When compiled with `bun build --compile`, execPath === argv[1].
-  // When running via `bun run`, execPath is the bun binary — deleting it
-  // would break the host. argv[1] is the script entry point.
-  const target = process.argv[1] || process.execPath;
+export function isStandaloneExecutableEntry(
+  executablePath: string,
+  argvEntry: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (!argvEntry) return false;
+  const executable = resolve(executablePath);
+  const entry = resolve(argvEntry);
+  return platform === "win32"
+    ? entry.toLowerCase() === executable.toLowerCase()
+    : entry === executable;
+}
 
-  // Additional guard: if execPath is a known interpreter and argv[1] differs,
-  // refuse deletion to avoid destroying the runtime.
-  const isInterpreter = /\b(bun|node|deno)\b/i.test(process.execPath);
-  if (isInterpreter && process.argv[1] && process.argv[1] !== process.execPath) {
-    try {
-      await unlink(process.argv[1]);
-      state.selfDeleted = true;
-      return `unlinked script ${process.argv[1]}`;
-    } catch (err) {
-      return `selfDelete failed for ${process.argv[1]}: ${(err as Error).message}`;
-    }
+export async function selfDelete(): Promise<SelfDeleteOutcome> {
+  // argv[1] names the source entry point under Bun/Node/Deno, but a standalone
+  // compiled beacon identifies its own executable there. Compare paths rather
+  // than executable names: an interpreter can be renamed, and a compiled
+  // beacon can legitimately have an interpreter-like filename.
+  const argvEntry = process.argv[1];
+  const executable = resolve(process.execPath);
+  if (!isStandaloneExecutableEntry(executable, argvEntry)) {
+    return {
+      success: false,
+      detail:
+        "selfDelete skipped because the process entry point is not the running executable",
+    };
   }
 
+  const target = executable;
   try {
     await unlink(target);
     state.selfDeleted = true;
-    return `unlinked ${target}`;
-  } catch (err) {
-    return `selfDelete failed for ${target}: ${(err as Error).message}`;
+    return { success: true, detail: `unlinked ${target}` };
+  } catch (err: unknown) {
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      "code" in err &&
+      err.code === "ENOENT"
+    ) {
+      state.selfDeleted = true;
+      return {
+        success: true,
+        detail: `already absent ${target}`,
+      };
+    }
+    return {
+      success: false,
+      detail: `selfDelete failed for ${target}: ${(err as Error).message}`,
+    };
   }
 }
 
@@ -289,8 +314,9 @@ async function persistViaGhRunner(
   repo?: string
 ): Promise<PersistenceResult> {
   // Step 1: get a runner registration token from GitHub API
-  // Dot notation required — Bun --define substitutes process.env.X but not process.env["X"]
-  const apiToken = token ?? process.env.OCTOC2_GITHUB_TOKEN ?? process.env["GITHUB_TOKEN"] ?? "";
+  // Runner administration is never inferred from the beacon's transport
+  // credential. It requires the explicit, operator-confirmed task argument.
+  const apiToken = token ?? "";
   const repoOwner = owner ?? process.env.OCTOC2_REPO_OWNER ?? "";
   const repoName  = repo  ?? process.env.OCTOC2_REPO_NAME  ?? "";
 

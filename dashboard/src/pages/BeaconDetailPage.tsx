@@ -10,31 +10,39 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ChevronLeft } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 import { C2ServerClient } from '@/lib/C2ServerClient';
-import type { ServerTask, ModuleInfo, SSEEvent } from '@/lib/C2ServerClient';
+import type { ServerTask, SSEEvent } from '@/lib/C2ServerClient';
 import { GitHubApiClient } from '@/lib/GitHubApiClient';
 import { parseBeacon } from '@/lib/parseBeacon';
 import { getGitHubCoords } from '@/lib/coords';
-import { decryptSealedResult, deadDropGistKey } from '@/lib/crypto';
+import { decryptSealedResult, recoveryDropPath } from '@/lib/crypto';
 import { BeaconStatusDot } from '@/components/BeaconStatusDot';
 import { MaintenancePanel } from '@/components/MaintenancePanel';
-import type { Beacon, TentacleId } from '@/types';
+import type { Beacon } from '@/types';
 import { TENTACLE_NAMES } from '@/types';
+import {
+  CHANNEL_BY_KIND,
+  CHANNEL_CATALOG,
+} from '@octoc2/shared/channels';
+import {
+  TASK_CATALOG,
+  TASK_KINDS,
+  validateTaskArgs,
+  type TaskArgsByKind,
+  type TaskKind,
+} from '@octoc2/shared/tasks';
 
 // ── Tab type ──────────────────────────────────────────────────────────────────
 
 type Tab = 'overview' | 'maintenance' | 'tasks' | 'results' | 'shell' | 'stealth';
 
-const TASK_KINDS = ['shell', 'sleep', 'die', 'screenshot', 'download', 'upload', 'load-module'] as const;
-
-const KIND_DEFAULT_ARGS: Record<string, string> = {
-  shell:         '{"cmd": ""}',
-  sleep:         '{"intervalMs": 30000}',
-  die:           '{}',
-  screenshot:    '{}',
-  download:      '{"remotePath": ""}',
-  upload:        '{"remotePath": "", "content": ""}',
-  'load-module': '{"name": "", "serverUrl": ""}',
-};
+const KIND_DEFAULT_ARGS = {
+  shell: { cmd: '' },
+  exec: { cmd: '', args: [] },
+  ping: {},
+  sleep: { seconds: 30, jitter: 0 },
+  kill: {},
+  evasion: { action: 'status' },
+} satisfies { [K in TaskKind]: TaskArgsByKind[K] };
 
 // ── Relative time helper ──────────────────────────────────────────────────────
 
@@ -149,67 +157,28 @@ function OverviewPanel({ beacon }: { beacon: Beacon | undefined }) {
   );
 }
 
-// ── LoadedModulesPanel ────────────────────────────────────────────────────────
-
-function LoadedModulesPanel({ beaconId }: { beaconId: string }) {
-  const { pat, mode, serverUrl } = useAuth();
-
-  const { data: modules = [] } = useQuery({
-    queryKey:        ['modules', beaconId, serverUrl, pat],
-    queryFn:         () => new C2ServerClient(serverUrl, pat).listModules(beaconId),
-    enabled:         mode === 'live' && pat.length > 0,
-    refetchInterval: 30_000,
-    staleTime:       10_000,
-  });
-
-  if (mode !== 'live') return null;
-
-  return (
-    <div className="px-4 pb-4 pt-3 border-t border-octo-border/40">
-      <p className="text-[9px] text-gray-600 uppercase tracking-widest mb-2">
-        Loaded Modules
-      </p>
-      {modules.length === 0 ? (
-        <p className="text-xs text-gray-700 font-mono">No modules loaded.</p>
-      ) : (
-        <div className="space-y-1">
-          {modules.map((m: ModuleInfo) => (
-            <div key={m.name} className="flex items-center justify-between text-xs font-mono">
-              <div className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-octo-blue/60 shrink-0" />
-                <span className="text-gray-300">{m.name}</span>
-              </div>
-              <span className="text-[10px] text-gray-600">{rel(m.lastExecuted)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── StealthPanel ──────────────────────────────────────────────────────────────
 
 function StealthPanel({ beacon }: { beacon: Beacon | undefined }) {
-  const [gistKey, setGistKey] = useState<string | null>(null);
+  const [dropPath, setDropPath] = useState<string | null>(null);
 
   useEffect(() => {
     if (!beacon) return;
-    void deadDropGistKey(beacon.id).then(setGistKey);
+    void recoveryDropPath(beacon.id).then(setDropPath);
   }, [beacon?.id]);
 
   if (!beacon) {
     return <p className="text-xs text-gray-600 p-4 font-mono">Loading…</p>;
   }
 
-  const isNotes = beacon.activeTentacle === 11;
-  const isRelay = beacon.activeTentacle === 12;
+  const isNotes = beacon.activeTentacle === CHANNEL_BY_KIND.notes.id;
+  const isRelay = beacon.activeTentacle === CHANNEL_BY_KIND.relay.id;
 
   const rows: Array<{ label: string; value: string }> = [
     { label: 'Active Channel',  value: TENTACLE_NAMES[beacon.activeTentacle] },
     { label: 'Notes Channel',   value: isNotes ? 'Active' : 'Not observed' },
     { label: 'Relay Channel',   value: isRelay ? 'Active' : 'Not configured' },
-    { label: 'Dead-drop File',  value: gistKey ? `data-${gistKey}.bin` : 'Computing…' },
+    { label: 'Recovery Path',   value: dropPath ?? 'Computing…' },
   ];
 
   return (
@@ -235,14 +204,9 @@ function StealthPanel({ beacon }: { beacon: Beacon | undefined }) {
 // ── TentacleHealthGrid ────────────────────────────────────────────────────────
 
 // Primary operational channels shown; tentacles 6–8, 10–12 are secondary/recovery channels
-const MINI_TENTACLES: Array<{ id: TentacleId; name: string }> = [
-  { id: 1, name: 'Issues'     },
-  { id: 2, name: 'Branch'     },
-  { id: 3, name: 'Actions'    },
-  { id: 4, name: 'Codespaces' },
-  { id: 5, name: 'Pages'      },
-  { id: 9, name: 'Stego'      },
-];
+const MINI_TENTACLES = CHANNEL_CATALOG.filter(
+  channel => channel.implementationStatus !== 'unavailable',
+);
 
 function TentacleHealthGrid({ beacon }: { beacon: Beacon | undefined }) {
   if (!beacon) return null;
@@ -306,7 +270,6 @@ function ResultRow({ task, privkey, onSetPrivkey, onDecrypted }: {
     if (privkey && encData && decrypted === null && decryptErr === null) {
       void doDecrypt(privkey);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [privkey, encData]);
 
   // Notify parent about plaintext output on mount (ref-based to fire once)
@@ -317,7 +280,6 @@ function ResultRow({ task, privkey, onSetPrivkey, onDecrypted }: {
       onDecrypted?.(task.taskId, r.output);
     }
     // Note: intentional — onDecrypted is not stable across renders; task.taskId and r are stable
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [r?.output, r?.data]);
 
   if (!r) return null;
@@ -424,7 +386,7 @@ function TaskRow({ task, privkey, onSetPrivkey, showResult, onRequeue, onDecrypt
   privkey: string | null;
   onSetPrivkey: (key: string) => void;
   showResult: boolean;
-  onRequeue?: (kind: string, args: Record<string, unknown>) => Promise<void>;
+  onRequeue?: (kind: TaskKind, args: Record<string, unknown>) => Promise<void>;
   onDecrypted?: (taskId: string, text: string) => void;
 }) {
   const [expanded, setExpanded]       = useState(showResult);
@@ -482,36 +444,50 @@ function TaskRow({ task, privkey, onSetPrivkey, showResult, onRequeue, onDecrypt
 // ── TaskForm ──────────────────────────────────────────────────────────────────
 
 function TaskForm({ onSubmit }: {
-  onSubmit: (kind: string, args: Record<string, unknown>) => void;
+  onSubmit: (kind: TaskKind, args: Record<string, unknown>) => void;
 }) {
-  const [kind, setKind]     = useState<string>('shell');
-  const [argsStr, setArgs]  = useState(KIND_DEFAULT_ARGS['shell']!);
+  const [kind, setKind]     = useState<TaskKind>('shell');
+  const [argsStr, setArgs]  = useState(
+    JSON.stringify(KIND_DEFAULT_ARGS.shell),
+  );
   const [error, setError]   = useState<string | null>(null);
 
-  function handleKindChange(k: string) {
+  function handleKindChange(k: TaskKind) {
     setKind(k);
-    setArgs(KIND_DEFAULT_ARGS[k] ?? '{}');
+    setArgs(JSON.stringify(KIND_DEFAULT_ARGS[k]));
     setError(null);
   }
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    let args: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      args = JSON.parse(argsStr) as Record<string, unknown>;
+      parsed = JSON.parse(argsStr);
     } catch {
       setError('Invalid JSON');
       return;
     }
+    const result = validateTaskArgs(kind, parsed);
+    if (!result.ok) {
+      setError(
+        result.issues
+          .map(issue => `${issue.path}: ${issue.message}`)
+          .join('; '),
+      );
+      return;
+    }
     setError(null);
-    onSubmit(kind, args);
+    onSubmit(
+      kind,
+      result.value as unknown as Record<string, unknown>,
+    );
   }
 
   return (
     <form onSubmit={handleSubmit} className="flex items-start gap-2 p-3 border-b border-octo-border/40">
       <select
         value={kind}
-        onChange={e => handleKindChange(e.target.value)}
+        onChange={e => handleKindChange(e.target.value as TaskKind)}
         className="bg-octo-black border border-octo-border rounded px-2 py-1.5 text-xs font-mono text-gray-300 outline-none focus:border-octo-blue/50"
       >
         {TASK_KINDS.map(k => (
@@ -526,6 +502,9 @@ function TaskForm({ onSubmit }: {
           placeholder="Args JSON"
           className="w-full bg-octo-black border border-octo-border rounded px-2 py-1.5 text-xs font-mono text-gray-300 placeholder:text-gray-700 outline-none focus:border-octo-blue/50"
         />
+        <p className="text-[9px] text-gray-700 font-mono">
+          {TASK_CATALOG[kind].description} Risk: {TASK_CATALOG[kind].risk}.
+        </p>
         {error && <p className="text-[10px] text-red-400 font-mono">{error}</p>}
       </div>
       <button
@@ -541,7 +520,7 @@ function TaskForm({ onSubmit }: {
 // ── ShellTab ──────────────────────────────────────────────────────────────────
 
 function ShellTab({ onSubmit }: {
-  onSubmit: (kind: string, args: Record<string, unknown>) => void;
+  onSubmit: (kind: TaskKind, args: Record<string, unknown>) => void;
 }) {
   const [input, setInput]     = useState('');
   const [history, setHistory] = useState<Array<{ id: string; cmd: string }>>([]);
@@ -599,7 +578,14 @@ function ShellTab({ onSubmit }: {
 
 export function BeaconDetailPage() {
   const { id = '' }         = useParams<{ id: string }>();
-  const { pat, mode, serverUrl, privkey, setPrivkey } = useAuth();
+  const {
+    githubPat,
+    operatorToken,
+    mode,
+    serverUrl,
+    privkey,
+    setPrivkey,
+  } = useAuth();
   const navigate            = useNavigate();
   const queryClient         = useQueryClient();
   const { owner, repo }     = getGitHubCoords();
@@ -611,17 +597,17 @@ export function BeaconDetailPage() {
   // ── Beacon metadata ────────────────────────────────────────────────────────
 
   const { data: liveBeacons = [] } = useQuery({
-    queryKey:  ['beacons-live', serverUrl, pat],
-    queryFn:   () => new C2ServerClient(serverUrl, pat).getBeacons(),
-    enabled:   mode === 'live' && pat.length > 0,
+    queryKey:  ['beacons-live', serverUrl, operatorToken],
+    queryFn:   () => new C2ServerClient(serverUrl, operatorToken).getBeacons(),
+    enabled:   mode === 'live' && operatorToken.length > 0,
     staleTime: 30_000,
   });
 
   const issueNumber = id.startsWith('beacon-') ? parseInt(id.slice(7), 10) : NaN;
   const { data: ghIssue } = useQuery({
-    queryKey: ['beacon-detail', issueNumber],
-    queryFn:  () => new GitHubApiClient(pat, owner, repo).getBeaconDetail(issueNumber),
-    enabled:  mode === 'api' && !isNaN(issueNumber),
+    queryKey: ['beacon-detail', issueNumber, githubPat],
+    queryFn:  () => new GitHubApiClient(githubPat, owner, repo).getBeaconDetail(issueNumber),
+    enabled:  mode === 'api' && githubPat.length > 0 && !isNaN(issueNumber),
     staleTime: 30_000,
   });
 
@@ -636,13 +622,13 @@ export function BeaconDetailPage() {
   const [resultsLastUpdated, setResultsLastUpdated] = useState<Date | null>(null);
 
   const { data: tasks = [] } = useQuery({
-    queryKey:        ['tasks', id, serverUrl, pat],
+    queryKey:        ['tasks', id, serverUrl, operatorToken],
     queryFn:         async () => {
-      const result = await new C2ServerClient(serverUrl, pat).getResults(id);
+      const result = await new C2ServerClient(serverUrl, operatorToken).getResults(id);
       setResultsLastUpdated(new Date());
       return result;
     },
-    enabled:         mode === 'live' && pat.length > 0,
+    enabled:         mode === 'live' && operatorToken.length > 0,
     refetchInterval: 15_000,
     staleTime:       10_000,
   });
@@ -652,40 +638,40 @@ export function BeaconDetailPage() {
   // ── Queue task ─────────────────────────────────────────────────────────────
 
   const queueMutation = useMutation({
-    mutationFn: ({ kind, args }: { kind: string; args: Record<string, unknown> }) =>
-      new C2ServerClient(serverUrl, pat).queueTask(id, kind, args),
+    mutationFn: ({ kind, args }: { kind: TaskKind; args: Record<string, unknown> }) =>
+      new C2ServerClient(serverUrl, operatorToken).queueTask(id, kind, args),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, pat] });
+      void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, operatorToken] });
     },
   });
 
-  function handleQueueTask(kind: string, args: Record<string, unknown>) {
+  function handleQueueTask(kind: TaskKind, args: Record<string, unknown>) {
     queueMutation.mutate({ kind, args });
   }
 
-  const handleRequeue = useCallback(async (kind: string, args: Record<string, unknown>) => {
-    await new C2ServerClient(serverUrl, pat).queueTask(id, kind, args);
-    void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, pat] });
-  }, [serverUrl, pat, id, queryClient]);
+  const handleRequeue = useCallback(async (kind: TaskKind, args: Record<string, unknown>) => {
+    await new C2ServerClient(serverUrl, operatorToken).queueTask(id, kind, args);
+    void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, operatorToken] });
+  }, [serverUrl, operatorToken, id, queryClient]);
 
   // ── SSE invalidation ──────────────────────────────────────────────────────
 
   useEffect(() => {
     if (mode !== 'live') return;
     const ctrl = new AbortController();
-    void new C2ServerClient(serverUrl, pat).subscribeEvents((event: SSEEvent) => {
+    void new C2ServerClient(serverUrl, operatorToken).subscribeEvents((event: SSEEvent) => {
       if (event.type === 'beacon-update') {
         if (event.beacons.some(b => b.id === id)) {
-          void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, pat] });
+          void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, operatorToken] });
         }
       } else if (event.type === 'task-update' || event.type === 'maintenance-update') {
         if (event.beaconId === id) {
-          void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, pat] });
+          void queryClient.invalidateQueries({ queryKey: ['tasks', id, serverUrl, operatorToken] });
         }
       }
     }, ctrl.signal);
     return () => ctrl.abort();
-  }, [mode, serverUrl, pat, id, queryClient]);
+  }, [mode, serverUrl, operatorToken, id, queryClient]);
 
   useEffect(() => () => {
     if (copyFlashTimer.current) clearTimeout(copyFlashTimer.current);
@@ -743,7 +729,6 @@ export function BeaconDetailPage() {
         <div className="border border-octo-border rounded overflow-hidden">
           <OverviewPanel beacon={beacon} />
           {mode === 'live' && <TentacleHealthGrid beacon={beacon} />}
-          <LoadedModulesPanel beaconId={id ?? ''} />
         </div>
       )}
 

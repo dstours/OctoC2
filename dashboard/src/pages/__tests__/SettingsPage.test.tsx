@@ -1,6 +1,6 @@
 // dashboard/src/pages/__tests__/SettingsPage.test.tsx
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, describe, it, expect, vi, beforeEach } from 'bun:test';
 import { MemoryRouter } from 'react-router-dom';
 import { SettingsPage } from '../SettingsPage';
 
@@ -19,17 +19,23 @@ vi.mock('libsodium-wrappers', () => {
   };
 });
 
-const mockLogout         = vi.hoisted(() => vi.fn());
-const mockSubscribeEvents = vi.hoisted(() => vi.fn());
+const mockLogout         = vi.fn();
+const mockSubscribeEvents = vi.fn();
+const nativeFetch = globalThis.fetch;
+type FetchCall = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
 
-const mockAuthState = vi.hoisted(() => ({
+const mockAuthState = {
   mode:      'live' as string,
-  serverUrl: 'http://localhost:8080',
+  serverUrl: 'https://localhost:8080',
   latencyMs: 42 as number | null,
   privkey:   null as string | null,
-  pat:       'ghp_test',
+  githubPat: 'ghp_test',
+  operatorToken: 'operator-test',
   logout:    mockLogout,
-}));
+};
 
 vi.mock('@/context/AuthContext', () => ({
   useAuth: () => mockAuthState,
@@ -40,24 +46,26 @@ vi.mock('@/lib/coords', () => ({
 }));
 
 vi.mock('@/lib/C2ServerClient', () => ({
-  C2ServerClient: vi.fn(function (this: Record<string, unknown>) {
-    this['subscribeEvents'] = mockSubscribeEvents;
-  }),
+  C2ServerClient: class {
+    subscribeEvents = mockSubscribeEvents;
+  },
 }));
 
 beforeEach(() => {
   mockLogout.mockReset();
   mockAuthState.mode      = 'live';
-  mockAuthState.serverUrl = 'http://localhost:8080';
+  mockAuthState.serverUrl = 'https://localhost:8080';
   mockAuthState.latencyMs = 42;
   mockAuthState.privkey   = null;
-  mockAuthState.pat       = 'ghp_test';
+  mockAuthState.githubPat = 'ghp_test';
+  mockAuthState.operatorToken = 'operator-test';
   // Default SSE subscription: never resolves
   mockSubscribeEvents.mockReset().mockImplementation(() => new Promise(() => {}));
-  // Reset fetch mock if set
-  if (vi.isMockFunction(globalThis.fetch)) {
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockReset();
-  }
+  globalThis.fetch = nativeFetch;
+});
+
+afterEach(() => {
+  globalThis.fetch = nativeFetch;
 });
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -75,7 +83,7 @@ describe('SettingsPage', () => {
 
   it('shows server URL', () => {
     render(<SettingsPage />, { wrapper: MemoryRouter });
-    expect(screen.getByText('http://localhost:8080')).toBeInTheDocument();
+    expect(screen.getByText('https://localhost:8080')).toBeInTheDocument();
   });
 
   it('shows GitHub owner', () => {
@@ -101,24 +109,26 @@ describe('SettingsPage', () => {
 
   it('shows server-side OPSEC reference variables (OCTOC2_*)', () => {
     render(<SettingsPage />, { wrapper: MemoryRouter });
-    expect(screen.getByText('OCTOC2_CLEANUP_DAYS')).toBeInTheDocument();
-    expect(screen.getByText('OCTOC2_APP_ID')).toBeInTheDocument();
-    expect(screen.getByText('OCTOC2_INSTALLATION_ID')).toBeInTheDocument();
-    expect(screen.getByText('OCTOC2_PROXY_REPOS')).toBeInTheDocument();
+    expect(screen.getByText('OCTOC2_SERVER_GITHUB_TOKEN')).toBeInTheDocument();
+    expect(screen.getByText('OCTOC2_OPERATOR_API_TOKEN')).toBeInTheDocument();
+    expect(screen.getByText('OCTOC2_BEACON_API_TOKENS')).toBeInTheDocument();
+    expect(screen.getByText('OCTOC2_GITHUB_APP_ID')).toBeInTheDocument();
+    expect(screen.getByText('OCTOC2_GITHUB_APP_PRIVATE_KEY_FILE')).toBeInTheDocument();
+    expect(screen.getByText('OCTOC2_RECOVERY_POLICIES')).toBeInTheDocument();
   });
 
   it('shows beacon-side OPSEC reference variables (SVC_*)', () => {
     render(<SettingsPage />, { wrapper: MemoryRouter });
     expect(screen.getByText('SVC_SLEEP')).toBeInTheDocument();
     expect(screen.getByText('SVC_JITTER')).toBeInTheDocument();
-    expect(screen.getByText('SVC_APP_ID')).toBeInTheDocument();
-    expect(screen.getByText('SVC_INSTALLATION_ID')).toBeInTheDocument();
+    expect(screen.getByText('SVC_BEACON_API_TOKEN')).toBeInTheDocument();
+    expect(screen.getByText('SVC_GITHUB_TOKEN_LEASE')).toBeInTheDocument();
   });
 
   it('calls logout() when logout button is clicked', () => {
     render(<SettingsPage />, { wrapper: MemoryRouter });
     fireEvent.click(screen.getByTestId('logout-btn'));
-    expect(mockLogout).toHaveBeenCalledOnce();
+    expect(mockLogout).toHaveBeenCalledTimes(1);
   });
 
   it('renders Generate Operator Keypair button', () => {
@@ -132,16 +142,17 @@ describe('SettingsPage', () => {
     expect(screen.getByText(/safety checklist/i)).toBeInTheDocument();
   });
 
-  it('renders all 8 checklist items', () => {
+  it('renders all 8 unresolved safety checks without claiming completion', () => {
     render(<SettingsPage />, { wrapper: MemoryRouter });
-    expect(screen.getByText('C2 repo is private')).toBeInTheDocument();
-    expect(screen.getByText('GitHub App auth (not PAT) configured')).toBeInTheDocument();
-    expect(screen.getByText('App private key delivered via dead-drop (not baked in binary)')).toBeInTheDocument();
-    expect(screen.getByText('OctoProxy relay active for target isolation')).toBeInTheDocument();
-    expect(screen.getByText('OCTOC2_CLEANUP_DAYS set to 3 or less')).toBeInTheDocument();
-    expect(screen.getByText('Dashboard not exposed publicly (local only)')).toBeInTheDocument();
-    expect(screen.getByText('PAT scope limited to repo only')).toBeInTheDocument();
-    expect(screen.getByText('E2E --fingerprint check passing')).toBeInTheDocument();
+    expect(screen.getByText(/bind only to intended interfaces/i)).toBeInTheDocument();
+    expect(screen.getByText(/operator API token separate from the GitHub PAT/i)).toBeInTheDocument();
+    expect(screen.getByText(/private, disposable repository/i)).toBeInTheDocument();
+    expect(screen.getByText(/trusted loopback or a private test network/i)).toBeInTheDocument();
+    expect(screen.getByText(/alternate channels as unverified/i)).toBeInTheDocument();
+    expect(screen.getByText(/local tests and type checks/i)).toBeInTheDocument();
+    expect(screen.getByText(/manual approved workflow/i)).toBeInTheDocument();
+    expect(screen.getByText(/not.*proof of production readiness/i)).toBeInTheDocument();
+    expect(screen.queryByText('✓')).not.toBeInTheDocument();
   });
 });
 
@@ -230,7 +241,8 @@ describe('KeygenSection — Push MONITORING_PUBKEY', () => {
 
   it('shows "Pushing…" state while the API call is in-flight', async () => {
     // fetch never resolves
-    globalThis.fetch = vi.fn().mockImplementation(() => new Promise(() => {}));
+    globalThis.fetch = vi.fn<FetchCall>()
+      .mockImplementation(() => new Promise(() => {})) as unknown as typeof fetch;
 
     render(<SettingsPage />, { wrapper: MemoryRouter });
     await generateKeys();
@@ -244,11 +256,11 @@ describe('KeygenSection — Push MONITORING_PUBKEY', () => {
   });
 
   it('shows "✓ Pushed to MONITORING_PUBKEY" after a successful push', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn<FetchCall>().mockResolvedValue({
       ok: true,
       status: 204,
       text: () => Promise.resolve(''),
-    } as unknown as Response);
+    } as unknown as Response) as unknown as typeof fetch;
 
     render(<SettingsPage />, { wrapper: MemoryRouter });
     await generateKeys();
@@ -262,11 +274,11 @@ describe('KeygenSection — Push MONITORING_PUBKEY', () => {
   });
 
   it('shows error message when the API call fails', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn<FetchCall>().mockResolvedValue({
       ok: false,
       status: 422,
       text: () => Promise.resolve('Unprocessable Entity'),
-    } as unknown as Response);
+    } as unknown as Response) as unknown as typeof fetch;
 
     render(<SettingsPage />, { wrapper: MemoryRouter });
     await generateKeys();
@@ -281,7 +293,7 @@ describe('KeygenSection — Push MONITORING_PUBKEY', () => {
   });
 
   it('retries with POST when PATCH returns 404', async () => {
-    const fetchMock = vi.fn()
+    const fetchMock = vi.fn<FetchCall>()
       .mockResolvedValueOnce({
         ok: false,
         status: 404,
@@ -292,7 +304,7 @@ describe('KeygenSection — Push MONITORING_PUBKEY', () => {
         status: 201,
         text: () => Promise.resolve(''),
       } as unknown as Response);
-    globalThis.fetch = fetchMock;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     render(<SettingsPage />, { wrapper: MemoryRouter });
     await generateKeys();

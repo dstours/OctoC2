@@ -50,11 +50,8 @@ const queryClient = new QueryClient({
 // ── Route components ──────────────────────────────────────────────────────────
 
 function ProtectedRoutes() {
-  const { pat, mode } = useAuth();
-  // Allow through if operator has a PAT or has explicitly chosen offline mode
-  // (via "Skip to Offline Mode" on the login page).
-  // Initial state is `mode: 'api'` which forces redirect to /login.
-  if (!pat && mode !== 'offline') return <Navigate to="/login" replace />;
+  const { isAuthenticated, mode } = useAuth();
+  if (!isAuthenticated && mode !== 'offline') return <Navigate to="/login" replace />;
   return <Layout />;
 }
 

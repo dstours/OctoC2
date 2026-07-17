@@ -31,7 +31,9 @@ const mockListIssues      = mock(() => Promise.resolve({ data: [] }));
 const mockCreateIssue     = mock(() => Promise.resolve({ data: { number: 42 } }));
 const mockCreateComment   = mock(() => Promise.resolve({ data: { id: 1001 } }));
 const mockListComments    = mock(() => Promise.resolve({ data: [] as any[] }));
-const mockDeleteComment   = mock(() => Promise.resolve({}));
+const mockDeleteComment   = mock(
+  (_params?: { comment_id: number }) => Promise.resolve({}),
+);
 const mockUpdateComment   = mock(() => Promise.resolve({ data: {} }));
 const mockPaginate        = mock((_fn: unknown, params: unknown) => {
   void params;
@@ -61,41 +63,271 @@ mock.module("@octokit/rest", () => ({
 
 // Import AFTER mock is registered
 const { IssuesTentacle } = await import("../tentacles/IssuesTentacle.ts");
-const { generateKeyPair, publicKeyToBase64 } = await import("../crypto/sodium.ts");
+const {
+  encryptBox,
+  generateKeyPair,
+  publicKeyToBase64,
+} = await import("../crypto/sodium.ts");
+const {
+  computeTaskResultDigest,
+  createTaskResultSignaturePayload,
+  createUnsignedEnvelope,
+  ed25519KeyId,
+  encodeBase64Url,
+  generateEd25519KeyPair,
+  serializeSignedEnvelope,
+  signEnvelope,
+} = await import("@octoc2/shared");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 let testDir: string;
 let originalXdg: string | undefined;
+let originalAppData: string | undefined;
+let originalResultAckTimeout: string | undefined;
+let originalResultAckRetry: string | undefined;
+const TEST_BEACON_ID = "550e8400-e29b-41d4-a716-446655440001";
+const TEST_BEACON_KEYS = await generateKeyPair();
+const TEST_BEACON_PUBLIC_KEY = await publicKeyToBase64(
+  TEST_BEACON_KEYS.publicKey,
+);
+const TEST_SIGNING_KEYS = await generateEd25519KeyPair();
+const TEST_SIGNING_KEY_ID = await ed25519KeyId(
+  TEST_SIGNING_KEYS.publicKey,
+);
+const TEST_SIGNING_PUBLIC_KEY = encodeBase64Url(
+  TEST_SIGNING_KEYS.publicKey,
+);
 
-function makeTentacle(tokenOverride = "ghp_test_token") {
+let currentOperatorKeyPair:
+  | Awaited<ReturnType<typeof generateKeyPair>>
+  | null = null;
+let identitySequence = 0;
+
+async function signedCheckin(
+  payload: import("../types.ts").CheckinPayload,
+): Promise<import("../types.ts").CheckinPayload> {
+  const checkin = {
+    ...payload,
+    beaconId: TEST_BEACON_ID,
+    publicKey: TEST_BEACON_PUBLIC_KEY,
+  };
+  const identity = await signEnvelope(
+    createUnsignedEnvelope({
+      kind: "checkin",
+      signerId: TEST_BEACON_ID,
+      keyId: TEST_SIGNING_KEY_ID,
+      issuedAt: checkin.checkinAt,
+      sequence: ++identitySequence,
+      payload: {
+        beaconId: TEST_BEACON_ID,
+        encryptionPublicKey: TEST_BEACON_PUBLIC_KEY,
+        signingPublicKey: TEST_SIGNING_PUBLIC_KEY,
+        hostname: checkin.hostname,
+        username: checkin.username,
+        os: checkin.os,
+        arch: checkin.arch,
+        pid: checkin.pid,
+        checkinAt: checkin.checkinAt,
+      },
+    }),
+    TEST_SIGNING_KEYS.secretKey,
+  );
+  return { ...checkin, identity };
+}
+
+function makeTentacle(
+  tokenOverride = "ghp_test_token",
+  configOverrides: Partial<import("../types.ts").BeaconConfig> = {},
+) {
   const config = {
-    id:   "550e8400-e29b-41d4-a716-446655440001",
+    id:   TEST_BEACON_ID,
     repo: { owner: "op", name: "c2" },
     token: tokenOverride,
     tentaclePriority: ["issues"] as import("../types.ts").TentacleKind[],
     sleepSeconds: 60,
     jitter: 0.2,
     operatorPublicKey: new Uint8Array(32),
-    beaconKeyPair: {
-      publicKey: new Uint8Array(32),
-      secretKey: new Uint8Array(32),
-    },
+    beaconKeyPair: TEST_BEACON_KEYS,
+    signingKeyPair: TEST_SIGNING_KEYS,
+    signingKeyId: TEST_SIGNING_KEY_ID,
+    ...configOverrides,
   };
-  return new IssuesTentacle(config);
+  const tentacle = new IssuesTentacle(config);
+
+  // All successful fixtures exercise the production signed-checkin path.
+  const originalCheckin = tentacle.checkin.bind(tentacle);
+  tentacle.checkin = async (payload) =>
+    originalCheckin(await signedCheckin(payload));
+
+  // Registration requires an explicit encrypted ACK bound to the exact
+  // GitHub registration comment. Inject that server response for the initial
+  // poll while leaving each test's ordinary listComments mock untouched.
+  const issuesApi = (
+    tentacle as unknown as {
+      octokit: {
+        rest: {
+          issues: {
+            listComments: (params: Record<string, unknown>) => Promise<{
+              data: any[];
+            }>;
+            deleteComment: (
+              params: Record<string, unknown>,
+            ) => Promise<unknown>;
+          };
+        };
+      };
+    }
+  ).octokit.rest.issues;
+  const listComments = issuesApi.listComments;
+  const deleteComment = issuesApi.deleteComment;
+  let ackCommentId: number | null = null;
+  let ackSent = false;
+
+  issuesApi.listComments = async (params) => {
+    const state = (
+      tentacle as unknown as {
+        state: {
+          beaconId: string;
+          registrationStatus: string;
+          regCommentId: number | null;
+        } | null;
+      }
+    ).state;
+    if (
+      params["since"] !== undefined &&
+      state?.registrationStatus === "pending" &&
+      state.regCommentId !== null &&
+      !ackSent
+    ) {
+      if (!currentOperatorKeyPair) {
+        throw new Error("test fixture is missing the operator key pair");
+      }
+      const acceptedAt = new Date().toISOString();
+      const encrypted = await encryptBox(
+        JSON.stringify({
+          kind: "registration-ack",
+          beaconId: state.beaconId,
+          registrationId: String(state.regCommentId),
+          acceptedAt,
+        }),
+        TEST_BEACON_KEYS.publicKey,
+        currentOperatorKeyPair.secretKey,
+      );
+      ackCommentId = state.regCommentId + 1_000_000;
+      ackSent = true;
+      return {
+        data: [{
+          id: ackCommentId,
+          created_at: acceptedAt,
+          body: [
+            `<!-- job:${Math.floor(Date.now() / 1000)}:deploy:reg-ack -->`,
+            "```text",
+            encrypted.ciphertext,
+            "```",
+            `<!-- ${encrypted.nonce} -->`,
+          ].join("\n"),
+        }],
+      };
+    }
+    return listComments(params);
+  };
+
+  // Keep cleanup assertions focused on repository comments supplied by each
+  // test; the synthetic ACK is consumed and deleted entirely inside the fixture.
+  issuesApi.deleteComment = async (params) => {
+    if (params["comment_id"] === ackCommentId) return {};
+    return deleteComment(params);
+  };
+
+  return tentacle;
 }
 
 async function makeOperatorKeyPair() {
   const kp  = await generateKeyPair();
   const b64 = await publicKeyToBase64(kp.publicKey);
+  currentOperatorKeyPair = kp;
   return { kp, b64 };
+}
+
+async function makeSignedResult(
+  taskId = "result-acceptance-task",
+): Promise<import("../types.ts").TaskResult> {
+  const completedAt = new Date().toISOString();
+  const unsigned = {
+    taskId,
+    beaconId: TEST_BEACON_ID,
+    success: true,
+    output: "completed",
+    completedAt,
+  };
+  return {
+    ...unsigned,
+    signature: serializeSignedEnvelope(await signEnvelope(
+      createUnsignedEnvelope({
+        kind: "task-result",
+        signerId: TEST_BEACON_ID,
+        keyId: TEST_SIGNING_KEY_ID,
+        issuedAt: completedAt,
+        sequence: ++identitySequence,
+        payload: await createTaskResultSignaturePayload(unsigned),
+      }),
+      TEST_SIGNING_KEYS.secretKey,
+    )),
+  };
+}
+
+async function makeResultReceiptComment(
+  result: import("../types.ts").TaskResult,
+  operatorKeys: Awaited<ReturnType<typeof generateKeyPair>>,
+  overrides: Partial<{
+    beaconId: string;
+    taskId: string;
+    resultDigest: string;
+    acceptedAt: string;
+    id: number;
+  }> = {},
+) {
+  const encrypted = await encryptBox(
+    JSON.stringify({
+      kind: "result-acceptance",
+      beaconId: overrides.beaconId ?? result.beaconId,
+      taskId: overrides.taskId ?? result.taskId,
+      resultDigest:
+        overrides.resultDigest ?? await computeTaskResultDigest(result),
+      acceptedAt: overrides.acceptedAt ?? new Date().toISOString(),
+    }),
+    TEST_BEACON_KEYS.publicKey,
+    operatorKeys.secretKey,
+  );
+  return {
+    id: overrides.id ?? 80_001,
+    created_at: new Date().toISOString(),
+    body: [
+      `<!-- job:${Math.floor(Date.now() / 1000)}:deploy:result-ack-${result.taskId} -->`,
+      "```text",
+      encrypted.ciphertext,
+      "```",
+      `<!-- ${encrypted.nonce} -->`,
+    ].join("\n"),
+  };
 }
 
 beforeEach(async () => {
   testDir     = join(tmpdir(), `svc-tentacle-test-${crypto.randomUUID()}`);
   originalXdg = process.env["XDG_CONFIG_HOME"];
+  originalAppData = process.env["APPDATA"];
+  originalResultAckTimeout =
+    process.env["SVC_RESULT_ACK_TIMEOUT_MS"];
+  originalResultAckRetry =
+    process.env["SVC_RESULT_ACK_RETRY_MS"];
   process.env["XDG_CONFIG_HOME"] = testDir;
+  process.env["APPDATA"] = testDir;
+  process.env["SVC_RESULT_ACK_TIMEOUT_MS"] = "0";
+  process.env["SVC_RESULT_ACK_RETRY_MS"] = "1";
   await mkdir(join(testDir, "svc"), { recursive: true });
+  currentOperatorKeyPair = null;
+  identitySequence = 0;
 
   // Reset all mocks to clean state (mockReset clears both call history AND implementation)
   mockRepoGet.mockReset();
@@ -125,6 +357,23 @@ afterEach(async () => {
     process.env["XDG_CONFIG_HOME"] = originalXdg;
   } else {
     delete process.env["XDG_CONFIG_HOME"];
+  }
+  if (originalAppData !== undefined) {
+    process.env["APPDATA"] = originalAppData;
+  } else {
+    delete process.env["APPDATA"];
+  }
+  if (originalResultAckTimeout !== undefined) {
+    process.env["SVC_RESULT_ACK_TIMEOUT_MS"] =
+      originalResultAckTimeout;
+  } else {
+    delete process.env["SVC_RESULT_ACK_TIMEOUT_MS"];
+  }
+  if (originalResultAckRetry !== undefined) {
+    process.env["SVC_RESULT_ACK_RETRY_MS"] =
+      originalResultAckRetry;
+  } else {
+    delete process.env["SVC_RESULT_ACK_RETRY_MS"];
   }
   await rm(testDir, { recursive: true, force: true });
 });
@@ -264,9 +513,282 @@ describe("initialization flow", () => {
 
     await expect(tentacle.checkin(payload)).rejects.toThrow("MONITORING_PUBKEY");
   });
+
+  it("updates a relayable CI comment on the second proxy checkin", async () => {
+    const { b64 } = await makeOperatorKeyPair();
+    mockGetRepoVariable.mockResolvedValue({ data: { value: b64 } });
+    mockCreateComment.mockResolvedValue({ data: { id: 4001 } });
+    mockListComments.mockResolvedValue({ data: [] });
+
+    const tentacle = makeTentacle("ghp_proxy_token", {
+      issuesStateScope: "proxy:acme/decoy",
+      issuesIssueNumber: 7,
+    });
+    const payload = {
+      beaconId: "test-id", publicKey: "", hostname: "h", username: "u",
+      os: "linux", arch: "x64", pid: 1, checkinAt: new Date().toISOString(),
+    };
+
+    await tentacle.checkin(payload);
+    mockUpdateComment.mockClear();
+    await tentacle.checkin({
+      ...payload,
+      checkinAt: new Date(Date.now() + 1_000).toISOString(),
+    });
+
+    expect(mockUpdateComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        comment_id: expect.any(Number),
+        body: expect.stringContaining(":ci:"),
+      }),
+    );
+  });
+
+  it("rejects a proxy repository whose MONITORING_PUBKEY differs from recovery", async () => {
+    const { b64 } = await makeOperatorKeyPair();
+    mockGetRepoVariable.mockResolvedValue({ data: { value: b64 } });
+    const tentacle = makeTentacle("ghp_proxy_token", {
+      issuesStateScope: "proxy:acme/decoy",
+      issuesIssueNumber: 7,
+      issuesRequireOperatorKeyMatch: true,
+      operatorPublicKey: new Uint8Array(32).fill(9),
+    });
+    const payload = {
+      beaconId: "test-id", publicKey: "", hostname: "h", username: "u",
+      os: "linux", arch: "x64", pid: 1, checkinAt: new Date().toISOString(),
+    };
+
+    await expect(tentacle.checkin(payload)).rejects.toThrow(
+      "does not match the signed proxy configuration",
+    );
+  });
+
+  it("resets only scoped Issues bookmarks when the signed decoy issue changes", async () => {
+    const first = makeTentacle("ghp_proxy_token", {
+      issuesStateScope: "proxy:acme/decoy",
+      issuesIssueNumber: 7,
+    }) as unknown as {
+      loadOrCreateStateFile(): Promise<void>;
+      state: {
+        issueNumber: number | null;
+        lastTaskCommentId: number | null;
+        registrationStatus: "pending" | "registered";
+        seq: number;
+        nextSeq(): number;
+        persist(): Promise<void>;
+      };
+    };
+    await first.loadOrCreateStateFile();
+    first.state.lastTaskCommentId = 99;
+    first.state.registrationStatus = "registered";
+    first.state.nextSeq();
+    await first.state.persist();
+
+    const second = makeTentacle("ghp_proxy_token", {
+      issuesStateScope: "proxy:acme/decoy",
+      issuesIssueNumber: 8,
+    }) as unknown as {
+      loadOrCreateStateFile(): Promise<void>;
+      state: {
+        issueNumber: number | null;
+        lastTaskCommentId: number | null;
+        registrationStatus: "pending" | "registered";
+        seq: number;
+      };
+    };
+    await second.loadOrCreateStateFile();
+
+    expect(second.state.issueNumber).toBe(8);
+    expect(second.state.lastTaskCommentId).toBeNull();
+    expect(second.state.registrationStatus).toBe("pending");
+    expect(second.state.seq).toBe(0);
+  });
+
+  it("rejects scoped state when persisted beacon key material differs", async () => {
+    const scope = "proxy:acme/identity-check";
+    const original = makeTentacle("ghp_proxy_token", {
+      issuesStateScope: scope,
+      issuesIssueNumber: 7,
+    }) as unknown as {
+      loadOrCreateStateFile(): Promise<void>;
+    };
+    await original.loadOrCreateStateFile();
+
+    const differentEncryptionKeys = await generateKeyPair();
+    const encryptionMismatch = makeTentacle("ghp_proxy_token", {
+      issuesStateScope: scope,
+      issuesIssueNumber: 7,
+      beaconKeyPair: differentEncryptionKeys,
+    }) as unknown as {
+      loadOrCreateStateFile(): Promise<void>;
+    };
+    await expect(encryptionMismatch.loadOrCreateStateFile()).rejects.toThrow(
+      "persisted X25519 identity does not match",
+    );
+
+    const differentSigningKeys = await generateEd25519KeyPair();
+    const signingMismatch = makeTentacle("ghp_proxy_token", {
+      issuesStateScope: scope,
+      issuesIssueNumber: 7,
+      signingKeyPair: differentSigningKeys,
+      signingKeyId: await ed25519KeyId(differentSigningKeys.publicKey),
+    }) as unknown as {
+      loadOrCreateStateFile(): Promise<void>;
+    };
+    await expect(signingMismatch.loadOrCreateStateFile()).rejects.toThrow(
+      "persisted Ed25519 identity does not match",
+    );
+  });
 });
 
 // ── Comment format: NONCE_RE handling ─────────────────────────────────────────
+
+describe("result acceptance receipts", () => {
+  async function initializedTentacle() {
+    const { kp, b64 } = await makeOperatorKeyPair();
+    mockGetRepoVariable.mockResolvedValue({ data: { value: b64 } });
+    const tentacle = makeTentacle();
+    await tentacle.checkin({
+      beaconId: TEST_BEACON_ID,
+      publicKey: TEST_BEACON_PUBLIC_KEY,
+      hostname: "host",
+      username: "user",
+      os: "linux",
+      arch: "x64",
+      pid: 123,
+      checkinAt: new Date().toISOString(),
+    });
+    mockDeleteComment.mockClear();
+    return { tentacle, operatorKeys: kp };
+  }
+
+  it("requires controller acceptance after writing the result artifact", async () => {
+    const { tentacle } = await initializedTentacle();
+    mockListComments.mockResolvedValue({ data: [] });
+
+    expect(await tentacle.submitResult(await makeSignedResult())).toEqual({
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "issues",
+      acceptance: null,
+    });
+  });
+
+  it("accepts a bound fresh receipt and cleans every valid duplicate", async () => {
+    const { tentacle, operatorKeys } = await initializedTentacle();
+    const result = await makeSignedResult();
+    const first = await makeResultReceiptComment(
+      result,
+      operatorKeys,
+      { id: 81_001 },
+    );
+    const second = await makeResultReceiptComment(
+      result,
+      operatorKeys,
+      { id: 81_002 },
+    );
+    mockListComments.mockResolvedValue({ data: [first, second] });
+
+    expect(await tentacle.submitResult(result)).toEqual({
+      artifactWritten: true,
+      controllerAccepted: true,
+      channel: "issues",
+      acceptance: "channel-receipt",
+    });
+    const deleted = (
+      mockDeleteComment.mock.calls as unknown as
+        Array<[{ comment_id: number }]>
+    ).map(([call]) => call.comment_id);
+    expect(deleted).toEqual([81_001, 81_002]);
+  });
+
+  it("rejects forged, stale, future, and incorrectly bound receipts", async () => {
+    const { tentacle, operatorKeys } = await initializedTentacle();
+    const result = await makeSignedResult();
+    const attacker = await generateKeyPair();
+    const comments = [
+      await makeResultReceiptComment(result, attacker, { id: 82_001 }),
+      await makeResultReceiptComment(result, operatorKeys, {
+        id: 82_002,
+        resultDigest: "0".repeat(64),
+      }),
+      await makeResultReceiptComment(result, operatorKeys, {
+        id: 82_003,
+        acceptedAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+      }),
+      await makeResultReceiptComment(result, operatorKeys, {
+        id: 82_004,
+        acceptedAt: new Date(Date.now() + 2 * 60_000).toISOString(),
+      }),
+      await makeResultReceiptComment(result, operatorKeys, {
+        id: 82_005,
+        taskId: "another-task",
+      }),
+      await makeResultReceiptComment(result, operatorKeys, {
+        id: 82_006,
+        beaconId: "550e8400-e29b-41d4-a716-446655440088",
+      }),
+    ];
+    mockListComments.mockResolvedValue({ data: comments });
+
+    expect((await tentacle.submitResult(result)).controllerAccepted).toBe(false);
+    expect(mockDeleteComment).not.toHaveBeenCalled();
+  });
+
+  it("does not let an undeletable leftover receipt block later task delivery", async () => {
+    const { tentacle, operatorKeys } = await initializedTentacle();
+    const result = await makeSignedResult();
+    const receipt = await makeResultReceiptComment(
+      result,
+      operatorKeys,
+      { id: 2_000_001 },
+    );
+    mockListComments.mockResolvedValue({ data: [receipt] });
+    mockDeleteComment.mockImplementation(async (params) => {
+      if (params?.comment_id === receipt.id) throw new Error("delete denied");
+      return {};
+    });
+
+    expect((await tentacle.submitResult(result)).controllerAccepted).toBe(true);
+
+    const deliveredTask = {
+      taskId: "task-after-leftover-receipt",
+      kind: "exec" as const,
+      args: { command: "whoami" },
+      ref: "after-receipt",
+    };
+    const encrypted = await encryptBox(
+      JSON.stringify([deliveredTask]),
+      TEST_BEACON_KEYS.publicKey,
+      operatorKeys.secretKey,
+    );
+    const taskComment = {
+      id: 2_000_002,
+      created_at: new Date().toISOString(),
+      body: [
+        `<!-- job:${Math.floor(Date.now() / 1000)}:deploy:${deliveredTask.ref} -->`,
+        "```text",
+        encrypted.ciphertext,
+        "```",
+        `<!-- ${encrypted.nonce} -->`,
+      ].join("\n"),
+    };
+    mockListComments.mockResolvedValue({
+      data: [receipt, taskComment],
+    });
+
+    expect(await tentacle.checkin({
+      beaconId: TEST_BEACON_ID,
+      publicKey: TEST_BEACON_PUBLIC_KEY,
+      hostname: "host",
+      username: "user",
+      os: "linux",
+      arch: "x64",
+      pid: 123,
+      checkinAt: new Date().toISOString(),
+    })).toEqual([deliveredTask]);
+  });
+});
 
 describe("comment format parsing", () => {
   // Access the private parseComment via a module-level re-export shim or
@@ -506,6 +1028,71 @@ describe("pruneOldComments", () => {
     const deletedId = (mockDeleteComment.mock.calls[0] as unknown as [{ comment_id: number }])[0].comment_id;
     expect(deletedId).toBe(9003); // only the registration comment was deleted
   });
+
+  it("preserves an old unread deploy through cleanup and then decrypts it", async () => {
+    const { kp, b64 } = await makeOperatorKeyPair();
+    mockGetRepoVariable.mockResolvedValue({ data: { value: b64 } });
+    mockPaginate.mockResolvedValue([]);
+    mockCreateComment.mockResolvedValue({ data: { id: 9100 } });
+    mockListComments.mockResolvedValue({ data: [] });
+
+    const tentacle = makeTentacle();
+    const checkin = {
+      beaconId: "test-id", publicKey: "", hostname: "h", username: "u",
+      os: "linux", arch: "x64", pid: 1, checkinAt: new Date().toISOString(),
+    };
+    await tentacle.checkin(checkin);
+
+    const state = (tentacle as unknown as {
+      state: { lastTaskCommentId: number | null };
+    }).state;
+    const task = {
+      taskId: crypto.randomUUID(),
+      kind: "ping" as const,
+      args: {},
+      issuedAt: new Date().toISOString(),
+    };
+    const encrypted = await encryptBox(
+      JSON.stringify([task]),
+      TEST_BEACON_KEYS.publicKey,
+      kp.secretKey,
+    );
+    const unreadCommentId = (state.lastTaskCommentId ?? 0) + 1;
+    const unreadDeploy = {
+      id: unreadCommentId,
+      created_at: new Date(Date.now() - 31 * 60 * 1000).toISOString(),
+      body: [
+        `<!-- job:${Math.floor(Date.now() / 1000)}:deploy:maint-test -->`,
+        "```text",
+        encrypted.ciphertext,
+        "```",
+        `<!-- ${encrypted.nonce} -->`,
+      ].join("\n"),
+    };
+
+    mockDeleteComment.mockReset();
+    mockDeleteComment.mockResolvedValue({});
+    mockListComments.mockResolvedValue({ data: [unreadDeploy] as never[] });
+
+    const cleanup = tentacle as unknown as {
+      startupCleanup(): Promise<void>;
+      pruneOldComments(): Promise<void>;
+    };
+    await cleanup.startupCleanup();
+    await cleanup.pruneOldComments();
+    expect(mockDeleteComment).not.toHaveBeenCalled();
+
+    const tasks = await tentacle.checkin({
+      ...checkin,
+      checkinAt: new Date().toISOString(),
+    });
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]?.taskId).toBe(task.taskId);
+    expect(mockDeleteComment).toHaveBeenCalledWith(
+      expect.objectContaining({ comment_id: unreadCommentId }),
+    );
+    expect(state.lastTaskCommentId).toBe(unreadCommentId);
+  });
 });
 
 // ── upsertMaintenanceComment ──────────────────────────────────────────────────
@@ -619,6 +1206,38 @@ describe("upsertMaintenanceComment", () => {
     expect(maintenanceBody).toBeDefined();
     expect(maintenanceBody).toContain("✅ Initial check-in");
     expect(maintenanceBody).not.toContain("**reg-ack**");
+  });
+
+  it("recreates a stale heartbeat comment after update returns 404", async () => {
+    const { b64 } = await makeOperatorKeyPair();
+    mockGetRepoVariable.mockResolvedValue({ data: { value: b64 } });
+    mockPaginate.mockResolvedValue([]);
+    mockCreateComment.mockResolvedValue({ data: { id: 5004 } });
+    mockListComments.mockResolvedValue({ data: [] });
+
+    const tentacle = makeTentacle();
+    const payload = {
+      beaconId: "test-id", publicKey: "", hostname: "beacon-host", username: "u",
+      os: "linux", arch: "x64", pid: 12345, checkinAt: new Date().toISOString(),
+    };
+
+    await tentacle.checkin(payload);
+
+    const notFoundErr = Object.assign(new Error("Not Found"), { status: 404 });
+    mockUpdateComment.mockRejectedValueOnce(notFoundErr);
+    mockCreateComment.mockResolvedValue({ data: { id: 6004 } });
+    mockListComments.mockResolvedValue({ data: [] });
+
+    await expect(tentacle.checkin({
+      ...payload,
+      checkinAt: new Date(Date.now() + 1_000).toISOString(),
+    })).resolves.toEqual(expect.anything());
+    expect(mockCreateComment).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        body: expect.stringContaining(":ci:"),
+        issue_number: 42,
+      }),
+    );
   });
 
   it("issue title is used exactly as-is from SVC_ISSUE_TITLE with no suffix appended", async () => {
@@ -791,105 +1410,6 @@ describe("discoverOrCreateIssue — SVC_ISSUE_TITLE", () => {
     }
   });
 });
-
-// ── GitHub App auth integration ────────────────────────────────────────────────
-//
-// Verifies that IssuesTentacle (via BaseTentacle) correctly registers an
-// Octokit request hook when GitHub App credentials are present, and falls
-// back cleanly to PAT when they are absent.
-//
-// The mock Octokit above has `hook: { wrap: mockHookWrap }`, so these
-// tests exercise the real BaseTentacle constructor logic through the full
-// IssuesTentacle class hierarchy.
-
-describe("IssuesTentacle — GitHub App auth", () => {
-  const FAKE_PEM =
-    "-----BEGIN RSA PRIVATE KEY-----\nMIIEoFake...\n-----END RSA PRIVATE KEY-----";
-
-  beforeEach(() => { mockHookWrap.mockClear(); });
-
-  it("does NOT register hook.wrap when App credentials are absent (PAT mode)", () => {
-    makeTentacle(); // PAT-only config
-    expect(mockHookWrap.mock.calls.length).toBe(0);
-  });
-
-  it("registers hook.wrap('request', fn) when all three App fields are set", () => {
-    new IssuesTentacle({
-      id:   "550e8400-e29b-41d4-a716-446655440099",
-      repo: { owner: "op", name: "c2" },
-      token: "ghp_fallback",
-      tentaclePriority: ["issues" as const],
-      sleepSeconds: 60,
-      jitter: 0.2,
-      operatorPublicKey: new Uint8Array(32),
-      beaconKeyPair: { publicKey: new Uint8Array(32), secretKey: new Uint8Array(32) },
-      appId:          12345,
-      installationId: 99999,
-      appPrivateKey:  FAKE_PEM,
-    });
-    expect(mockHookWrap.mock.calls.length).toBe(1);
-    expect(mockHookWrap.mock.calls[0]![0]).toBe("request");
-  });
-
-  it("does NOT register hook when only appId is set (partial config → PAT fallback)", () => {
-    new IssuesTentacle({
-      id:   "550e8400-e29b-41d4-a716-446655440099",
-      repo: { owner: "op", name: "c2" },
-      token: "ghp_fallback",
-      tentaclePriority: ["issues" as const],
-      sleepSeconds: 60,
-      jitter: 0.2,
-      operatorPublicKey: new Uint8Array(32),
-      beaconKeyPair: { publicKey: new Uint8Array(32), secretKey: new Uint8Array(32) },
-      appId: 12345,
-      // installationId and appPrivateKey absent → PAT fallback
-    });
-    expect(mockHookWrap.mock.calls.length).toBe(0);
-  });
-
-  it("full checkin still succeeds when App config is present (hook is async-transparent)", async () => {
-    // Set up mocks for a full checkin cycle
-    const kp = await generateKeyPair();
-    const pubB64 = await publicKeyToBase64(kp.publicKey);
-    mockGetRepoVariable.mockResolvedValue({ data: { value: pubB64 } });
-    mockListIssues.mockResolvedValue({ data: [] });
-    mockCreateIssue.mockResolvedValue({ data: { number: 55 } });
-    mockCreateComment.mockResolvedValue({ data: { id: 3001 } });
-    mockListComments.mockResolvedValue({ data: [] });
-
-    const tentacle = new IssuesTentacle({
-      id:   "550e8400-e29b-41d4-a716-446655440088",
-      repo: { owner: "op", name: "c2" },
-      token: "ghp_fallback_pat",
-      tentaclePriority: ["issues" as const],
-      sleepSeconds: 60,
-      jitter: 0.2,
-      operatorPublicKey: new Uint8Array(32),
-      beaconKeyPair: { publicKey: new Uint8Array(32), secretKey: new Uint8Array(32) },
-      appId:          12345,
-      installationId: 99999,
-      appPrivateKey:  FAKE_PEM,
-    });
-
-    // Verify hook was registered
-    expect(mockHookWrap.mock.calls.length).toBe(1);
-
-    // The mock Octokit's hook.wrap is a no-op — API calls still go through the
-    // mock REST methods. Full checkin should succeed exactly as in PAT mode.
-    const tasks = await tentacle.checkin({
-      beaconId: "550e8400-e29b-41d4-a716-446655440088",
-      publicKey: pubB64,
-      hostname: "testhost", username: "user",
-      os: "linux", arch: "x64", pid: 1,
-      checkinAt: new Date().toISOString(),
-    });
-
-    expect(Array.isArray(tasks)).toBe(true);
-    expect(mockCreateIssue.mock.calls.length).toBe(1);
-    expect(mockCreateComment.mock.calls.length).toBeGreaterThanOrEqual(1);
-  });
-});
-
 
 describe("IssuesTentacle — init retry logic", () => {
   it("retries initialization after a transient error ages out", async () => {

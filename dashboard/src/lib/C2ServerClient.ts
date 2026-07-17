@@ -4,6 +4,12 @@
 // Used in Live mode only — API mode uses GitHubApiClient.
 
 import type { Beacon } from '@/types/beacon';
+import {
+  assertTaskArgs,
+  type TaskKind,
+  type TaskState,
+} from '@octoc2/shared/tasks';
+import { normalizeControllerOrigin } from '@/lib/controllerUrl';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -19,10 +25,10 @@ export interface ServerTaskResult {
 export interface ServerTask {
   taskId:      string;
   beaconId:    string;
-  kind:        string;
+  kind:        TaskKind;
   args:        Record<string, unknown>;
   /** TaskState from server: 'pending' | 'delivered' | 'completed' | 'failed' */
-  status:      string;
+  status:      TaskState;
   ref:         string;
   createdAt:   string;
   deliveredAt: string | null;
@@ -33,22 +39,16 @@ export interface ServerTask {
 export interface QueuedTaskSummary {
   taskId:    string;
   beaconId:  string;
-  kind:      string;
+  kind:      TaskKind;
   args:      Record<string, unknown>;
-  status:    string;
+  status:    TaskState;
   createdAt: string;
-}
-
-export interface ModuleInfo {
-  name:         string;
-  /** ISO-8601 timestamp of last completed load-module task, or null if never run */
-  lastExecuted: string | null;
 }
 
 export interface MaintenanceTaskSummary {
   taskId:      string;
-  kind:        string;
-  status:      string;
+  kind:        TaskKind;
+  status:      TaskState;
   ref:         string;
   createdAt:   string;
   completedAt: string | null;
@@ -92,13 +92,19 @@ export type SSEEvent = SSEBeaconUpdate | SSETaskUpdate | SSEMaintenanceUpdate;
 // ── Client ────────────────────────────────────────────────────────────────────
 
 export class C2ServerClient {
+  private readonly serverUrl: string;
+  private readonly operatorToken: string;
+
   constructor(
-    private readonly serverUrl: string,
-    private readonly pat: string,
-  ) {}
+    serverUrl: string,
+    operatorToken: string,
+  ) {
+    this.serverUrl = normalizeControllerOrigin(serverUrl);
+    this.operatorToken = operatorToken;
+  }
 
   private get authHeaders(): Record<string, string> {
-    return { Authorization: `Bearer ${this.pat}` };
+    return { Authorization: `Bearer ${this.operatorToken}` };
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -133,26 +139,22 @@ export class C2ServerClient {
   }
 
   /** POST /api/beacon/:id/task — queue a new task for a beacon. */
-  async queueTask(
+  async queueTask<K extends TaskKind>(
     beaconId: string,
-    kind: string,
-    args: Record<string, unknown>,
+    kind: K,
+    args: unknown,
   ): Promise<QueuedTaskSummary> {
+    const validatedArgs = assertTaskArgs(kind, args);
     return this.request<QueuedTaskSummary>(`/api/beacon/${beaconId}/task`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind, args }),
+      body: JSON.stringify({ kind, args: validatedArgs }),
     });
   }
 
   /** GET /api/beacon/:id/results — returns all tasks for a beacon, newest-first. */
   async getResults(beaconId: string): Promise<ServerTask[]> {
     return this.request<ServerTask[]>(`/api/beacon/${beaconId}/results`);
-  }
-
-  /** GET /api/beacon/:id/modules — returns module info for a beacon. */
-  async listModules(beaconId: string): Promise<ModuleInfo[]> {
-    return this.request<ModuleInfo[]>(`/api/beacon/${beaconId}/modules`);
   }
 
   /** GET /api/beacon/:id/maintenance — returns maintenance state for a beacon. */

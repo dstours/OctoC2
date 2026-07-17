@@ -1,33 +1,65 @@
-name: CI Sync
+name: OctoC2 relay decoy replies
 
 on:
   repository_dispatch:
-    types: [infra-update]
+    types: [octoc2-relay-egress]
+
+concurrency:
+  group: octoc2-relay-egress-${{ github.event.client_payload.source_event_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
-  sync:
+  apply:
     runs-on: ubuntu-latest
     steps:
-      - name: Post update comment
+      - name: Verify and post the control reply exactly once
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELAY_SIGNING_KEY: ${{ secrets.RELAY_SIGNING_KEY }}
+          NODE_ID: ${{ secrets.NODE_ID }}
+          EVENT_JSON: ${{ toJSON(github.event.client_payload) }}
+          DECOY_REPOSITORY: ${{ github.repository }}
           FORWARD_ISSUE: ${{ vars.FORWARD_ISSUE }}
-          COMMENT_BODY: ${{ github.event.client_payload.comment_body }}
-          UPDATE_TS:  ${{ github.event.client_payload.update_ts }}
-          FORWARD_REPO: ${{ github.repository }}
+        shell: bash
         run: |
           set -euo pipefail
-          gh issue comment "${FORWARD_ISSUE}" \
-            --repo "${FORWARD_REPO}" \
-            --body "${COMMENT_BODY}"
+          test -n "${RELAY_SIGNING_KEY}"
 
-      - name: Update last-sync cursor
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPDATE_TS: ${{ github.event.client_payload.update_ts }}
-          FORWARD_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          gh variable set LAST_UPDATE_TS \
-            --repo "${FORWARD_REPO}" \
-            --body "${UPDATE_TS}"
+          SIGNATURE="$(jq -er '.signature' <<<"${EVENT_JSON}")"
+          PAYLOAD="$(jq -cS 'del(.signature)' <<<"${EVENT_JSON}")"
+          EXPECTED="$(printf '%s' "${PAYLOAD}" |
+            openssl dgst -sha256 -hmac "${RELAY_SIGNING_KEY}" -hex |
+            sed 's/^.* //')"
+          test "${SIGNATURE}" = "${EXPECTED}"
+          test "$(jq -er '.version' <<<"${PAYLOAD}")" = "1"
+          test "$(jq -er '.direction' <<<"${PAYLOAD}")" = "egress"
+          test "$(jq -er '.node_id' <<<"${PAYLOAD}")" = "${NODE_ID}"
+          test "$(jq -er '.decoy_repository' <<<"${PAYLOAD}")" = "${DECOY_REPOSITORY}"
+          test "$(jq -er '.decoy_issue' <<<"${PAYLOAD}")" = "${FORWARD_ISSUE}"
+
+          ISSUED_AT="$(jq -er '.issued_at' <<<"${PAYLOAD}")"
+          NOW="$(date -u +%s)"
+          ISSUED="$(date -u -d "${ISSUED_AT}" +%s)"
+          AGE="$((NOW - ISSUED))"
+          test "${AGE}" -ge -300
+          test "${AGE}" -le 900
+
+          SOURCE_EVENT_ID="$(jq -er '.source_event_id' <<<"${PAYLOAD}")"
+          MARKER="<!-- octoc2-relay:egress:${SOURCE_EVENT_ID} -->"
+          ALREADY_POSTED="$(gh api --paginate \
+            "repos/${DECOY_REPOSITORY}/issues/${FORWARD_ISSUE}/comments?per_page=100" |
+            jq -s --arg marker "${MARKER}" 'flatten | any(.body | contains($marker))')"
+          if [ "${ALREADY_POSTED}" = "true" ]; then
+            echo "Relay event ${SOURCE_EVENT_ID} was already applied"
+            exit 0
+          fi
+
+          COMMENT_BODY="$(jq -er '.comment_body' <<<"${PAYLOAD}")"
+          printf '%s\n\n%s\n' "${COMMENT_BODY}" "${MARKER}" |
+            gh issue comment "${FORWARD_ISSUE}" \
+              --repo "${DECOY_REPOSITORY}" \
+              --body-file -

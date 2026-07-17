@@ -1,32 +1,34 @@
 // dashboard/src/pages/__tests__/TentacleMonitorPage.test.tsx
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { TentacleMonitorPage } from '../TentacleMonitorPage';
 import type { Beacon } from '@/types';
+import { CHANNEL_CATALOG } from '@octoc2/shared/channels';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
-const mockLiveGetBeacons  = vi.hoisted(() => vi.fn());
-const mockSubscribeEvents = vi.hoisted(() => vi.fn());
+const mockLiveGetBeacons  = vi.fn();
+const mockSubscribeEvents = vi.fn();
 
 vi.mock('@/context/AuthContext', () => ({
   useAuth: () => ({
-    pat: 'ghp_test', mode: 'live', serverUrl: 'http://localhost:8080',
+    githubPat: 'ghp_test', operatorToken: 'operator-test',
+    mode: 'live', serverUrl: 'https://localhost:8080',
     privkey: null, latencyMs: null, login: vi.fn(), logout: vi.fn(),
     setPrivkey: vi.fn(), isAuthenticated: true,
   }),
 }));
 
 vi.mock('@/lib/C2ServerClient', () => ({
-  C2ServerClient: vi.fn(function (this: Record<string, unknown>) {
-    this['getBeacons']      = mockLiveGetBeacons;
-    this['health']          = vi.fn();
-    this['queueTask']       = vi.fn();
-    this['getResults']      = vi.fn();
-    this['subscribeEvents'] = mockSubscribeEvents;
-  }),
+  C2ServerClient: class {
+    getBeacons = mockLiveGetBeacons;
+    health = vi.fn();
+    queueTask = vi.fn();
+    getResults = vi.fn();
+    subscribeEvents = mockSubscribeEvents;
+  },
 }));
 
 vi.mock('@/lib/coords', () => ({
@@ -65,13 +67,12 @@ beforeEach(() => {
 // ── Existing tests (unchanged) ─────────────────────────────────────────────────
 
 describe('TentacleMonitorPage', () => {
-  it('renders all 12 tentacle cells by name', async () => {
+  it('renders every canonical channel cell by name', async () => {
     mockLiveGetBeacons.mockResolvedValue([]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
-    const names = ['Issues', 'Branch', 'Actions', 'Codespaces', 'Pages',
-                   'Gists', 'OIDC', 'PR\\+SSH', 'Stego', '^Proxy$'];
-    for (const name of names) {
-      expect(await screen.findByText(new RegExp(name, 'i'))).toBeInTheDocument();
+    await screen.findByText('Issues');
+    for (const channel of CHANNEL_CATALOG) {
+      expect(screen.getByTestId(`tentacle-cell-${channel.id}`)).toHaveTextContent(channel.name);
     }
   });
 
@@ -91,19 +92,22 @@ describe('TentacleMonitorPage', () => {
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     await screen.findByText('Issues');
     const cells = screen.getAllByTestId(/tentacle-cell-/);
-    expect(cells).toHaveLength(12);
+    expect(cells).toHaveLength(CHANNEL_CATALOG.length);
     for (const cell of cells) {
       expect(cell).toHaveTextContent(/idle/i);
     }
   });
 
-  it('renders all 12 tentacle cells including Notes and Relay', async () => {
+  it('renders all canonical channel cells including Secrets, Notes, Relay, and HTTP', async () => {
     mockLiveGetBeacons.mockResolvedValue([]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
-    expect(await screen.findByText(/Notes/i)).toBeInTheDocument();
-    expect(screen.getByText(/Relay/i)).toBeInTheDocument();
+    await screen.findByText('Issues');
+    expect(screen.getByTestId('tentacle-cell-7b')).toHaveTextContent('Secrets');
+    expect(screen.getByTestId('tentacle-cell-11')).toHaveTextContent('Notes');
+    expect(screen.getByTestId('tentacle-cell-12')).toHaveTextContent('Relay');
+    expect(screen.getByTestId('tentacle-cell-13')).toHaveTextContent('HTTP');
     const cells = screen.getAllByTestId(/tentacle-cell-/);
-    expect(cells).toHaveLength(12);
+    expect(cells).toHaveLength(CHANNEL_CATALOG.length);
   });
 
   it('shows correct beacon count when multiple beacons use the same tentacle', async () => {
@@ -156,11 +160,11 @@ describe('TentacleMonitorPage', () => {
       expect(screen.getByTestId('recovery-relay-count')).toHaveTextContent('0 beacons');
     });
 
-    it('shows dead-drop armed status', async () => {
+    it('does not claim dead-drop readiness without verification', async () => {
       mockLiveGetBeacons.mockResolvedValue([]);
       render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
       await screen.findByText(/Recovery Status/i);
-      expect(screen.getByTestId('recovery-dead-drop')).toHaveTextContent(/armed/i);
+      expect(screen.getByTestId('recovery-dead-drop')).toHaveTextContent(/not verified/i);
     });
   });
 
@@ -173,6 +177,20 @@ describe('TentacleMonitorPage', () => {
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     await screen.findByText('Issues');
     expect(screen.getByTestId('tentacle-cell-4')).toHaveTextContent('1 beacon');
+  });
+
+  it('counts a beacon on the historical string channel ID 7b', async () => {
+    mockLiveGetBeacons.mockResolvedValue([makeBeacon('secrets', '7b')]);
+    render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
+    await screen.findByText('Issues');
+    expect(screen.getByTestId('tentacle-cell-7b')).toHaveTextContent('1 beacon');
+  });
+
+  it('counts a beacon on the HTTP channel ID 13', async () => {
+    mockLiveGetBeacons.mockResolvedValue([makeBeacon('http', 13)]);
+    render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
+    await screen.findByText('Issues');
+    expect(screen.getByTestId('tentacle-cell-13')).toHaveTextContent('1 beacon');
   });
 
   it('counts beacons with missing activeTentacle as T1 (Issues channel)', async () => {
@@ -218,11 +236,14 @@ describe('ProxyPanel', () => {
     expect(screen.getByTestId('proxy-panel-count')).toHaveTextContent('1 beacon');
   });
 
-  it('shows the proxy config env var hint', async () => {
+  it('shows the signed-recovery proxy configuration hint', async () => {
     mockLiveGetBeacons.mockResolvedValue([]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     await screen.findByText(/Proxy Status/i);
-    expect(screen.getByTestId('proxy-panel-hint')).toBeInTheDocument();
+    const hint = screen.getByTestId('proxy-panel-hint');
+    expect(hint).toHaveTextContent('Signed recovery');
+    expect(hint).toHaveTextContent('decoyIssue');
+    expect(hint).not.toHaveTextContent('OCTOC2_PROXY_REPOS');
   });
 });
 
@@ -273,11 +294,11 @@ describe('TentacleMonitorPage — health color logic', () => {
 // ── New tests: summary row ────────────────────────────────────────────────────
 
 describe('TentacleMonitorPage — channel summary', () => {
-  it('shows "0 of 12 channels active" when no beacons', async () => {
+  it('shows no recently observed catalog entries when no beacons', async () => {
     mockLiveGetBeacons.mockResolvedValue([]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     expect(await screen.findByTestId('channel-summary')).toHaveTextContent(
-      '0 of 12 channels active',
+      `0 of ${CHANNEL_CATALOG.length} catalog entries recently observed`,
     );
   });
 
@@ -285,7 +306,7 @@ describe('TentacleMonitorPage — channel summary', () => {
     mockLiveGetBeacons.mockResolvedValue([makeBeacon('a1', 1, 30_000)]); // 30s ago
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     expect(await screen.findByTestId('channel-summary')).toHaveTextContent(
-      '1 of 12 channels active',
+      `1 of ${CHANNEL_CATALOG.length} catalog entries recently observed`,
     );
   });
 
@@ -294,7 +315,7 @@ describe('TentacleMonitorPage — channel summary', () => {
     mockLiveGetBeacons.mockResolvedValue([makeBeacon('y2', 2, 10 * 60_000)]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     expect(await screen.findByTestId('channel-summary')).toHaveTextContent(
-      '1 of 12 channels active',
+      `1 of ${CHANNEL_CATALOG.length} catalog entries recently observed`,
     );
   });
 
@@ -303,7 +324,7 @@ describe('TentacleMonitorPage — channel summary', () => {
     mockLiveGetBeacons.mockResolvedValue([makeBeacon('r3', 3, 45 * 60_000)]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     expect(await screen.findByTestId('channel-summary')).toHaveTextContent(
-      '0 of 12 channels active',
+      `0 of ${CHANNEL_CATALOG.length} catalog entries recently observed`,
     );
   });
 
@@ -315,7 +336,7 @@ describe('TentacleMonitorPage — channel summary', () => {
     ]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     expect(await screen.findByTestId('channel-summary')).toHaveTextContent(
-      '3 of 12 channels active',
+      `3 of ${CHANNEL_CATALOG.length} catalog entries recently observed`,
     );
   });
 });
@@ -457,50 +478,34 @@ describe('Task 83: SSE + live indicators', () => {
   });
 });
 
-// ── New tests: all 12 tentacle kinds appear ──────────────────────────────────
+// ── New tests: all canonical channel kinds appear ────────────────────────────
 
-describe('TentacleMonitorPage — all 12 tentacle kinds in grid', () => {
-  const ALL_TENTACLE_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] as const;
-
-  it('renders a cell with data-testid for each of the 12 tentacle IDs', async () => {
+describe('TentacleMonitorPage — all canonical channel kinds in grid', () => {
+  it('renders a cell with data-testid for every catalog ID', async () => {
     mockLiveGetBeacons.mockResolvedValue([]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     await screen.findByText('Issues');
-    for (const tid of ALL_TENTACLE_IDS) {
-      expect(screen.getByTestId(`tentacle-cell-${tid}`)).toBeInTheDocument();
+    for (const channel of CHANNEL_CATALOG) {
+      expect(screen.getByTestId(`tentacle-cell-${channel.id}`)).toBeInTheDocument();
     }
   });
 
-  it('renders a health dot for each of the 12 tentacle cells', async () => {
+  it('renders a health dot for every catalog entry', async () => {
     mockLiveGetBeacons.mockResolvedValue([]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     await screen.findByText('Issues');
-    for (const tid of ALL_TENTACLE_IDS) {
-      expect(screen.getByTestId(`tentacle-dot-${tid}`)).toBeInTheDocument();
+    for (const channel of CHANNEL_CATALOG) {
+      expect(screen.getByTestId(`tentacle-dot-${channel.id}`)).toBeInTheDocument();
     }
   });
 
-  it('shows each tentacle name in its cell', async () => {
-    const EXPECTED_NAMES: Record<number, RegExp> = {
-      1:  /issues/i,
-      2:  /branch/i,
-      3:  /actions/i,
-      4:  /codespaces/i,
-      5:  /pages/i,
-      6:  /gists/i,
-      7:  /oidc/i,
-      8:  /pr\+ssh/i,
-      9:  /stego/i,
-      10: /proxy/i,
-      11: /notes/i,
-      12: /relay/i,
-    };
+  it('shows each catalog name in its cell', async () => {
     mockLiveGetBeacons.mockResolvedValue([]);
     render(<TentacleMonitorPage />, { wrapper: makeWrapper() });
     await screen.findByText('Issues');
-    for (const [tidStr, pattern] of Object.entries(EXPECTED_NAMES)) {
-      const cell = screen.getByTestId(`tentacle-cell-${tidStr}`);
-      expect(cell).toHaveTextContent(pattern);
+    for (const channel of CHANNEL_CATALOG) {
+      const cell = screen.getByTestId(`tentacle-cell-${channel.id}`);
+      expect(cell).toHaveTextContent(channel.name);
     }
   });
 });

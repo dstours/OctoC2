@@ -1,0 +1,73 @@
+name: OctoC2 relay control replies
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  forward:
+    if: "!contains(github.event.comment.body, '<!-- octoc2-relay:')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sign and dispatch the control reply
+        env:
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+          RELAY_SIGNING_KEY: ${{ secrets.RELAY_SIGNING_KEY }}
+          NODE_ROUTE_MAP: ${{ vars.NODE_ROUTE_MAP }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          CONTROL_ISSUE: ${{ github.event.issue.number }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${TARGET_TOKEN}"
+          test -n "${RELAY_SIGNING_KEY}"
+
+          ROUTE_ENTRY="$(jq -cer \
+            --argjson issue "${CONTROL_ISSUE}" \
+            'to_entries | map(select(.value.controlIssue == $issue)) | if length == 1 then .[0] else error("control issue is not mapped exactly once") end' \
+            <<<"${NODE_ROUTE_MAP}")"
+          NODE_ID="$(jq -er '.key' <<<"${ROUTE_ENTRY}")"
+          DECOY_REPOSITORY="$(jq -er '.value.decoyRepository' <<<"${ROUTE_ENTRY}")"
+          DECOY_ISSUE="$(jq -er '.value.decoyIssue' <<<"${ROUTE_ENTRY}")"
+          SOURCE_EVENT_ID="control:${REPOSITORY_ID}:${COMMENT_ID}"
+          ISSUED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          PAYLOAD="$(jq -cS -n \
+            --argjson version 1 \
+            --arg direction "egress" \
+            --arg source_event_id "${SOURCE_EVENT_ID}" \
+            --arg node_id "${NODE_ID}" \
+            --arg decoy_repository "${DECOY_REPOSITORY}" \
+            --argjson decoy_issue "${DECOY_ISSUE}" \
+            --arg comment_body "${COMMENT_BODY}" \
+            --arg issued_at "${ISSUED_AT}" \
+            '{
+              version: $version,
+              direction: $direction,
+              source_event_id: $source_event_id,
+              node_id: $node_id,
+              decoy_repository: $decoy_repository,
+              decoy_issue: $decoy_issue,
+              comment_body: $comment_body,
+              issued_at: $issued_at
+            }')"
+          SIGNATURE="$(printf '%s' "${PAYLOAD}" |
+            openssl dgst -sha256 -hmac "${RELAY_SIGNING_KEY}" -hex |
+            sed 's/^.* //')"
+          DISPATCH="$(jq -cn \
+            --argjson payload "${PAYLOAD}" \
+            --arg signature "${SIGNATURE}" \
+            '{event_type:"octoc2-relay-egress",client_payload:($payload + {signature:$signature})}')"
+
+          printf '%s' "${DISPATCH}" |
+            GH_TOKEN="${TARGET_TOKEN}" gh api \
+              --method POST \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${DECOY_REPOSITORY}/dispatches" \
+              --input -

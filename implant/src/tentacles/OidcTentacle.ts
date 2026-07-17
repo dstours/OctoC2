@@ -78,9 +78,14 @@
 import { BaseTentacle } from "./BaseTentacle.ts";
 import {
   decryptBox, sealBox,
-  bytesToBase64,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
+import { requireHttpsControllerUrl } from "../lib/ControllerUrl.ts";
 
 /** Audience sent in the OIDC token request. Must match what the server expects. */
 const OIDC_AUDIENCE = "github-actions";
@@ -132,6 +137,7 @@ export class OidcTentacle extends BaseTentacle {
    */
   override async isAvailable(): Promise<boolean> {
     try {
+      this.controllerUrl();
       return OidcTentacle.isOidcAvailable();
     } catch {
       return false;
@@ -193,19 +199,18 @@ export class OidcTentacle extends BaseTentacle {
    * encrypted tasks.  Each task is decrypted with the beacon's key pair before
    * being returned to the caller.
    */
-  async checkin(_payload: CheckinPayload): Promise<Task[]> {
-    const serverUrl = (this.config as any).serverUrl as string | undefined;
-    if (!serverUrl) {
-      throw new Error("OidcTentacle: config.serverUrl is required for OIDC channel");
-    }
+  async checkin(payload: CheckinPayload): Promise<Task[]> {
+    const serverUrl = this.controllerUrl();
 
-    const jwt    = await this.fetchOidcToken(OIDC_AUDIENCE);
-    const pubkey = await bytesToBase64(this.config.beaconKeyPair.publicKey);
+    if (!payload.identity) {
+      throw new Error("OidcTentacle: signed checkin identity is required");
+    }
+    const jwt = await this.fetchOidcToken(OIDC_AUDIENCE);
 
     const response = await fetch(`${serverUrl}/api/oidc/checkin`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ jwt, pubkey }),
+      body:    JSON.stringify({ jwt, checkin: payload }),
     });
 
     if (!response.ok) {
@@ -240,11 +245,8 @@ export class OidcTentacle extends BaseTentacle {
    * Fetches a fresh OIDC JWT (the previous one may have expired) and POSTs
    * the sealed task result to the C2 server's result endpoint.
    */
-  async submitResult(result: TaskResult): Promise<void> {
-    const serverUrl = (this.config as any).serverUrl as string | undefined;
-    if (!serverUrl) {
-      throw new Error("OidcTentacle: config.serverUrl is required for OIDC channel");
-    }
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
+    const serverUrl = this.controllerUrl();
 
     const jwt    = await this.fetchOidcToken(OIDC_AUDIENCE);
     const sealed = await sealBox(JSON.stringify(result), this.config.operatorPublicKey);
@@ -258,6 +260,16 @@ export class OidcTentacle extends BaseTentacle {
     if (!response.ok) {
       throw new Error(`OidcTentacle: submitResult returned HTTP ${response.status}`);
     }
+    const responseBody = await response.json().catch(() => null) as {
+      ok?: unknown;
+    } | null;
+    const accepted = responseBody?.ok === true;
+    return {
+      artifactWritten: accepted,
+      controllerAccepted: accepted,
+      channel: "oidc",
+      acceptance: accepted ? "direct-response" : null,
+    };
   }
 
   // ── teardown ──────────────────────────────────────────────────────────────────
@@ -267,5 +279,12 @@ export class OidcTentacle extends BaseTentacle {
    */
   override async teardown(): Promise<void> {
     return;
+  }
+
+  private controllerUrl(): string {
+    return requireHttpsControllerUrl(
+      this.config.serverUrl,
+      "OidcTentacle config.serverUrl",
+    );
   }
 }

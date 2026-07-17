@@ -7,7 +7,7 @@
     "jsx":       "react-jsx",
     "rootDir":   "src",
     "noEmit":    true,
-    "types":     ["vite/client"],
+    "types":     ["vite/client", "bun-types"],
     "allowImportingTsExtensions": true,
     "paths": {
       "@/*": ["./src/*"]

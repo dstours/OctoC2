@@ -7,7 +7,7 @@ export type ConnectionMode = 'live' | 'api' | 'offline';
 
 /** Health report for a single tentacle channel. */
 export interface TentacleHealth {
-  /** Tentacle number 1–10. */
+  /** Canonical channel ID, including historical `7b` and HTTP 13. */
   id: TentacleId;
   /** Human-readable name (e.g. "Issues", "Codespaces"). */
   name: string;

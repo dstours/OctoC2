@@ -1,45 +1,46 @@
 // dashboard/src/pages/__tests__/BeaconDetailPage.test.tsx
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BeaconDetailPage } from '../BeaconDetailPage';
 import type { Beacon } from '@/types';
 import type { ServerTask } from '@/lib/C2ServerClient';
+import { CHANNEL_CATALOG } from '@octoc2/shared/channels';
+import { TASK_KINDS } from '@octoc2/shared/tasks';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
-const mockQueueTask             = vi.hoisted(() => vi.fn());
-const mockGetResults            = vi.hoisted(() => vi.fn());
-const mockLiveGetBeacons        = vi.hoisted(() => vi.fn());
-const mockListModules           = vi.hoisted(() => vi.fn());
-const mockGetMaintenance        = vi.hoisted(() => vi.fn());
-const mockGetMaintenanceComment = vi.hoisted(() => vi.fn());
-const mockSubscribeEvents       = vi.hoisted(() => vi.fn());
-const mockAuthPrivkey           = vi.hoisted(() => ({ value: null as string | null }));
-const mockDecryptSealedResult                 = vi.hoisted(() => vi.fn());
-const mockDeadDropGistKey                     = vi.hoisted(() => vi.fn());
-const mockParseMaintenanceDiagnosticPayload   = vi.hoisted(() => vi.fn());
+const mockQueueTask             = vi.fn();
+const mockGetResults            = vi.fn();
+const mockLiveGetBeacons        = vi.fn();
+const mockGetMaintenance        = vi.fn();
+const mockGetMaintenanceComment = vi.fn();
+const mockSubscribeEvents       = vi.fn();
+const mockAuthPrivkey           = { value: null as string | null };
+const mockDecryptSealedResult                 = vi.fn();
+const mockRecoveryDropPath                    = vi.fn();
+const mockParseMaintenanceDiagnosticPayload   = vi.fn();
 
 vi.mock('@/context/AuthContext', () => ({
   useAuth: () => ({
-    pat: 'ghp_test', mode: 'live', serverUrl: 'http://localhost:8080',
+    githubPat: 'ghp_test', operatorToken: 'operator-test',
+    mode: 'live', serverUrl: 'https://localhost:8080',
     privkey: mockAuthPrivkey.value, latencyMs: null,
     login: vi.fn(), logout: vi.fn(), setPrivkey: vi.fn(), isAuthenticated: true,
   }),
 }));
 
 vi.mock('@/lib/C2ServerClient', () => ({
-  C2ServerClient: vi.fn(function (this: Record<string, unknown>) {
-    this['getBeacons']             = mockLiveGetBeacons;
-    this['queueTask']              = mockQueueTask;
-    this['getResults']             = mockGetResults;
-    this['health']                 = vi.fn().mockResolvedValue({ ok: true, latencyMs: 5 });
-    this['listModules']            = mockListModules;
-    this['getMaintenance']         = mockGetMaintenance;
-    this['getMaintenanceComment']  = mockGetMaintenanceComment;
-    this['subscribeEvents']        = mockSubscribeEvents;
-  }),
+  C2ServerClient: class {
+    getBeacons = mockLiveGetBeacons;
+    queueTask = mockQueueTask;
+    getResults = mockGetResults;
+    health = vi.fn().mockResolvedValue({ ok: true, latencyMs: 5 });
+    getMaintenance = mockGetMaintenance;
+    getMaintenanceComment = mockGetMaintenanceComment;
+    subscribeEvents = mockSubscribeEvents;
+  },
 }));
 
 vi.mock('@/lib/coords', () => ({
@@ -48,7 +49,7 @@ vi.mock('@/lib/coords', () => ({
 
 vi.mock('@/lib/crypto', () => ({
   decryptSealedResult:               mockDecryptSealedResult,
-  deadDropGistKey:                   mockDeadDropGistKey,
+  recoveryDropPath:                  mockRecoveryDropPath,
   parseMaintenanceDiagnosticPayload: mockParseMaintenanceDiagnosticPayload,
 }));
 
@@ -114,9 +115,10 @@ beforeEach(() => {
   });
   mockAuthPrivkey.value = null;
   mockDecryptSealedResult.mockReset();
-  (mockDeadDropGistKey as any).mockResolvedValue('deadbeef01234567');
+  (mockRecoveryDropPath as any).mockResolvedValue(
+    'drops/deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567.bin',
+  );
   mockParseMaintenanceDiagnosticPayload.mockReset().mockReturnValue(null);
-  mockListModules.mockResolvedValue([]);
   mockGetMaintenance.mockReset().mockResolvedValue({
     beaconId: 'b1', hostname: 'WIN-HOST', os: 'windows', arch: 'x64',
     status: 'active', lastSeen: new Date().toISOString(),
@@ -167,13 +169,16 @@ describe('BeaconDetailPage', () => {
       expect(screen.getByPlaceholderText(/args json/i)).toBeInTheDocument();
     });
 
-    it('includes load-module in the task kind dropdown', async () => {
+    it('uses the exact shared task catalog in the task kind dropdown', async () => {
       render(<BeaconDetailPage />, { wrapper: makeWrapper() });
       await screen.findAllByText('WIN-HOST');
       fireEvent.click(screen.getByRole('button', { name: /^tasks$/i }));
       const select = screen.getByRole('combobox') as HTMLSelectElement;
       const optionValues = Array.from(select.options).map(o => o.value);
-      expect(optionValues).toContain('load-module');
+      expect(optionValues).toEqual([...TASK_KINDS]);
+      for (const unsupported of ['load-module', 'openhulud', 'stego', 'die', 'screenshot', 'upload', 'download']) {
+        expect(optionValues).not.toContain(unsupported);
+      }
     });
 
     it('submits a new task when the form is filled and submitted', async () => {
@@ -187,6 +192,42 @@ describe('BeaconDetailPage', () => {
 
       await waitFor(() => {
         expect(mockQueueTask).toHaveBeenCalledWith('b1', 'shell', { cmd: 'whoami' });
+      });
+    });
+
+    it('uses canonical seconds and jitter fields for the sleep task default', async () => {
+      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
+      await screen.findAllByText('WIN-HOST');
+      fireEvent.click(screen.getByRole('button', { name: /^tasks$/i }));
+
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: 'sleep' } });
+      const argsInput = screen.getByPlaceholderText(/args json/i) as HTMLInputElement;
+      expect(JSON.parse(argsInput.value)).toEqual({ seconds: 30, jitter: 0 });
+      expect(argsInput.value).not.toContain('intervalMs');
+    });
+
+    it('rejects invalid task args before calling the server client', async () => {
+      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
+      await screen.findAllByText('WIN-HOST');
+      fireEvent.click(screen.getByRole('button', { name: /^tasks$/i }));
+
+      fireEvent.change(screen.getByPlaceholderText(/args json/i), { target: { value: '{}' } });
+      fireEvent.click(screen.getByRole('button', { name: /queue/i }));
+
+      expect(await screen.findByText(/cmd.*required/i)).toBeInTheDocument();
+      expect(mockQueueTask).not.toHaveBeenCalled();
+    });
+
+    it('queues a valid no-argument ping task', async () => {
+      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
+      await screen.findAllByText('WIN-HOST');
+      fireEvent.click(screen.getByRole('button', { name: /^tasks$/i }));
+
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: 'ping' } });
+      fireEvent.click(screen.getByRole('button', { name: /queue/i }));
+
+      await waitFor(() => {
+        expect(mockQueueTask).toHaveBeenCalledWith('b1', 'ping', {});
       });
     });
   });
@@ -391,12 +432,14 @@ describe('BeaconDetailPage', () => {
       expect(screen.getByRole('button', { name: /stealth/i })).toBeInTheDocument();
     });
 
-    it('shows dead-drop gist filename on Stealth tab', async () => {
+    it('shows the canonical signed-recovery path on Stealth tab', async () => {
       mockGetResults.mockResolvedValue([]);
       render(<BeaconDetailPage />, { wrapper: makeWrapper() });
       await screen.findAllByText('WIN-HOST');
       fireEvent.click(screen.getByRole('button', { name: /stealth/i }));
-      expect(await screen.findByText('data-deadbeef01234567.bin')).toBeInTheDocument();
+      expect(await screen.findByText(
+        'drops/deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567.bin',
+      )).toBeInTheDocument();
     });
 
     it('shows active channel name on Stealth tab', async () => {
@@ -404,7 +447,9 @@ describe('BeaconDetailPage', () => {
       render(<BeaconDetailPage />, { wrapper: makeWrapper() });
       await screen.findAllByText('WIN-HOST');
       fireEvent.click(screen.getByRole('button', { name: /stealth/i }));
-      await screen.findByText('data-deadbeef01234567.bin');
+      await screen.findByText(
+        'drops/deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567.bin',
+      );
       // activeTentacle=1 → Issues
       expect(screen.getAllByText('Issues')[0]).toBeInTheDocument();
     });
@@ -633,58 +678,6 @@ describe('BeaconDetailPage', () => {
     });
   });
 
-  describe('LoadedModulesPanel', () => {
-    it('shows "No modules loaded." when module list is empty', async () => {
-      mockListModules.mockResolvedValue([]);
-      mockGetResults.mockResolvedValue([]);
-      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
-      await screen.findAllByText('WIN-HOST');
-      expect(await screen.findByText('No modules loaded.')).toBeInTheDocument();
-    });
-
-    it('shows module names when modules are present', async () => {
-      mockListModules.mockResolvedValue([
-        { name: 'recon',      lastExecuted: null },
-        { name: 'screenshot', lastExecuted: null },
-      ]);
-      mockGetResults.mockResolvedValue([]);
-      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
-      await screen.findAllByText('WIN-HOST');
-      expect(screen.getByText('recon')).toBeInTheDocument();
-      expect(screen.getByText('screenshot')).toBeInTheDocument();
-    });
-
-    it('shows — for lastExecuted when module has never run', async () => {
-      mockListModules.mockResolvedValue([
-        { name: 'recon', lastExecuted: null },
-      ]);
-      mockGetResults.mockResolvedValue([]);
-      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
-      await screen.findAllByText('WIN-HOST');
-      // rel(null) returns '—'
-      expect(screen.getByText('—')).toBeInTheDocument();
-    });
-
-    it('shows relative time when module has been executed', async () => {
-      const execTime = new Date(Date.now() - 90_000).toISOString(); // 90s ago → "1m ago"
-      mockListModules.mockResolvedValue([
-        { name: 'recon', lastExecuted: execTime },
-      ]);
-      mockGetResults.mockResolvedValue([]);
-      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
-      await screen.findAllByText('WIN-HOST');
-      expect(screen.getByText('1m ago')).toBeInTheDocument();
-    });
-
-    it('shows modules section heading', async () => {
-      mockListModules.mockResolvedValue([{ name: 'recon', lastExecuted: null }]);
-      mockGetResults.mockResolvedValue([]);
-      render(<BeaconDetailPage />, { wrapper: makeWrapper() });
-      await screen.findAllByText('WIN-HOST');
-      expect(screen.getByText('Loaded Modules')).toBeInTheDocument();
-    });
-  });
-
   describe('Task 81: SSE invalidation', () => {
     it('calls getResults again when a beacon-update SSE event includes this beacon', async () => {
       let emitEvent: ((event: unknown) => void) | null = null;
@@ -777,14 +770,19 @@ describe('BeaconDetailPage', () => {
       expect(grayDots.length).toBeGreaterThan(0);
     });
 
-    it('shows all 6 mini tentacle labels', async () => {
+    it('shows every selectable catalog channel in the mini channel grid', async () => {
       mockGetResults.mockResolvedValue([]);
       render(<BeaconDetailPage />, { wrapper: makeWrapper() });
       await screen.findAllByText('WIN-HOST');
-      await screen.findByText('Tentacle Activity');
-      for (const name of ['Branch', 'Actions', 'Codespaces', 'Pages', 'Stego']) {
-        expect(screen.getByText(name)).toBeInTheDocument();
+      const section = (await screen.findByText('Tentacle Activity')).parentElement!;
+      const selectableChannels = CHANNEL_CATALOG.filter(
+        channel => channel.implementationStatus !== 'unavailable',
+      );
+      for (const channel of selectableChannels) {
+        expect(section).toHaveTextContent(channel.name);
       }
+      expect(section).not.toHaveTextContent('PR+SSH');
+      expect(section.querySelectorAll('span.rounded-full')).toHaveLength(selectableChannels.length);
     });
   });
 

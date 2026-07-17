@@ -11,39 +11,56 @@
 
 import { Octokit } from "@octokit/rest";
 import { GH_UA } from "../lib/constants.ts";
-import type { ITentacle, TentacleKind, CheckinPayload, Task, TaskResult, BeaconConfig } from "../types.ts";
+import {
+  getSharedGitHubTokenProvider,
+  type GitHubTokenProvider,
+} from "../lib/GitHubTokenProvider.ts";
+import type {
+  ITentacle,
+  TentacleKind,
+  CheckinPayload,
+  Task,
+  TaskResult,
+  BeaconConfig,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 
 export abstract class BaseTentacle implements ITentacle {
   abstract readonly kind: TentacleKind;
 
   protected readonly octokit: Octokit;
   protected readonly config: BeaconConfig;
+  protected readonly tokenProvider: GitHubTokenProvider;
 
-  constructor(config: BeaconConfig, getToken?: () => Promise<string>) {
+  constructor(config: BeaconConfig, tokenProvider?: GitHubTokenProvider) {
     this.config = config;
+    this.tokenProvider =
+      tokenProvider ?? getSharedGitHubTokenProvider(config);
 
-    const tokenGetter = getToken ?? (() => Promise.resolve(config.token));
     this.octokit = new Octokit({
-      auth: config.token,
       userAgent: process.env.OCTOC2_USER_AGENT ?? GH_UA,
       // Retry on 429 (rate limit) automatically
       throttle: undefined,
     });
 
-    // If GitHub App credentials are present, wrap all Octokit requests to
-    // inject short-lived installation tokens (1-hour TTL) transparently.
-    // The caller may pass a shared getToken() to avoid redundant JWT signing
-    // across multiple tentacle instances.
-    if (config.appId && config.installationId && config.appPrivateKey) {
-      this.octokit.hook.wrap("request", async (request, options) => {
-        const token = await tokenGetter();
-        options.headers = {
-          ...options.headers,
-          authorization: `token ${token}`,
-        };
-        return request(options);
-      });
-    }
+    // Every request obtains its credential from the shared provider. A token
+    // lease never falls back to config.token when stale, invalid, or expired.
+    this.octokit.hook.wrap("request", async (request, options) => {
+      const token = await this.tokenProvider.getToken({ channel: this.kind });
+      options.headers = {
+        ...options.headers,
+        authorization: `Bearer ${token}`,
+      };
+      try {
+        return await request(options);
+      } catch (error) {
+        const status = (error as { status?: unknown }).status;
+        if (status === 401 || status === 403) {
+          this.tokenProvider.invalidate(`GitHub returned HTTP ${status}`);
+        }
+        throw error;
+      }
+    });
   }
 
   /** Default availability check — verify token works with a lightweight call */
@@ -60,7 +77,7 @@ export abstract class BaseTentacle implements ITentacle {
   }
 
   abstract checkin(payload: CheckinPayload): Promise<Task[]>;
-  abstract submitResult(result: TaskResult): Promise<void>;
+  abstract submitResult(result: TaskResult): Promise<ResultSubmissionOutcome>;
 
   async teardown(): Promise<void> {
     // No-op by default — override in tentacles that hold connections

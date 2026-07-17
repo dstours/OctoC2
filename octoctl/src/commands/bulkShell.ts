@@ -9,6 +9,12 @@
  *   octoctl bulk shell --beacon-ids <id1,id2,id3> --cmd "id" --json
  */
 
+import {
+  controllerFetch,
+  requireControllerServerUrl,
+  requireOperatorApiToken,
+} from "../lib/env.ts";
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 export interface BulkShellOptions {
@@ -47,7 +53,7 @@ export async function postBulkTask(
   token:     string,
   cmd:       string,
 ): Promise<string> {
-  const resp = await fetch(`${serverUrl}/api/beacon/${beaconId}/task`, {
+  const resp = await controllerFetch(`${serverUrl}/api/beacon/${beaconId}/task`, {
     method:  "POST",
     headers: {
       Authorization:  `Bearer ${token}`,
@@ -136,7 +142,7 @@ export async function pollBulkResults(
       if (done.has(entry.beaconId)) continue;
 
       try {
-        const resp = await fetch(
+        const resp = await controllerFetch(
           `${opts.serverUrl}/api/beacon/${entry.beaconId}/results`,
           { headers: { Authorization: `Bearer ${opts.token}` } },
         );
@@ -183,13 +189,9 @@ export async function runBulkShell(rawOpts: {
   wait?:        boolean;
   pollTimeout?: number;
 }): Promise<void> {
-  const serverUrl = rawOpts.serverUrl ?? process.env["OCTOC2_SERVER_URL"] ?? "";
-  if (!serverUrl) {
-    console.error("\n  Error: --server-url or OCTOC2_SERVER_URL env var is required for bulk shell.\n");
-    process.exit(1);
-  }
+  const serverUrl = requireControllerServerUrl(rawOpts.serverUrl);
 
-  const token = rawOpts.token ?? process.env["OCTOC2_DASHBOARD_TOKEN"] ?? "dev-token";
+  const token = requireOperatorApiToken(rawOpts.token);
 
   const beaconIds = rawOpts.beaconIds
     .split(",")
@@ -206,7 +208,7 @@ export async function runBulkShell(rawOpts: {
     cmd: rawOpts.cmd,
     serverUrl,
     token,
-    json: rawOpts.json,
+    ...(rawOpts.json !== undefined && { json: rawOpts.json }),
   });
 
   // ── JSON output ──────────────────────────────────────────────────────────────
@@ -235,7 +237,9 @@ export async function runBulkShell(rawOpts: {
     await pollBulkResults(results, {
       serverUrl,
       token,
-      pollTimeout: rawOpts.pollTimeout,
+      ...(rawOpts.pollTimeout !== undefined && {
+        pollTimeout: rawOpts.pollTimeout,
+      }),
     });
   }
 }

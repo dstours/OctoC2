@@ -1,6 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
+import {
+  controllerFetch,
+  requireControllerServerUrl,
+} from "../lib/env.ts";
 
 const DIM    = "\x1b[2m";
 const BOLD   = "\x1b[1m";
@@ -64,11 +68,19 @@ export function loadEnvFile(envPath: string): Record<string, string> {
   return vars;
 }
 
-async function probeHealth(port: number, timeoutMs = 3000): Promise<boolean> {
+async function probeHealth(
+  serverUrl: string,
+  caFile?: string,
+  timeoutMs = 3000,
+): Promise<boolean> {
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    const resp = await fetch(`http://localhost:${port}/api/health`, { signal: ctrl.signal });
+    const resp = await controllerFetch(
+      `${serverUrl}/api/health`,
+      { signal: ctrl.signal },
+      caFile,
+    );
     clearTimeout(timer);
     return resp.ok;
   } catch {
@@ -123,6 +135,16 @@ export async function runStart(opts: StartOptions): Promise<void> {
       }
 
       const httpPort = mergedEnv["OCTOC2_HTTP_PORT"] ?? "8080";
+      const httpEnabled = ["1", "true", "yes", "on"].includes(
+        (mergedEnv["OCTOC2_HTTP_ENABLED"] ?? "").trim().toLowerCase(),
+      );
+      const serverUrl = httpEnabled
+        ? requireControllerServerUrl(
+            mergedEnv["OCTOC2_SERVER_URL"] ??
+              `https://127.0.0.1:${httpPort}`,
+          )
+        : null;
+      const httpCaFile = mergedEnv["OCTOC2_HTTP_CA_CERT"]?.trim() || undefined;
       const logFile = join(projectRoot, "server.log");
 
       // Set data dir to project root so registry.json is at <root>/data/
@@ -143,14 +165,22 @@ export async function runStart(opts: StartOptions): Promise<void> {
       savePids(pidPath, pids);
 
       await new Promise(r => setTimeout(r, 1500));
-      const healthy = await probeHealth(parseInt(httpPort, 10));
+      const healthy = serverUrl
+        ? await probeHealth(serverUrl, httpCaFile)
+        : false;
 
-      if (healthy) {
+      if (!httpEnabled) {
+        console.log(
+          `  ${GREEN}Server started${RESET} with direct HTTP disabled (PID ${proc.pid})`,
+        );
+      } else if (healthy) {
         console.log(`  ${GREEN}Server started${RESET} on :${httpPort} (PID ${proc.pid})`);
       } else {
         console.log(`  ${YELLOW}Server spawned${RESET} (PID ${proc.pid}) — waiting for health…`);
         await new Promise(r => setTimeout(r, 2000));
-        const retry = await probeHealth(parseInt(httpPort, 10));
+        const retry = serverUrl
+          ? await probeHealth(serverUrl, httpCaFile)
+          : false;
         if (retry) {
           console.log(`  ${GREEN}Server healthy${RESET} on :${httpPort}`);
         } else {
@@ -183,7 +213,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
       pids.dashboard = proc.pid;
       savePids(pidPath, pids);
 
-      console.log(`  ${GREEN}Dashboard started${RESET} on :3000 (PID ${proc.pid})`);
+      console.log(`  ${GREEN}Dashboard started${RESET} on :5173 (PID ${proc.pid})`);
     }
   }
 
@@ -209,7 +239,7 @@ export async function runStop(opts: StopOptions): Promise<void> {
     } else {
       console.log(`  ${DIM}Server not running${RESET} (stale PID ${pids.server})`);
     }
-    pids.server = undefined;
+    delete pids.server;
   }
 
   if (stopDashboard && pids.dashboard) {
@@ -219,7 +249,7 @@ export async function runStop(opts: StopOptions): Promise<void> {
     } else {
       console.log(`  ${DIM}Dashboard not running${RESET} (stale PID ${pids.dashboard})`);
     }
-    pids.dashboard = undefined;
+    delete pids.dashboard;
   }
 
   savePids(pidPath, pids);
@@ -231,12 +261,15 @@ export async function runStop(opts: StopOptions): Promise<void> {
 
 export async function runStatus(): Promise<void> {
   const pids = loadPids();
-  const httpPort = parseInt(process.env["OCTOC2_HTTP_PORT"] ?? "8080", 10);
+  const serverUrl = process.env["OCTOC2_SERVER_URL"]?.trim();
+  const httpCaFile = process.env["OCTOC2_HTTP_CA_CERT"]?.trim() || undefined;
 
   console.log("");
 
   if (pids.server && isAlive(pids.server)) {
-    const healthy = await probeHealth(httpPort);
+    const healthy = serverUrl
+      ? await probeHealth(requireControllerServerUrl(serverUrl), httpCaFile)
+      : false;
     const badge = healthy ? `${GREEN}healthy${RESET}` : `${YELLOW}unhealthy${RESET}`;
     console.log(`  Server     ${GREEN}running${RESET}  PID ${pids.server}  ${badge}`);
   } else {
@@ -244,7 +277,7 @@ export async function runStatus(): Promise<void> {
   }
 
   if (pids.dashboard && isAlive(pids.dashboard)) {
-    console.log(`  Dashboard  ${GREEN}running${RESET}  PID ${pids.dashboard}  http://localhost:3000`);
+    console.log(`  Dashboard  ${GREEN}running${RESET}  PID ${pids.dashboard}  http://127.0.0.1:5173`);
   } else {
     console.log(`  Dashboard  ${DIM}stopped${RESET}`);
   }

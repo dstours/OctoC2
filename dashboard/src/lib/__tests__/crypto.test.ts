@@ -1,6 +1,5 @@
 // dashboard/src/lib/__tests__/crypto.test.ts
-// @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import sodium from 'libsodium-wrappers';
 import { decryptSealedResult } from '../crypto';
 
@@ -38,20 +37,19 @@ describe('decryptSealedResult', () => {
   });
 });
 
-import { deadDropGistKey } from '../crypto';
+import { recoveryDropPath } from '../crypto';
 
-describe('deadDropGistKey', () => {
-  it('returns the first 16 hex chars of sha256(beaconId)', async () => {
-    // sha256("abc") hex = "ba7816bf8f01cfea414140de5dae2ec73b00361bbef0469393f4..."
-    // First 16 chars: "ba7816bf8f01cfea"
-    const key = await deadDropGistKey('abc');
-    expect(key).toHaveLength(16);
-    expect(key).toBe('ba7816bf8f01cfea');
+describe('recoveryDropPath', () => {
+  it('uses the full sha256(beaconId) digest under the canonical drops prefix', async () => {
+    expect(await recoveryDropPath('abc')).toBe(
+      'drops/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad.bin',
+    );
   });
 
-  it('formats the full gist filename correctly', async () => {
-    const key = await deadDropGistKey('test-beacon-id');
-    expect(`data-${key}.bin`).toMatch(/^data-[0-9a-f]{16}\.bin$/);
+  it('formats recovery paths with a full 64-character hex digest', async () => {
+    expect(await recoveryDropPath('test-beacon-id')).toMatch(
+      /^drops\/[0-9a-f]{64}\.bin$/,
+    );
   });
 });
 

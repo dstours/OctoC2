@@ -5,15 +5,20 @@
  * Queues `shell` tasks and polls for results in a REPL loop.
  *
  * Usage:
- *   OCTOC2_SERVER_URL=http://localhost:8080 octoctl beacon shell --beacon <id>
- *   OCTOC2_SERVER_URL=http://localhost:8080 octoctl beacon shell --beacon <id> --tentacle notes
- *   OCTOC2_SERVER_URL=http://localhost:8080 octoctl beacon shell --beacon <id> --bulk <id2>,<id3>
+ *   OCTOC2_SERVER_URL=https://localhost:8080 octoctl beacon shell --beacon <id>
+ *   OCTOC2_SERVER_URL=https://localhost:8080 octoctl beacon shell --beacon <id> --tentacle notes
+ *   OCTOC2_SERVER_URL=https://localhost:8080 octoctl beacon shell --beacon <id> --bulk <id2>,<id3>
  */
 
 import * as readline from "node:readline";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  controllerFetch,
+  requireControllerServerUrl,
+  requireOperatorApiToken,
+} from "../lib/env.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -118,7 +123,7 @@ async function fetchBeacon(
   beaconPrefix: string,
   token: string,
 ): Promise<ServerBeacon> {
-  const resp = await fetch(`${serverUrl}/api/beacons`, {
+  const resp = await controllerFetch(`${serverUrl}/api/beacons`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!resp.ok) {
@@ -145,7 +150,7 @@ async function postTask(
     ...(preferredChannel !== undefined && { preferredChannel }),
   };
 
-  const resp = await fetch(`${serverUrl}/api/beacon/${beaconId}/task`, {
+  const resp = await controllerFetch(`${serverUrl}/api/beacon/${beaconId}/task`, {
     method:  "POST",
     headers: {
       Authorization:  `Bearer ${token}`,
@@ -179,7 +184,7 @@ async function pollForResult(
   while (Date.now() < deadline) {
     await new Promise<void>(resolve => setTimeout(resolve, 3000));
 
-    const resp = await fetch(`${serverUrl}/api/beacon/${beaconId}/results`, {
+    const resp = await controllerFetch(`${serverUrl}/api/beacon/${beaconId}/results`, {
       headers: { Authorization: `Bearer ${token}` },
     });
 
@@ -208,15 +213,9 @@ const CYAN  = "\x1b[36m";
 // ── Main entrypoint ────────────────────────────────────────────────────────────
 
 export async function runBeaconShell(opts: BeaconShellOptions): Promise<void> {
-  const serverUrl = opts.serverUrl ?? process.env["OCTOC2_SERVER_URL"] ?? "";
-  if (!serverUrl) {
-    console.error(
-      "\n  Error: --server-url or OCTOC2_SERVER_URL env var is required for beacon shell.\n"
-    );
-    process.exit(1);
-  }
+  const serverUrl = requireControllerServerUrl(opts.serverUrl);
 
-  const token      = process.env["OCTOC2_DASHBOARD_TOKEN"] ?? "dev-token";
+  const token      = requireOperatorApiToken();
   const timeoutSec = opts.timeout ?? 300;
   const timeoutMs  = timeoutSec * 1000;
 

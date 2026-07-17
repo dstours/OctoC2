@@ -7,11 +7,15 @@
  */
 
 import { describe, it, expect } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   getEvasionState,
   hideProcess,
   antiDebug,
   jitteredSleep,
+  isStandaloneExecutableEntry,
   selfDelete,
   installPersistence,
   propagate,
@@ -52,19 +56,44 @@ describe("hideProcess", () => {
 });
 
 describe("selfDelete", () => {
-  it("returns a non-empty string without throwing (even if unlink fails)", async () => {
+  it("returns a structured outcome without throwing", async () => {
     const result = await selfDelete();
-    expect(typeof result).toBe("string");
-    expect(result.length).toBeGreaterThan(0);
+    expect(typeof result.success).toBe("boolean");
+    expect(result.detail.length).toBeGreaterThan(0);
   });
 
-  it("prefers argv[1] over execPath to avoid deleting the runtime interpreter", async () => {
+  it("never deletes argv[1] while running under an interpreter", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "octoc2-self-delete-"));
+    const sourcePath = join(dir, "beacon-source.ts");
+    await writeFile(sourcePath, "export {};\n");
     const origArgv1 = process.argv[1];
-    process.argv[1] = "/tmp/fake-beacon-script";
-    const result = await selfDelete();
-    // Should reference argv[1] in the result message
-    expect(result).toContain("fake-beacon-script");
-    process.argv[1] = origArgv1 as string;
+    try {
+      process.argv[1] = sourcePath;
+      const result = await selfDelete();
+      expect(result).toMatchObject({ success: false });
+      expect(result.detail).toContain("skipped");
+      expect(await Bun.file(sourcePath).exists()).toBe(true);
+    } finally {
+      process.argv[1] = origArgv1 as string;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses entry/executable identity rather than interpreter basenames", () => {
+    expect(
+      isStandaloneExecutableEntry(
+        "C:\\tools\\svc-host.exe",
+        "C:\\work\\entry.ts",
+        "win32",
+      ),
+    ).toBe(false);
+    expect(
+      isStandaloneExecutableEntry(
+        "C:\\tools\\bun.exe",
+        "c:\\TOOLS\\BUN.EXE",
+        "win32",
+      ),
+    ).toBe(true);
   });
 });
 

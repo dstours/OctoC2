@@ -2,7 +2,7 @@
  * Tests for `octoctl beacon shell` — pure helper functions
  */
 import { describe, it, expect } from "bun:test";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeFile, unlink } from "node:fs/promises";
 import {
@@ -212,6 +212,6 @@ describe("buildHistoryPath", () => {
 
   it("returns an absolute path under home directory", () => {
     const p = buildHistoryPath();
-    expect(p.startsWith("/")).toBe(true);
+    expect(isAbsolute(p)).toBe(true);
   });
 });

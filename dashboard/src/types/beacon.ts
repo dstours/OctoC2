@@ -1,5 +1,10 @@
 // dashboard/src/types/beacon.ts
 
+import {
+  CHANNEL_CATALOG,
+  type ChannelId,
+} from '@octoc2/shared/channels';
+
 /**
  * UI-computed liveness status for display in the dashboard.
  * Derived from `lastSeen` vs configurable TTL — NOT from the server's own state field.
@@ -21,23 +26,14 @@ export type OS = 'windows' | 'linux' | 'macos';
 
 export type Arch = 'x64' | 'arm64' | 'x86';
 
-/** One of the 12 OctoC2 tentacle channels. Numbers match the spec (1–12). */
-export type TentacleId = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
+/** A canonical OctoC2 channel ID, including the historical string ID `7b`. */
+export type TentacleId = ChannelId;
 
-export const TENTACLE_NAMES: Record<TentacleId, string> = {
-  1:  'Issues',
-  2:  'Branch',
-  3:  'Actions',
-  4:  'Codespaces',
-  5:  'Pages',
-  6:  'Gists',
-  7:  'OIDC',
-  8:  'PR+SSH',
-  9:  'Stego',
-  10: 'Proxy',
-  11: 'Notes',
-  12: 'Relay',
-};
+export const TENTACLE_NAMES = Object.freeze(
+  Object.fromEntries(
+    CHANNEL_CATALOG.map(channel => [String(channel.id), channel.name]),
+  ),
+) as Readonly<Record<TentacleId, string>>;
 
 export interface Beacon {
   /** Unique stable ID — derived from the GitHub Issue number or server-assigned. */

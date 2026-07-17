@@ -1,63 +1,59 @@
 # OctoC2 Operator Dashboard
 
-React + Vite operator UI for the OctoC2 framework.
+> [!IMPORTANT]
+> **Authorized use only.** Run this UI on trusted loopback or a reviewed private
+> network for systems and repositories you have explicit permission to test.
 
-> **OPSEC:** The dashboard is intentionally **never deployed to GitHub Pages or any public URL.**
-> It runs locally or inside a private GitHub Codespace only.
-
----
-
-## Quick Start
-
-### Local (recommended)
+## Local development
 
 ```bash
 cd dashboard
-bun install
 bun run dev
 ```
 
-Opens at **http://localhost:5173**
+Vite binds to `127.0.0.1:5173` and proxies `/api` to
+`https://127.0.0.1:8080`.
 
-Or from the repo root:
+The controller is TLS-only. Configure `OCTOC2_HTTP_SERVER_CERT` and
+`OCTOC2_HTTP_SERVER_KEY`, and trust the issuing local CA in the operating
+system or browser running the dashboard. The Vite proxy verifies the
+controller certificate and does not include a certificate-verification
+bypass.
+
+When setting `VITE_C2_SERVER_URL`, use a bare HTTPS origin such as
+`https://127.0.0.1:8080`. HTTP URLs and values containing userinfo, a path,
+query string, or fragment are rejected before the dashboard sends any request.
+
+The devcontainer does not auto-start the dashboard. Start it explicitly, and
+keep any Codespaces port forwarding private.
+
+## Credential roles
+
+The login page intentionally separates:
+
+- **Operator API Token** — sent only to controller REST/SSE routes in live mode.
+- **GitHub PAT** — sent only to GitHub in direct API fallback mode.
+- **Operator Private Key** — used locally for result decryption.
+
+Credentials remain in React memory. They are not persisted to browser storage,
+and logout clears all roles. A GitHub PAT is never substituted for the operator
+token.
+
+## Capability display
+
+The channel page is an activity view. “Recently observed” means a beacon
+reported recent use of a catalog entry; it does not prove transport readiness
+or live E2E coverage.
+
+Unsigned remote module execution is not part of the dashboard surface.
+`load-module` does not appear in task selectors or bulk controls.
+
+## Verification
 
 ```bash
-bun run dashboard:dev
+bun test --timeout 30000
+bun run lint
+bun run build
 ```
 
-### GitHub Codespace
-
-Open this repo in a private GitHub Codespace — the dashboard starts automatically on port 5173 and opens in your browser via port forwarding.
-
----
-
-## Connecting
-
-| Mode | What you need | What works |
-|------|--------------|------------|
-| **Live** | Operator server running + PAT | Full task queue, results, maintenance |
-| **API** | GitHub PAT only | Read beacons from GitHub Issues |
-| **Offline** | Nothing | Browse cached data only |
-
-Enter your **GitHub PAT** (`repo` scope) on the login page. Optionally enter your **operator private key** (base64url) to auto-decrypt beacon results.
-
-Credentials are held **in memory only** — never written to disk or localStorage.
-
----
-
-## Development
-
-```bash
-bun run test          # Run all 236 tests (watch mode)
-bun run test --run    # Run once (CI mode)
-bun run build         # Production build → dist/
-bun run lint          # ESLint
-```
-
-## Stack
-
-- React 18 + Vite 8
-- shadcn/ui + Tailwind CSS (dark cyberpunk theme)
-- TanStack Query v5
-- React Router v6
-- Vitest + @testing-library/react
+The build runs strict TypeScript checking before Vite produces `dist/`.

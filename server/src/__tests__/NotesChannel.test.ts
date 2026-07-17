@@ -1,184 +1,326 @@
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test";
+import { describe, expect, it } from "bun:test";
+import type { CheckinPayload, TaskResult } from "@octoc2/shared";
 import { NotesChannel } from "../channels/NotesChannel.ts";
-import { BeaconRegistry } from "../BeaconRegistry.ts";
-import { TaskQueue } from "../TaskQueue.ts";
-import { generateOperatorKeyPair, bytesToBase64, encryptForBeacon } from "../crypto/sodium.ts";
+import {
+  createSignedChannelFixture,
+  type SignedChannelFixture,
+} from "./helpers/SignedChannelFixture.ts";
 
-// ── Octokit mock factory ──────────────────────────────────────────────────────
+const BEACON_ID = "a07e5afe-1234-5678-90ab-cdef12345678";
+const POLL_SCOPE = "repo:owner/repo";
 
-function makeOctokit(overrides: Record<string, any> = {}) {
-  return {
+class FakeNotesRepository {
+  readonly ackPageRequests: number[] = [];
+  readonly resultPageRequests: number[] = [];
+  readonly createdBlobs: any[] = [];
+  readonly updatedRefs: any[] = [];
+  readonly createdRefs: any[] = [];
+  readonly deletedRefs: string[] = [];
+  private readonly blobs = new Map<string, string>();
+  private firstAckRef: any | null = null;
+  private laterAckRef: any | null = null;
+  private resultRef: any | null = null;
+
+  readonly octokit = {
     rest: {
       git: {
-        listMatchingRefs: mock(async () => ({ data: [] })),
-        getBlob:          mock(async () => ({ data: { content: "", encoding: "utf-8" } })),
-        createBlob:       mock(async () => ({ data: { sha: "blob-sha" } })),
-        createRef:        mock(async () => ({})),
-        updateRef:        mock(async () => ({})),
-        deleteRef:        mock(async () => ({})),
-        ...overrides.git,
+        listMatchingRefs: async ({ ref, page }: any) => {
+          if (String(ref).includes("svc-a-")) {
+            this.ackPageRequests.push(page);
+            if (page === 1 && this.firstAckRef) {
+              return {
+                data: Array.from(
+                  { length: 100 },
+                  () => this.firstAckRef,
+                ),
+              };
+            }
+            if (page === 2 && this.laterAckRef) {
+              return { data: [this.laterAckRef] };
+            }
+            return { data: [] };
+          }
+          this.resultPageRequests.push(page);
+          return {
+            data: page === 1 && this.resultRef ? [this.resultRef] : [],
+          };
+        },
+        getBlob: async ({ file_sha }: any) => {
+          const content = this.blobs.get(file_sha);
+          if (content === undefined) {
+            throw new Error(`unknown blob ${file_sha}`);
+          }
+          return { data: { content, encoding: "utf-8" } };
+        },
+        createBlob: async (input: any) => {
+          this.createdBlobs.push(input);
+          return { data: { sha: `task-blob-${this.createdBlobs.length}` } };
+        },
+        updateRef: async (input: any) => {
+          this.updatedRefs.push(input);
+          return {};
+        },
+        createRef: async (input: any) => {
+          this.createdRefs.push(input);
+          return {};
+        },
+        deleteRef: async ({ ref }: any) => {
+          this.deletedRefs.push(ref);
+          if (this.resultRef?.ref.replace("refs/", "") === ref) {
+            this.resultRef = null;
+          }
+          return {};
+        },
       },
     },
-    ...overrides,
   } as any;
+
+  putAcks(
+    fixture: SignedChannelFixture,
+    first: CheckinPayload,
+    later: CheckinPayload,
+  ): void {
+    const ref = `refs/notes/svc-a-${fixture.id8}`;
+    this.firstAckRef = { ref, object: { sha: "ack-sha-1" } };
+    this.laterAckRef = { ref, object: { sha: "ack-sha-2" } };
+    this.blobs.set("ack-sha-1", JSON.stringify(first));
+    this.blobs.set("ack-sha-2", JSON.stringify(later));
+  }
+
+  putAck(
+    fixture: SignedChannelFixture,
+    checkin: CheckinPayload,
+    sha: string,
+  ): void {
+    const ref = `refs/notes/svc-a-${fixture.id8}`;
+    this.firstAckRef = { ref, object: { sha } };
+    this.laterAckRef = null;
+    this.blobs.set(sha, JSON.stringify(checkin));
+  }
+
+  putMalformedAck(fixture: SignedChannelFixture): void {
+    const ref = `refs/notes/svc-a-${fixture.id8}`;
+    this.firstAckRef = { ref, object: { sha: "ack-poison-sha" } };
+    this.blobs.set("ack-poison-sha", "{");
+  }
+
+  putResult(
+    fixture: SignedChannelFixture,
+    result: TaskResult,
+    sealed: string,
+  ): void {
+    const ref = `refs/notes/svc-r-${fixture.id8}-${
+      result.taskId.slice(0, 8)
+    }`;
+    this.resultRef = { ref, object: { sha: "result-sha" } };
+    this.blobs.set("result-sha", sealed);
+  }
+
+  get result(): any {
+    return this.resultRef;
+  }
 }
 
-describe("NotesChannel", () => {
-  let registry: BeaconRegistry;
-  let queue: TaskQueue;
-  let operatorKp: { publicKey: Uint8Array; secretKey: Uint8Array };
+describe("NotesChannel signed durable integration", () => {
+  it("advances through a later-page signed ACK, updates a task ref, and consumes a signed result once", async () => {
+    const fixture = await createSignedChannelFixture("notes", BEACON_ID);
+    try {
+      const github = new FakeNotesRepository();
+      const firstCheckin = await fixture.createCheckin(1, {
+        hostname: "notes-page-one",
+      });
+      const laterCheckin = await fixture.createCheckin(2, {
+        hostname: "notes-page-two",
+      });
+      github.putAcks(fixture, firstCheckin, laterCheckin);
+      const channel = createChannel(fixture, github);
+      const task = fixture.queue.queueTask(
+        fixture.beaconId,
+        "shell",
+        { cmd: "hostname" },
+        "notes",
+      );
 
-  beforeEach(async () => {
-    registry = new BeaconRegistry("/tmp/notes-channel-test-registry");
-    queue    = new TaskQueue();
-    operatorKp = await generateOperatorKeyPair();
+      await (channel as any).poll();
+
+      expect(github.ackPageRequests).toContain(2);
+      expect(fixture.registry.get(fixture.beaconId)).toMatchObject({
+        hostname: "notes-page-two",
+        lastSeq: 2,
+        activeTentacle: 11,
+      });
+      expect(
+        fixture.store.getProcessedMessage(
+          "notes-ack-poll",
+          `ack:refs/notes/svc-a-${fixture.id8}:ack-sha-2`,
+        ),
+      ).toBeDefined();
+      expect(
+        fixture.store.getPollCursor("notes-ack-poll", POLL_SCOPE)?.cursor,
+      ).toBe("ack-sha-2");
+      expect(github.createdBlobs).toHaveLength(1);
+      expect(github.updatedRefs).toEqual([
+        {
+          owner: "owner",
+          repo: "repo",
+          ref: `notes/svc-t-${fixture.id8}`,
+          sha: "task-blob-1",
+          force: true,
+        },
+      ]);
+      expect(github.createdRefs).toHaveLength(0);
+      expect(await fixture.decryptTasks(github.createdBlobs[0].content))
+        .toEqual([
+          {
+            taskId: task.taskId,
+            kind: "shell",
+            args: { cmd: "hostname" },
+            ref: task.ref,
+          },
+        ]);
+      expect(fixture.queue.getTask(task.taskId)?.state).toBe("delivered");
+
+      const result = await fixture.createResult(task.taskId, 3, {
+        output: "notes-page-two",
+      });
+      github.putResult(
+        fixture,
+        result,
+        await fixture.sealResult(result),
+      );
+      const resultRef = github.result.ref;
+
+      await (channel as any).poll();
+
+      expect(fixture.queue.getTask(task.taskId)?.state).toBe("completed");
+      expect(fixture.store.getTaskResult(task.taskId)?.canonicalResult)
+        .toContain("notes-page-two");
+      expect(github.deletedRefs).toEqual([
+        resultRef.replace("refs/", ""),
+      ]);
+      expect(
+        fixture.store.getProcessedMessage(
+          "notes-result-poll",
+          `result:${resultRef}:result-sha`,
+        ),
+      ).toBeDefined();
+      expect(
+        fixture.store.getPollCursor("notes-result-poll", POLL_SCOPE)?.cursor,
+      ).toBe("result-sha");
+
+      await (createChannel(fixture, github) as any).poll();
+
+      expect(github.deletedRefs).toEqual([
+        resultRef.replace("refs/", ""),
+      ]);
+      expect(github.createdBlobs).toHaveLength(1);
+      expect(fixture.store.listDeliveryAttempts(task.taskId)).toHaveLength(1);
+      expect(fixture.registry.get(fixture.beaconId)?.lastSeq).toBe(3);
+    } finally {
+      fixture.close();
+    }
   });
 
-  it("start() and stop() do not throw", () => {
-    const ch = new NotesChannel(registry, queue, {
-      owner: "owner", repo: "repo", token: "tok",
-      operatorSecretKey: operatorKp.secretKey,
-      pollIntervalMs: 60_000,
-      octokit: makeOctokit(),
-    });
-    ch.start();
-    ch.stop();
+  it("durably rejects a malformed immutable ACK blob", async () => {
+    const fixture = await createSignedChannelFixture(
+      "notes-poison",
+      BEACON_ID,
+    );
+    try {
+      const github = new FakeNotesRepository();
+      github.putMalformedAck(fixture);
+      const channel = createChannel(fixture, github);
+      const messageId =
+        `ack:refs/notes/svc-a-${fixture.id8}:ack-poison-sha`;
+
+      await (channel as any).poll();
+      const rejected = fixture.store.getProcessedMessage(
+        "notes-ack-poll",
+        messageId,
+      );
+      expect(rejected).toMatchObject({ outcome: "rejected" });
+
+      await (channel as any).poll();
+      expect(fixture.store.getProcessedMessage(
+        "notes-ack-poll",
+        messageId,
+      )?.processedAt).toBe(rejected?.processedAt);
+    } finally {
+      fixture.close();
+    }
   });
 
-  it("poll processes ACK ref and registers beacon", async () => {
-    const beaconId = "ack-beacon-id-1234";
-    const beaconKp = await generateOperatorKeyPair();
-    const ackContent = JSON.stringify({
-      beaconId,
-      publicKey: await bytesToBase64(beaconKp.publicKey),
-      hostname: "host", username: "user", os: "linux", arch: "x64",
-      checkinAt: new Date().toISOString(),
-    });
+  it("requires a newly accepted or gap ACK before updating the task ref", async () => {
+    const fixture = await createSignedChannelFixture("notes-replay", BEACON_ID);
+    try {
+      const github = new FakeNotesRepository();
+      const checkin = await fixture.createCheckin(1);
+      github.putAck(fixture, checkin, "ack-replay-1");
+      let forcedStatus: "stale_duplicate" | null = null;
+      const services = {
+        ...fixture.services,
+        identities: {
+          verifyAndRegisterCheckin: async (...args: any[]) =>
+            forcedStatus ??
+            await (fixture.identities.verifyAndRegisterCheckin as any).call(
+              fixture.identities,
+              ...args,
+            ),
+        },
+      } as any;
 
-    const octokit = makeOctokit({
-      git: {
-        listMatchingRefs: mock(async (params: any) => {
-          if (params.ref?.includes("svc-a-")) {
-            return { data: [{ ref: `refs/notes/svc-a-${beaconId.slice(0, 8)}`, object: { sha: "ack-sha" } }] };
-          }
-          return { data: [] };
+      await (createChannel(fixture, github, services) as any).poll();
+      const task = fixture.queue.queueTask(
+        fixture.beaconId,
+        "ping",
+        {},
+        "notes",
+      );
+
+      const restarted = createChannel(fixture, github, services);
+      await (restarted as any).poll();
+      expect(github.createdBlobs).toHaveLength(0);
+      expect(fixture.queue.getTask(task.taskId)?.state).toBe("pending");
+
+      forcedStatus = "stale_duplicate";
+      github.putAck(fixture, checkin, "ack-replay-2");
+      await (restarted as any).poll();
+      expect(github.createdBlobs).toHaveLength(0);
+      expect(fixture.queue.getTask(task.taskId)?.state).toBe("pending");
+
+      forcedStatus = null;
+      github.putAck(
+        fixture,
+        await fixture.createCheckin(2, {
+          checkinAt: fixture.timestamp(3),
         }),
-        getBlob: mock(async () => ({
-          data: { content: ackContent, encoding: "utf-8" }
-        })),
-        createBlob: mock(async () => ({ data: { sha: "blob-sha" } })),
-        createRef:  mock(async () => ({})),
-        updateRef:  mock(async () => ({})),
-        deleteRef:  mock(async () => ({})),
-      },
-    });
-
-    const ch = new NotesChannel(registry, queue, {
-      owner: "owner", repo: "repo", token: "tok",
-      operatorSecretKey: operatorKp.secretKey,
-      pollIntervalMs: 60_000,
-      octokit,
-    });
-
-    await (ch as any).poll();
-
-    const beacon = registry.get(beaconId);
-    expect(beacon).not.toBeUndefined();
-    expect(beacon!.hostname).toBe("host");
-    expect(beacon!.publicKey).toBe(await bytesToBase64(beaconKp.publicKey));
-  });
-
-  it("poll delivers pending tasks to notes beacon via task ref", async () => {
-    const beaconId = "task-beacon-abcd1234";
-    const beaconKp = await generateOperatorKeyPair();
-    const pubB64   = await bytesToBase64(beaconKp.publicKey);
-
-    // Register the beacon
-    registry.register({
-      beaconId, issueNumber: 0, publicKey: pubB64,
-      hostname: "h", username: "u", os: "linux", arch: "x64", seq: 0,
-    });
-    // Queue a task
-    queue.queueTask(beaconId, "shell", { cmd: "whoami" });
-
-    const octokit = makeOctokit({
-      git: {
-        listMatchingRefs: mock(async () => ({ data: [] })),
-        getBlob:    mock(async () => ({ data: { content: "", encoding: "utf-8" } })),
-        createBlob: mock(async () => ({ data: { sha: "new-blob-sha" } })),
-        createRef:  mock(async () => ({})),
-        updateRef:  mock(async () => ({})),
-        deleteRef:  mock(async () => ({})),
-      },
-    });
-
-    const ch = new NotesChannel(registry, queue, {
-      owner: "owner", repo: "repo", token: "tok",
-      operatorSecretKey: operatorKp.secretKey,
-      pollIntervalMs: 60_000,
-      octokit,
-    });
-
-    // Prime the notes-beacon set so the channel knows this is a notes beacon
-    (ch as any).notesBeacons.add(beaconId);
-    await (ch as any).poll();
-
-    // A blob should have been created with encrypted tasks
-    expect(octokit.rest.git.createBlob).toHaveBeenCalled();
-    // A ref should have been created or updated
-    const refCalls =
-      (octokit.rest.git.createRef as any).mock.calls.length +
-      (octokit.rest.git.updateRef as any).mock.calls.length;
-    expect(refCalls).toBeGreaterThan(0);
-  });
-
-  it("poll processes result ref, marks task completed, and clears ref", async () => {
-    const beaconId = "result-beacon-abcdef12";
-    const beaconKp = await generateOperatorKeyPair();
-
-    // Register beacon and queue + deliver a task
-    registry.register({
-      beaconId, issueNumber: 0, publicKey: await bytesToBase64(beaconKp.publicKey),
-      hostname: "h", username: "u", os: "linux", arch: "x64", seq: 0,
-    });
-    const task = queue.queueTask(beaconId, "shell", { cmd: "id" });
-    queue.markDelivered(task.taskId);
-
-    // Import sealBox from server crypto
-    const { sealBox: serverSealBox } = await import("../crypto/sodium.ts");
-    const resultPayload = JSON.stringify({
-      taskId: task.taskId, beaconId,
-      success: true, output: "uid=0(root)", completedAt: new Date().toISOString(),
-    });
-    const sealed = await serverSealBox(resultPayload, operatorKp.publicKey);
-
-    const octokit = makeOctokit({
-      git: {
-        listMatchingRefs: mock(async (params: any) => {
-          if (params.ref?.includes("svc-r-")) {
-            return { data: [{ ref: `refs/notes/svc-r-${beaconId.slice(0, 8)}`, object: { sha: "res-sha" } }] };
-          }
-          return { data: [] };
-        }),
-        getBlob: mock(async () => ({ data: { content: sealed, encoding: "utf-8" } })),
-        createBlob: mock(async () => ({ data: { sha: "clr-sha" } })),
-        createRef:  mock(async () => ({})),
-        updateRef:  mock(async () => ({})),
-        deleteRef:  mock(async () => ({})),
-      },
-    });
-
-    const ch = new NotesChannel(registry, queue, {
-      owner: "owner", repo: "repo", token: "tok",
-      operatorSecretKey: operatorKp.secretKey,
-      pollIntervalMs: 60_000,
-      octokit,
-    });
-
-    await (ch as any).poll();
-
-    const completed = queue.getTask(task.taskId);
-    expect(completed?.state).toBe("completed");
-    expect(octokit.rest.git.deleteRef).toHaveBeenCalledTimes(1);
+        "ack-replay-3",
+      );
+      await (restarted as any).poll();
+      expect(github.createdBlobs).toHaveLength(1);
+      expect(fixture.queue.getTask(task.taskId)?.state).toBe("delivered");
+    } finally {
+      fixture.close();
+    }
   });
 });
+
+function createChannel(
+  fixture: SignedChannelFixture,
+  github: FakeNotesRepository,
+  services: any = fixture.services,
+): NotesChannel {
+  return new NotesChannel(
+    fixture.registry,
+    fixture.queue,
+    {
+      owner: "owner",
+      repo: "repo",
+      token: "local-test-token",
+      operatorSecretKey: fixture.operatorKeys.secretKey,
+      pollIntervalMs: 60_000,
+      octokit: github.octokit,
+    },
+    services,
+  );
+}

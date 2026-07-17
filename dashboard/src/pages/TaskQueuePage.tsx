@@ -30,11 +30,11 @@ const STATUS_COLOURS: Record<string, string> = {
 // ── Per-beacon task section ───────────────────────────────────────────────────
 
 function BeaconTasksSection({ beacon }: { beacon: Beacon }) {
-  const { pat, serverUrl } = useAuth();
+  const { operatorToken, serverUrl } = useAuth();
 
   const { data: tasks = [] } = useQuery({
-    queryKey:        ['tasks', beacon.id, serverUrl, pat],
-    queryFn:         () => new C2ServerClient(serverUrl, pat).getResults(beacon.id),
+    queryKey:        ['tasks', beacon.id, serverUrl, operatorToken],
+    queryFn:         () => new C2ServerClient(serverUrl, operatorToken).getResults(beacon.id),
     refetchInterval: 30_000,
     staleTime:       10_000,
   });
@@ -82,12 +82,12 @@ function BeaconTasksSection({ beacon }: { beacon: Beacon }) {
 // ── TaskQueuePage ─────────────────────────────────────────────────────────────
 
 export function TaskQueuePage() {
-  const { pat, mode, serverUrl } = useAuth();
+  const { operatorToken, mode, serverUrl } = useAuth();
 
   const { data: beacons = [], isLoading } = useQuery({
-    queryKey:        ['beacons-live', serverUrl, pat],
-    queryFn:         () => new C2ServerClient(serverUrl, pat).getBeacons(),
-    enabled:         mode === 'live' && pat.length > 0,
+    queryKey:        ['beacons-live', serverUrl, operatorToken],
+    queryFn:         () => new C2ServerClient(serverUrl, operatorToken).getBeacons(),
+    enabled:         mode === 'live' && operatorToken.length > 0,
     refetchInterval: 30_000,
     staleTime:       10_000,
   });

@@ -5,6 +5,7 @@ const mockGists = {
   list:   mock(async () => ({ data: [] as any[] })),
   get:    mock(async () => ({ data: { id: "gist123", files: {}, updated_at: "2024-01-01T00:00:00Z" } })),
   create: mock(async () => ({ data: { id: "new-gist-id" } })),
+  update: mock(async () => ({ data: { id: "new-gist-id" } })),
   delete: mock(async () => ({})),
 };
 const mockActions = {
@@ -20,11 +21,15 @@ mock.module("@octokit/rest", () => ({
 }));
 
 import { GistTentacle } from "../tentacles/GistTentacle.ts";
-import { generateKeyPair, bytesToBase64, encryptBox } from "../crypto/sodium.ts";
+import { generateKeyPair, encryptBox } from "../crypto/sodium.ts";
 import type { BeaconConfig } from "../types.ts";
+import { signedCheckin } from "./signedCheckinFixture.ts";
 
-async function makeConfig(): Promise<BeaconConfig> {
+async function makeConfig(
+  overrides: Partial<BeaconConfig> = {},
+): Promise<BeaconConfig> {
   const kp = await generateKeyPair();
+  const operatorKp = await generateKeyPair();
   return {
     id: "abcd1234-5678-90ab-cdef-1234567890ab",
     repo: { owner: "testowner", name: "testrepo" },
@@ -32,8 +37,9 @@ async function makeConfig(): Promise<BeaconConfig> {
     tentaclePriority: ["gist"],
     sleepSeconds: 60,
     jitter: 0.3,
-    operatorPublicKey: new Uint8Array(32),
+    operatorPublicKey: operatorKp.publicKey,
     beaconKeyPair: kp,
+    ...overrides,
   };
 }
 
@@ -49,6 +55,7 @@ describe("GistTentacle", () => {
     mockGists.list.mockClear();
     mockGists.get.mockClear();
     mockGists.create.mockClear();
+    mockGists.update.mockClear();
     mockGists.delete.mockClear();
     mockActions.getRepoVariable.mockClear();
     mockRepos.get.mockClear();
@@ -71,8 +78,9 @@ describe("GistTentacle", () => {
   it("checkin sends ACK gist on first call and returns [] when no task gist found", async () => {
     // list returns empty (no task gist)
     mockGists.list.mockResolvedValueOnce({ data: [] });
-    const t = new GistTentacle(await makeConfig());
-    const tasks = await t.checkin(PAYLOAD);
+    const cfg = await makeConfig();
+    const t = new GistTentacle(cfg);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
     // ACK gist should have been created
     expect(mockGists.create).toHaveBeenCalledTimes(1);
@@ -107,11 +115,11 @@ describe("GistTentacle", () => {
 
     const t = new GistTentacle(cfg);
     // First checkin sets lastTaskUpdatedAt (decrypt fails gracefully → [])
-    await t.checkin(PAYLOAD);
+    await t.checkin(await signedCheckin(cfg, PAYLOAD));
     mockGists.get.mockClear();
 
     // Second checkin — same updatedAt, should bail early
-    const tasks = await t.checkin({ ...PAYLOAD });
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
     // gists.get should NOT have been called (cached updatedAt short-circuits)
     expect(mockGists.get).not.toHaveBeenCalled();
@@ -119,9 +127,9 @@ describe("GistTentacle", () => {
 
   it("checkin decrypts tasks from task gist (full crypto round-trip)", async () => {
     const operatorKp = await generateKeyPair();
-    const cfg = await makeConfig();
-    const opPubB64 = await bytesToBase64(operatorKp.publicKey);
-    mockActions.getRepoVariable.mockResolvedValue({ data: { value: opPubB64 } });
+    const cfg = await makeConfig({
+      operatorPublicKey: operatorKp.publicKey,
+    });
 
     const id8 = cfg.id.slice(0, 8);
     const taskFilename = `svc-t-${id8}.json`;
@@ -152,7 +160,7 @@ describe("GistTentacle", () => {
     mockGists.delete.mockResolvedValueOnce({});
 
     const t = new GistTentacle(cfg);
-    const tasks = await t.checkin({ ...PAYLOAD, beaconId: cfg.id });
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toHaveLength(1);
     expect(tasks[0]!.taskId).toBe("t1");
     expect(mockGists.delete).toHaveBeenCalledTimes(1);  // task gist deleted after read
@@ -170,32 +178,71 @@ describe("GistTentacle", () => {
     expect(fileKeys[0]).toMatch(/^svc-r-/);
   });
 
-  it("teardown deletes the ACK gist when ackGistId is set", async () => {
+  it("teardown preserves the ACK gist after registration", async () => {
     mockGists.list.mockResolvedValueOnce({ data: [] });
-    const t = new GistTentacle(await makeConfig());
-    // First checkin to set ackGistId
-    await t.checkin(PAYLOAD);
+    const cfg = await makeConfig();
+    const t = new GistTentacle(cfg);
+    await t.checkin(await signedCheckin(cfg, PAYLOAD));
     mockGists.delete.mockClear();
 
     await t.teardown();
-    expect(mockGists.delete).toHaveBeenCalledTimes(1);
-    expect(((mockGists.delete.mock.calls[0] as any)[0] as any).gist_id).toBe("new-gist-id");
+    expect(mockGists.delete).not.toHaveBeenCalled();
   });
 
-  it("checkin does not create duplicate ACK gist on second call", async () => {
+  it("checkin refreshes one reusable ACK gist on the second call and still polls", async () => {
     // Both checkin calls get an empty gist list (no task gist)
     mockGists.list
       .mockResolvedValueOnce({ data: [] })
       .mockResolvedValueOnce({ data: [] });
 
-    const t = new GistTentacle(await makeConfig());
-    await t.checkin(PAYLOAD);
-    await t.checkin(PAYLOAD);
+    const cfg = await makeConfig();
+    const t = new GistTentacle(cfg);
+    const firstPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:00.000Z",
+    });
+    const secondPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:01.000Z",
+    });
+    await t.checkin(firstPayload);
+    await t.checkin(secondPayload);
 
-    // ACK gist created exactly once for the session
+    // The ACK gist is created once, then updated in place.
     expect(mockGists.create).toHaveBeenCalledTimes(1);
+    expect(mockGists.update).toHaveBeenCalledTimes(1);
+    const created = JSON.parse(
+      ((mockGists.create.mock.calls[0] as any)[0] as any)
+        .files[`svc-a-${cfg.id.slice(0, 8)}.json`].content,
+    );
+    const updated = JSON.parse(
+      ((mockGists.update.mock.calls[0] as any)[0] as any)
+        .files[`svc-a-${cfg.id.slice(0, 8)}.json`].content,
+    );
+    expect(updated.identity.sequence).toBe(secondPayload.identity!.sequence);
+    expect(updated.identity.signature).not.toBe(created.identity.signature);
     // list was called once per checkin
     expect(mockGists.list).toHaveBeenCalledTimes(2);
+  });
+
+  it("reuses a pre-existing ACK gist after process restart", async () => {
+    const cfg = await makeConfig();
+    const ackFilename = `svc-a-${cfg.id.slice(0, 8)}.json`;
+    mockGists.list.mockResolvedValueOnce({
+      data: [{
+        id: "existing-ack",
+        files: { [ackFilename]: { filename: ackFilename } },
+      }],
+    });
+
+    const t = new GistTentacle(cfg);
+    await t.checkin(await signedCheckin(cfg, PAYLOAD));
+
+    expect(mockGists.create).not.toHaveBeenCalled();
+    expect(mockGists.update).toHaveBeenCalledTimes(1);
+    expect(
+      ((mockGists.update.mock.calls[0] as any)[0] as any).gist_id,
+    ).toBe("existing-ack");
   });
 
   it("checkin returns [] and does not throw when gists.get throws", async () => {
@@ -214,12 +261,12 @@ describe("GistTentacle", () => {
     });
 
     const t = new GistTentacle(cfg);
-    const tasks = await t.checkin(PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
   });
 
-  it("checkin returns [] gracefully when MONITORING_PUBKEY variable returns empty value", async () => {
-    const cfg = await makeConfig();
+  it("checkin returns [] gracefully when the provisioned operator key is invalid", async () => {
+    const cfg = await makeConfig({ operatorPublicKey: new Uint8Array(0) });
     const id8 = cfg.id.slice(0, 8);
     const taskFilename = `svc-t-${id8}.json`;
     const taskGist = {
@@ -230,8 +277,6 @@ describe("GistTentacle", () => {
 
     // Return a task gist so checkin tries to fetch the key
     mockGists.list.mockResolvedValueOnce({ data: [taskGist] });
-    // Empty public key value
-    mockActions.getRepoVariable.mockResolvedValueOnce({ data: { value: "" } });
     mockGists.get.mockResolvedValueOnce({
       data: {
         id: "task-gist-empty-key",
@@ -241,11 +286,11 @@ describe("GistTentacle", () => {
     });
 
     const t = new GistTentacle(cfg);
-    const tasks = await t.checkin(PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
   });
 
-  it("teardown does nothing when ackGistId is null (no first checkin)", async () => {
+  it("teardown does nothing before the first checkin", async () => {
     const t = new GistTentacle(await makeConfig());
     // Never called checkin — ackGistId is null
     await expect(t.teardown()).resolves.toBeUndefined();

@@ -1,6 +1,6 @@
 // dashboard/src/pages/__tests__/BeaconListPage.test.tsx
 import { render, screen } from '@testing-library/react';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BeaconListPage } from '../BeaconListPage';
@@ -20,9 +20,9 @@ function makeWrapper() {
 }
 
 describe('BeaconListPage', () => {
-  it('renders the Active Beacons heading', () => {
+  it('renders the Observed Beacons heading', () => {
     render(<BeaconListPage />, { wrapper: makeWrapper() });
-    expect(screen.getByText(/active beacons/i)).toBeInTheDocument();
+    expect(screen.getByText(/observed beacons/i)).toBeInTheDocument();
   });
 
   it('renders the BeaconTable component', () => {

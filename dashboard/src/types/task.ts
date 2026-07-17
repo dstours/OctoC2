@@ -1,32 +1,16 @@
 // dashboard/src/types/task.ts
 
+import type {
+  TaskKind as ProtocolTaskKind,
+  TaskState as ProtocolTaskState,
+} from '@octoc2/shared';
 import type { TentacleId } from './beacon';
 
 /** The kind of task the operator is issuing to a beacon. */
-export type TaskKind =
-  // Server kinds — must match server's TaskKind spelling exactly
-  | 'shell'        // Run a shell command
-  | 'upload'       // Push a file to the target
-  | 'download'     // Pull a file from the target
-  | 'screenshot'   // Capture screen (if supported)
-  | 'keylog'       // Toggle keylogger (if supported)
-  | 'persist'      // Install persistence mechanism
-  | 'unpersist'    // Remove persistence mechanism
-  | 'sleep'        // Change beacon sleep interval
-  | 'die'          // Terminate the implant (NOTE: 'die' not 'exit')
-  | 'load-module'   // Load a module into the implant
-  | 'evasion'       // Evasion/persistence operation
-  | 'openhulud'     // OpenHulud evasion primitive
-  | 'stego'         // Steganography channel task
-  // Dashboard-only kinds — no server equivalent
-  | 'custom';      // Raw payload, interpreted by implant
+export type TaskKind = ProtocolTaskKind;
 
 export type TaskStatus =
-  // Server states — must match server's TaskState spelling exactly
-  | 'pending'    // Queued, not yet picked up by beacon
-  | 'delivered'  // Beacon acknowledged receipt
-  | 'completed'  // Beacon returned a result (NOTE: 'completed' not 'complete')
-  | 'failed'     // Beacon returned an error
+  | ProtocolTaskState
   // Dashboard-only states — computed/derived in the UI
   | 'running'    // Optimistic — beacon reported start but no result yet
   | 'timeout'    // TTL expired with no response (dashboard-computed)
@@ -41,11 +25,12 @@ export interface Task {
   kind: TaskKind;
   /**
    * Task arguments — shape depends on kind:
-   *   shell:    { cmd: string }
-   *   upload:   { remotePath: string; content: string }  (base64)
-   *   download: { remotePath: string }
-   *   sleep:    { intervalMs: number }
-   *   custom:   { payload: string }
+   *   shell:   { cmd: string, cwd?: string, timeout?: number }
+   *   exec:    { cmd: string, args?: string[], cwd?: string, timeout?: number }
+   *   ping:    {}
+   *   sleep:   { seconds: number, jitter?: number }
+   *   kill:    {}
+   *   evasion: { action: string, ...validated action fields }
    */
   args: Record<string, unknown>;
   /** Current lifecycle status. */

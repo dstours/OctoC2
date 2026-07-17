@@ -15,21 +15,22 @@ import { useConnectionMode } from '@/hooks/useConnectionMode';
 import { OctoLogo } from '@/assets/OctoLogo';
 
 export function LoginPage() {
-  const [patInput,     setPatInput]     = useState('');
-  const [privkeyInput, setPrivkeyInput] = useState('');
+  const [operatorTokenInput, setOperatorTokenInput] = useState('');
+  const [githubPatInput,     setGitHubPatInput]     = useState('');
+  const [privkeyInput,       setPrivkeyInput]       = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const { login }  = useAuth();
   const navigate   = useNavigate();
   const { mode, latencyMs, serverUrl, loading, error, refresh } =
-    useConnectionMode(patInput);
+    useConnectionMode(operatorTokenInput, githubPatInput);
 
   // ── Derived display ─────────────────────────────────────────────────────────
 
   const modeText = loading
     ? 'Detecting…'
     : mode === 'live'   ? `Live server (${latencyMs ?? '?'}ms)`
-    : mode === 'api'    ? 'API mode'
+    : mode === 'api'    ? 'Direct GitHub API mode'
     :                     'Offline mode';
 
   const modeColor = loading ? 'text-gray-500'
@@ -47,12 +48,26 @@ export function LoginPage() {
   async function handleConnect(e: React.FormEvent) {
     e.preventDefault();
     const { mode: detectedMode, latencyMs: detectedLatency } = await refresh();
-    login(patInput, detectedMode, serverUrl, detectedLatency, privkeyInput || null);
+    login({
+      operatorToken: operatorTokenInput,
+      githubPat: githubPatInput,
+      mode: detectedMode,
+      serverUrl,
+      latencyMs: detectedLatency,
+      privkey: privkeyInput || null,
+    });
     navigate('/');
   }
 
   function handleSkipOffline() {
-    login('', 'offline', serverUrl, null, null);
+    login({
+      operatorToken: '',
+      githubPat: '',
+      mode: 'offline',
+      serverUrl,
+      latencyMs: null,
+      privkey: null,
+    });
     navigate('/');
   }
 
@@ -71,14 +86,14 @@ export function LoginPage() {
         {/* ── Local-only safety banner ───────────────────────────────────────── */}
         <div
           className="border border-amber-800/50 bg-amber-950/30 rounded px-3 py-2 text-[10px] font-mono text-amber-400/80 space-y-0.5"
-          role="note"
-          aria-label="Security notice"
+          role="alert"
+          aria-label="Experimental warning"
         >
           <p className="font-semibold text-amber-400">
-            ⚠️ Local / private Codespace only
+            ⚠ EXPERIMENTAL / NON-PRODUCTION
           </p>
           <p className="text-amber-500/70">
-            Safe to enter PAT and private key here. Never run on an untrusted network.
+            Authorized local testing only. Connect only to a trusted loopback or private endpoint.
           </p>
         </div>
 
@@ -88,19 +103,52 @@ export function LoginPage() {
           className="card-neon bg-[#030310] rounded-lg p-6 space-y-5"
         >
 
-          {/* PAT field */}
+          {/* Operator API token */}
           <div className="space-y-1.5">
             <label
-              htmlFor="pat-input"
+              htmlFor="operator-token-input"
               className="text-[10px] text-gray-500 uppercase tracking-[0.2em] block"
             >
-              GitHub Personal Access Token
+              Operator API Token
             </label>
             <input
-              id="pat-input"
+              id="operator-token-input"
               type="password"
-              value={patInput}
-              onChange={e => setPatInput(e.target.value)}
+              value={operatorTokenInput}
+              onChange={e => setOperatorTokenInput(e.target.value)}
+              placeholder="OCTOC2_OPERATOR_API_TOKEN"
+              autoComplete="off"
+              spellCheck={false}
+              className="
+                w-full bg-octo-black border border-octo-border rounded px-3 py-2
+                text-sm text-gray-200 placeholder:text-gray-700 font-mono
+                outline-none
+                transition-all duration-150
+                focus:border-octo-blue/50 focus:ring-1 focus:ring-octo-blue/30
+                focus:shadow-[0_0_12px_rgba(0,240,255,0.12)]
+              "
+            />
+            <p className="text-[9px] text-gray-700">
+              Used only for operator REST and SSE routes.
+            </p>
+          </div>
+
+          {/* GitHub PAT */}
+          <div className="space-y-1.5">
+            <label
+              htmlFor="github-pat-input"
+              className="text-[10px] text-gray-500 uppercase tracking-[0.2em] block"
+            >
+              GitHub PAT
+              <span className="ml-2 text-gray-700 normal-case tracking-normal text-[10px]">
+                (direct API mode only)
+              </span>
+            </label>
+            <input
+              id="github-pat-input"
+              type="password"
+              value={githubPatInput}
+              onChange={e => setGitHubPatInput(e.target.value)}
               placeholder="ghp_..."
               autoComplete="off"
               spellCheck={false}
@@ -113,6 +161,9 @@ export function LoginPage() {
                 focus:shadow-[0_0_12px_rgba(0,240,255,0.12)]
               "
             />
+            <p className="text-[9px] text-gray-700">
+              Never sent to the controller API.
+            </p>
           </div>
 
           {/* Mode indicator */}

@@ -2,6 +2,11 @@
 
 import type { Beacon, OS, Arch, TentacleId, BeaconStatus } from '@/types';
 import type { GitHubIssue } from '@/types/github';
+import {
+  CHANNEL_BY_ID,
+  CHANNEL_BY_KIND,
+  isChannelKind,
+} from '@octoc2/shared/channels';
 
 const VALID_OS: ReadonlySet<string> = new Set<OS>(['windows', 'linux', 'macos']);
 const VALID_ARCH: ReadonlySet<string> = new Set<Arch>(['x64', 'arm64', 'x86']);
@@ -12,6 +17,14 @@ function toOS(raw: string | undefined): OS {
 
 function toArch(raw: string | undefined): Arch {
   return VALID_ARCH.has(raw ?? '') ? (raw as Arch) : 'x64';
+}
+
+function toTentacleId(raw: string | undefined): TentacleId {
+  if (raw === undefined) return 1;
+  const normalized = raw.trim().toLowerCase();
+  const byId = CHANNEL_BY_ID[normalized];
+  if (byId) return byId.id;
+  return isChannelKind(normalized) ? CHANNEL_BY_KIND[normalized].id : 1;
 }
 
 /**
@@ -57,10 +70,7 @@ export function parseBeacon(issue: GitHubIssue): Beacon {
   const os = toOS(fm.get('os'));
   const arch = toArch(fm.get('arch'));
 
-  const tentacleRaw = fm.get('tentacle');
-  const tentacleN = tentacleRaw !== undefined ? parseInt(tentacleRaw, 10) : 1;
-  const activeTentacle: TentacleId =
-    tentacleN >= 1 && tentacleN <= 10 ? (tentacleN as TentacleId) : 1;
+  const activeTentacle = toTentacleId(fm.get('tentacle'));
 
   const status = deriveStatus(issue.updated_at);
 

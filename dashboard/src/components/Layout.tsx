@@ -118,11 +118,11 @@ export function Layout() {
       <div
         className="fixed top-12 left-0 right-0 z-40 flex items-center justify-center
                    bg-amber-950/40 border-b border-amber-800/30 px-3 py-[3px]"
-        role="note"
-        aria-label="Security notice"
+        role="alert"
+        aria-label="Experimental warning"
       >
         <span className="text-[9px] font-mono text-amber-500/70 tracking-wide">
-          ⚠️ Local / private Codespace only — never expose to untrusted networks
+          EXPERIMENTAL / NON-PRODUCTION — use only on trusted loopback or private test networks
         </span>
       </div>
 

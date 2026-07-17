@@ -1,5 +1,5 @@
 // dashboard/src/lib/__tests__/parseBeacon.test.ts
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { parseBeacon } from '../parseBeacon';
 import type { GitHubIssue } from '@/types/github';
 
@@ -74,6 +74,26 @@ describe('parseBeacon', () => {
   it('parses tentacle number into activeTentacle', () => {
     const beacon = parseBeacon(makeIssue({ body: 'tentacle: 3\nhostname: host' }));
     expect(beacon.activeTentacle).toBe(3);
+  });
+
+  it('preserves the historical string tentacle ID 7b', () => {
+    const beacon = parseBeacon(makeIssue({ body: 'tentacle: 7b\nhostname: host' }));
+    expect(beacon.activeTentacle).toBe('7b');
+  });
+
+  it('parses the HTTP tentacle ID 13', () => {
+    const beacon = parseBeacon(makeIssue({ body: 'tentacle: 13\nhostname: host' }));
+    expect(beacon.activeTentacle).toBe(13);
+  });
+
+  it('accepts a canonical channel kind in frontmatter', () => {
+    const beacon = parseBeacon(makeIssue({ body: 'tentacle: http\nhostname: host' }));
+    expect(beacon.activeTentacle).toBe(13);
+  });
+
+  it('defaults unknown tentacle values to Issues', () => {
+    const beacon = parseBeacon(makeIssue({ body: 'tentacle: not-a-channel\nhostname: host' }));
+    expect(beacon.activeTentacle).toBe(1);
   });
 
   it('defaults activeTentacle to 1 when tentacle not in frontmatter', () => {

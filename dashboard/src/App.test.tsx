@@ -6,26 +6,53 @@
  * Pages are stubbed so tests are fast and focused on routing behaviour only.
  */
 import { render, screen } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { MemoryRouter } from 'react-router-dom';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
+import { MemoryRouter, Outlet } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ConnectionMode } from '@/types';
+import * as AuthContextModule from '@/context/AuthContext';
+import * as LoginPageModule from '@/pages/LoginPage';
+import * as BeaconListPageModule from '@/pages/BeaconListPage';
+import * as BeaconDetailPageModule from '@/pages/BeaconDetailPage';
+import * as TentacleMonitorPageModule from '@/pages/TentacleMonitorPage';
+import * as TaskQueuePageModule from '@/pages/TaskQueuePage';
+import * as SettingsPageModule from '@/pages/SettingsPage';
+import * as LayoutModule from '@/components/Layout';
+import { restoreModuleMocks } from '@/test/moduleMocks';
 import { AppRoutes } from './App';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
-let mockAuthPat  = '';
+let mockGitHubPat = '';
+let mockOperatorToken = '';
 let mockAuthMode: ConnectionMode = 'offline';
+
+restoreModuleMocks([
+  ['@/context/AuthContext', { ...AuthContextModule }],
+  ['@/pages/LoginPage', { ...LoginPageModule }],
+  ['@/pages/BeaconListPage', { ...BeaconListPageModule }],
+  ['@/pages/BeaconDetailPage', { ...BeaconDetailPageModule }],
+  ['@/pages/TentacleMonitorPage', { ...TentacleMonitorPageModule }],
+  ['@/pages/TaskQueuePage', { ...TaskQueuePageModule }],
+  ['@/pages/SettingsPage', { ...SettingsPageModule }],
+  ['@/components/Layout', { ...LayoutModule }],
+]);
 
 vi.mock('@/context/AuthContext', () => ({
   AuthProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   useAuth: () => ({
-    pat:             mockAuthPat,
+    githubPat:       mockGitHubPat,
+    operatorToken:   mockOperatorToken,
     mode:            mockAuthMode,
-    serverUrl:       'http://localhost:8080',
+    serverUrl:       'https://localhost:8080',
     latencyMs:       null,
     privkey:         null,
-    isAuthenticated: mockAuthPat.length > 0,
+    isAuthenticated:
+      mockAuthMode === 'live'
+        ? mockOperatorToken.length > 0
+        : mockAuthMode === 'api'
+          ? mockGitHubPat.length > 0
+          : false,
     login:           vi.fn(),
     setPrivkey:      vi.fn(),
     logout:          vi.fn(),
@@ -53,16 +80,13 @@ vi.mock('@/pages/SettingsPage', () => ({
 }));
 
 // Layout must render Outlet so child routes are visible
-vi.mock('@/components/Layout', async () => {
-  const { Outlet } = await import('react-router-dom');
-  return {
-    Layout: () => (
-      <div data-testid="layout">
-        <Outlet />
-      </div>
-    ),
-  };
-});
+vi.mock('@/components/Layout', () => ({
+  Layout: () => (
+    <div data-testid="layout">
+      <Outlet />
+    </div>
+  ),
+}));
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -78,7 +102,8 @@ function renderApp(initialPath = '/') {
 }
 
 beforeEach(() => {
-  mockAuthPat  = '';
+  mockGitHubPat = '';
+  mockOperatorToken = '';
   mockAuthMode = 'offline';
 });
 
@@ -94,28 +119,28 @@ describe('App routing', () => {
 
   describe('protected routes', () => {
     it('redirects to /login when unauthenticated and mode is not offline', () => {
-      mockAuthPat  = '';
+      mockGitHubPat = '';
       mockAuthMode = 'api'; // api mode + no PAT → force login
       renderApp('/');
       expect(screen.getByTestId('login-page')).toBeInTheDocument();
     });
 
     it('allows access in offline mode even without a PAT', () => {
-      mockAuthPat  = '';
+      mockGitHubPat = '';
       mockAuthMode = 'offline';
       renderApp('/');
       expect(screen.getByTestId('beacon-list-page')).toBeInTheDocument();
     });
 
     it('allows access with a valid PAT in api mode', () => {
-      mockAuthPat  = 'ghp_testtoken';
+      mockGitHubPat = 'ghp_testtoken';
       mockAuthMode = 'api';
       renderApp('/');
       expect(screen.getByTestId('beacon-list-page')).toBeInTheDocument();
     });
 
     it('wraps protected routes in the Layout shell', () => {
-      mockAuthPat  = 'ghp_testtoken';
+      mockGitHubPat = 'ghp_testtoken';
       mockAuthMode = 'api';
       renderApp('/');
       expect(screen.getByTestId('layout')).toBeInTheDocument();
@@ -124,7 +149,7 @@ describe('App routing', () => {
 
   describe('unknown routes', () => {
     it('redirects unknown path to /login', () => {
-      mockAuthPat  = '';
+      mockGitHubPat = '';
       mockAuthMode = 'api';
       renderApp('/some/unknown/path');
       expect(screen.getByTestId('login-page')).toBeInTheDocument();
@@ -133,28 +158,28 @@ describe('App routing', () => {
 
   describe('page routes', () => {
     it('renders BeaconDetailPage at /beacon/:id', () => {
-      mockAuthPat  = 'ghp_testtoken';
+      mockGitHubPat = 'ghp_testtoken';
       mockAuthMode = 'api';
       renderApp('/beacon/beacon-42');
       expect(screen.getByTestId('beacon-detail-page')).toBeInTheDocument();
     });
 
     it('renders TentacleMonitorPage at /tentacles', () => {
-      mockAuthPat  = 'ghp_testtoken';
+      mockGitHubPat = 'ghp_testtoken';
       mockAuthMode = 'api';
       renderApp('/tentacles');
       expect(screen.getByTestId('tentacle-monitor-page')).toBeInTheDocument();
     });
 
     it('renders TaskQueuePage at /tasks', () => {
-      mockAuthPat  = 'ghp_testtoken';
+      mockGitHubPat = 'ghp_testtoken';
       mockAuthMode = 'api';
       renderApp('/tasks');
       expect(screen.getByTestId('task-queue-page')).toBeInTheDocument();
     });
 
     it('renders SettingsPage at /settings', () => {
-      mockAuthPat  = 'ghp_testtoken';
+      mockGitHubPat = 'ghp_testtoken';
       mockAuthMode = 'api';
       renderApp('/settings');
       expect(screen.getByTestId('settings-page')).toBeInTheDocument();

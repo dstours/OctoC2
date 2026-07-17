@@ -47,13 +47,13 @@ export async function runKeygen(opts: KeygenOptions): Promise<void> {
   if (!opts.setVariable) return;
 
   // Push public key to GitHub Variable
-  const token = process.env["OCTOC2_GITHUB_TOKEN"]?.trim();
+  const token = process.env["OCTOC2_OPERATOR_GITHUB_TOKEN"]?.trim();
   const owner = process.env["OCTOC2_REPO_OWNER"]?.trim();
   const repo  = process.env["OCTOC2_REPO_NAME"]?.trim();
 
   if (!token || !owner || !repo) {
     console.error(
-      "  Cannot set GitHub Variable: OCTOC2_GITHUB_TOKEN, OCTOC2_REPO_OWNER, " +
+      "  Cannot set GitHub Variable: OCTOC2_OPERATOR_GITHUB_TOKEN, OCTOC2_REPO_OWNER, " +
       "and OCTOC2_REPO_NAME must be set."
     );
     process.exit(1);

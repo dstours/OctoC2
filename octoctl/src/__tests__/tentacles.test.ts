@@ -2,33 +2,48 @@
  * Tests for `octoctl tentacles list`
  */
 
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test";
-
-// ── Stub loadRegistry ─────────────────────────────────────────────────────────
-
-const mockBeacons: Record<string, unknown>[] = [];
-
-mock.module("../lib/registry.ts", () => ({
-  loadRegistry: async () => mockBeacons,
-  registryPath: () => "/fake/data/registry.json",
-  getBeacon: async (id: string) =>
-    mockBeacons.find(
-      (b: Record<string, unknown>) =>
-        b["beaconId"] === id ||
-        (typeof b["beaconId"] === "string" && (b["beaconId"] as string).startsWith(id)),
-    ),
-}));
-
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   runTentaclesList,
-  runTentaclesHealth,
   buildChannels,
   computeChannelStats,
+  normalizeActiveChannel,
   printErrorDetails,
   statusDisplay,
   type TentaclesListResult,
   type TentacleChannel,
 } from "../commands/tentacles.ts";
+
+// ── Isolated registry fixture ─────────────────────────────────────────────────
+
+const mockBeacons: Record<string, unknown>[] = [];
+let testDataDir: string | undefined;
+
+async function runOffline(
+  opts: Parameters<typeof runTentaclesList>[0],
+): Promise<void> {
+  testDataDir ??= await mkdtemp(join(tmpdir(), "octoctl-tentacles-"));
+  await writeFile(
+    join(testDataDir, "registry.json"),
+    JSON.stringify({
+      version: 1,
+      savedAt: new Date().toISOString(),
+      beacons: mockBeacons,
+    }),
+  );
+  await runTentaclesList({ ...opts, dataDir: testDataDir });
+}
+
+afterEach(async () => {
+  if (testDataDir) {
+    await rm(testDataDir, { recursive: true, force: true });
+    testDataDir = undefined;
+  }
+  mockBeacons.length = 0;
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -77,12 +92,23 @@ async function captureJsonOutput(opts: Parameters<typeof runTentaclesList>[0]): 
   const orig = console.log;
   console.log = (s: unknown) => { parts.push(String(s)); };
   try {
-    await runTentaclesList(opts);
+    await runOffline(opts);
   } finally {
     console.log = orig;
   }
   return JSON.parse(parts[parts.length - 1]!) as TentaclesListResult;
 }
+
+describe("active channel normalization", () => {
+  it("maps canonical numeric and historical string IDs to channel kinds", () => {
+    expect(normalizeActiveChannel(13)).toBe("http");
+    expect(normalizeActiveChannel("13")).toBe("http");
+    expect(normalizeActiveChannel("7b")).toBe("secrets");
+    expect(normalizeActiveChannel("notes")).toBe("notes");
+    expect(normalizeActiveChannel(8)).toBeNull();
+    expect(normalizeActiveChannel("unknown")).toBeNull();
+  });
+});
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -91,7 +117,7 @@ describe("runTentaclesList — offline mode", () => {
     mockBeacons.length = 0;
   });
 
-  it("returns all 12 channel kinds in JSON output", async () => {
+  it("returns all selectable channel kinds in JSON output", async () => {
     mockBeacons.push(makeBeacon({ activeTentacle: "issues" }));
 
     const result = await captureJsonOutput({
@@ -168,7 +194,7 @@ describe("runTentaclesList — offline mode", () => {
   it("throws an error when beacon is not found", async () => {
     // registry is empty
     await expect(
-      runTentaclesList({ beacon: "notexist", json: true }),
+      runOffline({ beacon: "notexist", json: true }),
     ).rejects.toThrow(/not found/);
   });
 
@@ -176,7 +202,7 @@ describe("runTentaclesList — offline mode", () => {
     mockBeacons.push(makeBeacon({ activeTentacle: "issues" }));
 
     const lines = await captureLog(() =>
-      runTentaclesList({ beacon: "abc12345" }),
+      runOffline({ beacon: "abc12345" }),
     );
     const joined = lines.join("\n");
 
@@ -189,7 +215,7 @@ describe("runTentaclesList — offline mode", () => {
     mockBeacons.push(makeBeacon({ activeTentacle: "gist" }));
 
     const lines = await captureLog(() =>
-      runTentaclesList({ beacon: "abc12345" }),
+      runOffline({ beacon: "abc12345" }),
     );
     const joined = lines.join("\n");
 
@@ -211,7 +237,7 @@ describe("runTentaclesList — offline mode", () => {
     expect(Array.isArray(result.channels)).toBe(true);
   });
 
-  it("returns exactly 12 channels regardless of activeTentacle value", async () => {
+  it("returns the selectable catalog regardless of activeTentacle value", async () => {
     for (const kind of ALL_KINDS) {
       mockBeacons.length = 0;
       mockBeacons.push(makeBeacon({ activeTentacle: kind }));
@@ -444,7 +470,7 @@ describe("runTentaclesList — human-readable output includes health columns", (
     mockBeacons.push(makeBeacon({ activeTentacle: "issues" }));
 
     const lines = await captureLog(() =>
-      runTentaclesList({ beacon: "abc12345" }),
+      runOffline({ beacon: "abc12345" }),
     );
     const header = lines.find(l => l.includes("Success"));
     expect(header).toBeDefined();
@@ -459,7 +485,7 @@ describe("runTentaclesHealth — alias for runTentaclesList", () => {
     mockBeacons.length = 0;
   });
 
-  it("returns all 12 channels in JSON output (including pages and stego)", async () => {
+  it("returns all selectable channels in JSON output (including pages and stego)", async () => {
     mockBeacons.push(makeBeacon({ activeTentacle: "stego" }));
 
     // runTentaclesHealth === runTentaclesList; captureJsonOutput is equivalent
@@ -576,7 +602,7 @@ describe("statusDisplay — ANSI color codes", () => {
     mockBeacons.push(makeBeacon({ activeTentacle: "issues" }));
 
     const lines = await captureLog(() =>
-      runTentaclesList({ beacon: "abc12345" }),
+      runOffline({ beacon: "abc12345" }),
     );
     const joined = lines.join("\n");
     expect(joined).toContain(GREEN);
@@ -590,7 +616,7 @@ describe("statusDisplay — ANSI color codes", () => {
     }));
 
     const lines = await captureLog(() =>
-      runTentaclesList({ beacon: "abc12345" }),
+      runOffline({ beacon: "abc12345" }),
     );
     const joined = lines.join("\n");
     expect(joined).toContain(RED);

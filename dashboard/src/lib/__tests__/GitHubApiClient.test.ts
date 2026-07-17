@@ -1,5 +1,5 @@
 // dashboard/src/lib/__tests__/GitHubApiClient.test.ts
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { GitHubApiClient } from '../GitHubApiClient';
 import type { GitHubIssue, GitHubComment } from '@/types/github';
 
@@ -8,13 +8,19 @@ import type { GitHubIssue, GitHubComment } from '@/types/github';
 const PAT = 'ghp_testtoken';
 const OWNER = 'example-owner';
 const REPO = 'OctoC2';
+const nativeFetch = globalThis.fetch;
+type FetchCall = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+let fetchMock = vi.fn<FetchCall>();
 
 function makeClient() {
   return new GitHubApiClient(PAT, OWNER, REPO);
 }
 
 function mockFetchJson(data: unknown, status = 200) {
-  vi.mocked(fetch).mockResolvedValueOnce({
+  fetchMock.mockResolvedValueOnce({
     ok: status >= 200 && status < 300,
     status,
     json: () => Promise.resolve(data),
@@ -22,7 +28,7 @@ function mockFetchJson(data: unknown, status = 200) {
 }
 
 function mockFetchError(status: number) {
-  vi.mocked(fetch).mockResolvedValueOnce({
+  fetchMock.mockResolvedValueOnce({
     ok: false,
     status,
     json: () => Promise.resolve({ message: 'Unauthorized' }),
@@ -33,11 +39,12 @@ function mockFetchError(status: number) {
 
 describe('GitHubApiClient', () => {
   beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn());
+    fetchMock = vi.fn<FetchCall>();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
   });
 
   afterEach(() => {
-    vi.unstubAllGlobals();
+    globalThis.fetch = nativeFetch;
     vi.restoreAllMocks();
   });
 

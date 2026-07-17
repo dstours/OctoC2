@@ -24,6 +24,7 @@ mock.module("@octokit/rest", () => ({
 import { NotesTentacle } from "../tentacles/NotesTentacle.ts";
 import { generateKeyPair, bytesToBase64, encryptBox } from "../crypto/sodium.ts";
 import type { BeaconConfig } from "../types.ts";
+import { signedCheckin } from "./signedCheckinFixture.ts";
 
 async function makeConfig(): Promise<BeaconConfig> {
   const kp = await generateKeyPair();
@@ -74,26 +75,43 @@ describe("NotesTentacle", () => {
     mockGit.getRef.mockImplementationOnce(async () => {
       throw Object.assign(new Error("Not Found"), { status: 404 });
     });
-    const t = new NotesTentacle(await makeConfig());
-    const tasks = await t.checkin(PAYLOAD);
+    const cfg = await makeConfig();
+    const t = new NotesTentacle(cfg);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
     expect(mockGit.createBlob).toHaveBeenCalledTimes(1);   // ACK blob only
     expect(mockGit.deleteRef).not.toHaveBeenCalled();
   });
 
-  it("checkin returns [] when task SHA is unchanged since last poll", async () => {
+  it("checkin refreshes the ACK blob on every call before polling the task ref", async () => {
     const cfg = await makeConfig();
     const t = new NotesTentacle(cfg);
-    // First checkin — sends ACK, reads SHA "sha1"
+    const firstPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:00.000Z",
+    });
+    const secondPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:01.000Z",
+    });
+    // First checkin refreshes ACK, then reads SHA "sha1".
     mockGit.getRef.mockResolvedValueOnce({ data: { object: { sha: "sha1" } } });
     mockGit.getBlob.mockResolvedValueOnce({ data: { content: "bad", encoding: "utf-8" } });
-    await t.checkin(PAYLOAD);
+    await t.checkin(firstPayload);
     mockGit.createBlob.mockClear();
     mockGit.getBlob.mockClear();
-    // Second checkin — same SHA
+    // Second checkin publishes a new envelope and still polls the same task SHA.
     mockGit.getRef.mockResolvedValueOnce({ data: { object: { sha: "sha1" } } });
-    const tasks = await t.checkin(PAYLOAD);
+    const tasks = await t.checkin(secondPayload);
     expect(tasks).toEqual([]);
+    expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
+    const written = JSON.parse(
+      ((mockGit.createBlob.mock.calls[0] as any)[0] as any).content,
+    );
+    expect(written.identity.sequence).toBe(secondPayload.identity!.sequence);
+    expect(written.identity.signature).not.toBe(
+      firstPayload.identity!.signature,
+    );
     expect(mockGit.getBlob).not.toHaveBeenCalled();
   });
 
@@ -117,7 +135,7 @@ describe("NotesTentacle", () => {
     mockGit.deleteRef.mockResolvedValueOnce({});
 
     const t = new NotesTentacle(cfg);
-    const tasks = await t.checkin({ ...PAYLOAD, beaconId: cfg.id });
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toHaveLength(1);
     expect(tasks[0]!.taskId).toBe("t1");
     expect(mockGit.deleteRef).toHaveBeenCalledTimes(1);

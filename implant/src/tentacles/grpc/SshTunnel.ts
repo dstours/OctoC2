@@ -1,135 +1,230 @@
 /**
- * OctoC2 — SshTunnel
- *
- * Wraps an ssh2 Client and a local net.Server that port-forwards traffic
- * through the SSH channel. Knows nothing about gRPC.
- *
- * Usage:
- *   const t = new SshTunnel();
- *   await t.connect(host, 22, username, token);   // token = GitHub PAT (password auth)
- *   await t.forward(50051, 50051);                 // local 50051 → remote 50051
- *   // ... use localhost:50051 as gRPC target ...
- *   await t.close();
+ * GitHub Codespaces tunnel backed by the supported GitHub CLI connection
+ * service. Codespaces are not ordinary SSH hosts: a PAT is used by `gh` for
+ * the Codespaces control plane and is never treated as an SSH password.
  */
 
-import { Client as SshClient } from "ssh2";
-import { createServer }        from "node:net";
-import type { Server as NetServer, Socket } from "node:net";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createConnection } from "node:net";
+
+const MAX_OUTPUT_BYTES = 64 * 1024;
+const FORWARD_START_TIMEOUT_MS = 330_000;
+const CODESPACE_NAME = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
+
+export function assertCodespaceName(name: string): void {
+  if (!CODESPACE_NAME.test(name)) {
+    throw new Error("Codespace name contains unsupported characters");
+  }
+}
+
+export function codespaceForwardArgs(
+  name: string,
+  localPort: number,
+  remotePort: number,
+): string[] {
+  assertCodespaceName(name);
+  assertPort(localPort, "localPort");
+  assertPort(remotePort, "remotePort");
+  return [
+    "codespace",
+    "ports",
+    "forward",
+    `${remotePort}:${localPort}`,
+    "--codespace",
+    name,
+  ];
+}
+
+function assertPort(port: number, label: string): void {
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`${label} must be an integer from 1 through 65535`);
+  }
+}
 
 export class SshTunnel {
-  private client: SshClient | null = null;
-  private server: NetServer | null = null;
-  private alive  = false;
+  private codespaceName: string | null = null;
+  private token: string | null = null;
+  private forwarder: ChildProcessWithoutNullStreams | null = null;
+  private alive = false;
 
-  // ── connect ──────────────────────────────────────────────────────────────────
+  constructor(
+    private readonly ghExecutable =
+      process.env["SVC_GITHUB_CLI"]?.trim() || "gh",
+  ) {}
 
-  /**
-   * Open an SSH connection.
-   * `token` is used as the SSH password — GitHub Codespace SSH gateway accepts
-   * a GitHub PAT as the password for `<codespace-name>.github.dev`.
-   */
-  connect(host: string, port: number, username: string, token: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const client = new SshClient();
-      this.client = client;
-
-      client.on("ready", () => {
-        this.alive = true;
-        resolve();
-      });
-
-      client.on("error", (err) => {
-        this.alive = false;
-        reject(err);
-      });
-
-      client.on("close", () => {
-        this.alive = false;
-      });
-
-      client.connect({ host, port, username, password: token });
-    });
+  async connect(codespaceName: string, token: string): Promise<void> {
+    assertCodespaceName(codespaceName);
+    if (!token.trim()) {
+      throw new Error("A dedicated Codespaces GitHub token is required");
+    }
+    if (token.trim().startsWith("github_pat_")) {
+      throw new Error(
+        "GitHub CLI Codespaces tunnels require a classic PAT with the codespace scope",
+      );
+    }
+    this.codespaceName = codespaceName;
+    this.token = token.trim();
+    const state = (await this.runGh([
+      "codespace",
+      "view",
+      "--codespace",
+      codespaceName,
+      "--json",
+      "state",
+      "--jq",
+      ".state",
+    ])).trim();
+    if (state !== "Available") {
+      throw new Error(`Codespace is not available (state: ${state || "unknown"})`);
+    }
+    this.alive = true;
   }
 
-  // ── forward ──────────────────────────────────────────────────────────────────
+  async forward(localPort: number, remotePort: number): Promise<void> {
+    const name = this.requireConnected();
+    if (this.forwarder) {
+      throw new Error("Codespaces port forwarding is already active");
+    }
+    const child = spawn(
+      this.ghExecutable,
+      codespaceForwardArgs(name, localPort, remotePort),
+      {
+        env: this.ghEnvironment(),
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    child.stdin.end();
+    this.forwarder = child;
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk.toString();
+    });
+    child.once("exit", () => {
+      this.alive = false;
+    });
+    child.once("error", () => {
+      this.alive = false;
+    });
 
-  /**
-   * Start a local TCP server on 127.0.0.1:localPort.
-   * Each incoming connection is tunnelled to 127.0.0.1:remotePort on the SSH host.
-   */
-  forward(localPort: number, remotePort: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const server = createServer((socket: Socket) => {
-        this.client!.forwardOut(
-          "127.0.0.1", localPort,
-          "127.0.0.1", remotePort,
-          (err, stream) => {
-            if (err) {
-              socket.destroy(err);
-              return;
-            }
-            socket.pipe(stream);
-            stream.pipe(socket);
-            socket.on("close", () => { try { stream.destroy(); } catch {} });
-            stream.on("close", () => { try { socket.destroy(); } catch {} });
-            socket.on("error", () => { try { stream.destroy(); } catch {} });
-            stream.on("error", () => { try { socket.destroy(); } catch {} });
-          }
+    const deadline = Date.now() + FORWARD_START_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null) {
+        this.forwarder = null;
+        throw new Error(
+          `GitHub Codespaces port forwarding exited early: ${stderr.trim() || `exit ${child.exitCode}`}`,
         );
-      });
-
-      this.server = server;
-      server.listen(localPort, "127.0.0.1", () => resolve());
-      server.on("error", reject);
-    });
+      }
+      if (await canConnect(localPort)) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    await this.stopForwarder();
+    throw new Error(
+      `Timed out waiting for the local Codespaces port forward${
+        stderr.trim() ? `: ${stderr.trim()}` : ""
+      }`,
+    );
   }
-
-  // ── exec ─────────────────────────────────────────────────────────────────────
-
-  /**
-   * Execute a command on the remote SSH host and return stdout as a string.
-   * Fire-and-forget commands (e.g. `nohup ... &`) return quickly because the
-   * shell exits after spawning the background process.
-   */
-  exec(command: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      this.client!.exec(command, (err, stream) => {
-        if (err) { reject(err); return; }
-        let out = "";
-        stream.on("data", (d: Buffer) => { out += d.toString(); });
-        stream.stderr?.on("data", () => {});  // swallow stderr
-        stream.on("close", () => resolve(out));
-        stream.on("error", (e: Error) => reject(e));
-      });
-    });
-  }
-
-  // ── isAlive ───────────────────────────────────────────────────────────────────
 
   isAlive(): boolean {
-    return this.alive;
+    return this.alive && this.forwarder?.exitCode === null;
   }
 
-  // ── close ─────────────────────────────────────────────────────────────────────
-
-  close(): Promise<void> {
+  async close(): Promise<void> {
     this.alive = false;
-    return new Promise<void>((resolve) => {
-      const doClose = () => {
-        if (this.client) {
-          try { this.client.end(); }    catch {}
-          try { this.client.destroy(); } catch {}
-          this.client = null;
-        }
-        resolve();
-      };
-
-      if (this.server) {
-        this.server.close(() => doClose());
-        this.server = null;
-      } else {
-        doClose();
-      }
-    });
+    await this.stopForwarder();
+    this.codespaceName = null;
+    this.token = null;
   }
+
+  private requireConnected(): string {
+    if (!this.codespaceName || !this.token || !this.alive) {
+      throw new Error("Codespaces tunnel is not connected");
+    }
+    return this.codespaceName;
+  }
+
+  private ghEnvironment(): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      GH_TOKEN: this.token!,
+      GH_PROMPT_DISABLED: "1",
+    };
+  }
+
+  private runGh(args: string[]): Promise<string> {
+    return runProcess(this.ghExecutable, args, this.ghEnvironment());
+  }
+
+  private async stopForwarder(): Promise<void> {
+    const child = this.forwarder;
+    this.forwarder = null;
+    if (!child || child.exitCode !== null) return;
+    child.kill("SIGTERM");
+    await Promise.race([
+      new Promise<void>((resolve) => child.once("exit", () => resolve())),
+      new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+    ]);
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }
+}
+
+async function canConnect(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "localhost", port });
+    const done = (connected: boolean) => {
+      socket.destroy();
+      resolve(connected);
+    };
+    socket.setTimeout(500, () => done(false));
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
+}
+
+function runProcess(
+  executable: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs = 60_000,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, {
+      env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const append = (current: string, chunk: Buffer) =>
+      current.length >= MAX_OUTPUT_BYTES
+        ? current
+        : (current + chunk.toString()).slice(0, MAX_OUTPUT_BYTES);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = append(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = append(stderr, chunk);
+    });
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback();
+    };
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(() => reject(new Error(`Process timed out: ${executable}`)));
+    }, timeoutMs);
+    child.once("error", (error) => {
+      finish(() => reject(new Error(`Unable to start ${executable}: ${error.message}`)));
+    });
+    child.once("exit", (code) => {
+      finish(() => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`${executable} exited ${code}: ${stderr.trim()}`));
+      });
+    });
+  });
 }

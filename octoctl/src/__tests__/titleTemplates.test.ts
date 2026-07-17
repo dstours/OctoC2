@@ -117,7 +117,7 @@ describe("loadTitleTemplates", () => {
 
 describe("real-templates integration", () => {
   const realCtx = { shortId: "a3f8", hostname: "beacon-host", date: "Mar 30" };
-  let templates: string[];
+  let templates: readonly [string, ...string[]];
 
   beforeAll(async () => {
     templates = await loadTitleTemplates(REAL_TEMPLATES_PATH);

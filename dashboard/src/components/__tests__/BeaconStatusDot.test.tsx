@@ -1,6 +1,6 @@
 // dashboard/src/components/__tests__/BeaconStatusDot.test.tsx
 import { render, screen } from '@testing-library/react';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { BeaconStatusDot } from '../BeaconStatusDot';
 
 describe('BeaconStatusDot', () => {

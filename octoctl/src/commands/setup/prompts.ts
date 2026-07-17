@@ -33,7 +33,7 @@ export async function promptPassword(opts: {
 }): Promise<string> {
   const result = await p.password({
     message: opts.message,
-    validate: opts.validate,
+    ...(opts.validate !== undefined && { validate: opts.validate }),
   });
   if (p.isCancel(result)) {
     p.cancel("Setup cancelled.");
@@ -50,9 +50,9 @@ export async function promptText(opts: {
 }): Promise<string> {
   const result = await p.text({
     message: opts.message,
-    placeholder: opts.placeholder,
-    initialValue: opts.initialValue,
-    validate: opts.validate,
+    ...(opts.placeholder !== undefined && { placeholder: opts.placeholder }),
+    ...(opts.initialValue !== undefined && { initialValue: opts.initialValue }),
+    ...(opts.validate !== undefined && { validate: opts.validate }),
   });
   if (p.isCancel(result)) {
     p.cancel("Setup cancelled.");
@@ -67,7 +67,7 @@ export async function promptSelect<T extends string>(opts: {
 }): Promise<T> {
   const result = await p.select({
     message: opts.message,
-    options: opts.options,
+    options: opts.options as p.Option<T>[],
   });
   if (p.isCancel(result)) {
     p.cancel("Setup cancelled.");

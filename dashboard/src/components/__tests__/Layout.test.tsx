@@ -1,6 +1,6 @@
 // dashboard/src/components/__tests__/Layout.test.tsx
 import { render, screen } from '@testing-library/react';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AuthProvider } from '@/context/AuthContext';
@@ -62,5 +62,11 @@ describe('Layout', () => {
   it('main content area renders Outlet', () => {
     renderLayout();
     expect(document.querySelector('main')).toBeInTheDocument();
+  });
+
+  it('shows a conspicuous non-production warning', () => {
+    renderLayout();
+    expect(screen.getByRole('alert', { name: /experimental warning/i }))
+      .toHaveTextContent(/experimental.*non-production/i);
   });
 });

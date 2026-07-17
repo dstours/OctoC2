@@ -1,64 +1,70 @@
-name: CI Update
+name: OctoC2 relay control ingress
 
 on:
   repository_dispatch:
-    types: [infra-sync]
+    types: [octoc2-relay-ingress]
+
+concurrency:
+  group: octoc2-relay-ingress-${{ github.event.client_payload.source_event_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
-  process:
+  ingest:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch and relay pending updates
+      - name: Verify and post the incoming comment exactly once
         env:
-          MAIN_TOKEN:        ${{ secrets.MAIN_TOKEN }}
-          MAIN_REPO_OWNER:   ${{ secrets.MAIN_REPO_OWNER }}
-          MAIN_REPO_NAME:    ${{ secrets.MAIN_REPO_NAME }}
-          NODE_ISSUE_MAP:    ${{ secrets.NODE_ISSUE_MAP }}
-          TARGET_TOKEN:      ${{ secrets.TARGET_TOKEN }}
-          NODE_ID:           ${{ github.event.client_payload.node_id }}
-          TARGET_OWNER:      ${{ github.event.client_payload.target_owner }}
-          TARGET_REPO:       ${{ github.event.client_payload.target_repo }}
-          LAST_UPDATE_TS:    ${{ github.event.client_payload.last_update_ts }}
+          GH_TOKEN: ${{ github.token }}
+          RELAY_SIGNING_KEY: ${{ secrets.RELAY_SIGNING_KEY }}
+          NODE_ROUTE_MAP: ${{ vars.NODE_ROUTE_MAP }}
+          EVENT_JSON: ${{ toJSON(github.event.client_payload) }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+        shell: bash
         run: |
           set -euo pipefail
-          # Resolve main issue number for this node
-          ISSUE_NUMBER=$(echo "${NODE_ISSUE_MAP}" | jq -r --arg id "${NODE_ID}" '.[$id]')
-          if [ "${ISSUE_NUMBER}" = "null" ] || [ -z "${ISSUE_NUMBER}" ]; then
-            echo "Unknown node ${NODE_ID}, skipping"
+          test -n "${RELAY_SIGNING_KEY}"
+          test -n "${NODE_ROUTE_MAP}"
+
+          SIGNATURE="$(jq -er '.signature' <<<"${EVENT_JSON}")"
+          PAYLOAD="$(jq -cS 'del(.signature)' <<<"${EVENT_JSON}")"
+          EXPECTED="$(printf '%s' "${PAYLOAD}" |
+            openssl dgst -sha256 -hmac "${RELAY_SIGNING_KEY}" -hex |
+            sed 's/^.* //')"
+          test "${SIGNATURE}" = "${EXPECTED}"
+          test "$(jq -er '.version' <<<"${PAYLOAD}")" = "1"
+          test "$(jq -er '.direction' <<<"${PAYLOAD}")" = "ingress"
+
+          ISSUED_AT="$(jq -er '.issued_at' <<<"${PAYLOAD}")"
+          NOW="$(date -u +%s)"
+          ISSUED="$(date -u -d "${ISSUED_AT}" +%s)"
+          AGE="$((NOW - ISSUED))"
+          test "${AGE}" -ge -300
+          test "${AGE}" -le 900
+
+          NODE_ID="$(jq -er '.node_id' <<<"${PAYLOAD}")"
+          ROUTE="$(jq -cer --arg id "${NODE_ID}" '.[$id]' <<<"${NODE_ROUTE_MAP}")"
+          CONTROL_ISSUE="$(jq -er '.controlIssue' <<<"${ROUTE}")"
+          EXPECTED_DECOY_REPOSITORY="$(jq -er '.decoyRepository' <<<"${ROUTE}")"
+          EXPECTED_DECOY_ISSUE="$(jq -er '.decoyIssue' <<<"${ROUTE}")"
+          test "$(jq -er '.decoy_repository' <<<"${PAYLOAD}")" = "${EXPECTED_DECOY_REPOSITORY}"
+          test "$(jq -er '.decoy_issue' <<<"${PAYLOAD}")" = "${EXPECTED_DECOY_ISSUE}"
+
+          SOURCE_EVENT_ID="$(jq -er '.source_event_id' <<<"${PAYLOAD}")"
+          MARKER="<!-- octoc2-relay:ingress:${SOURCE_EVENT_ID} -->"
+          ALREADY_POSTED="$(gh api --paginate \
+            "repos/${CONTROL_REPOSITORY}/issues/${CONTROL_ISSUE}/comments?per_page=100" |
+            jq -s --arg marker "${MARKER}" 'flatten | any(.body | contains($marker))')"
+          if [ "${ALREADY_POSTED}" = "true" ]; then
+            echo "Relay event ${SOURCE_EVENT_ID} was already applied"
             exit 0
           fi
 
-          # Fetch comments from the main issue newer than last sync
-          COMMENTS=$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${MAIN_TOKEN}" \
-            "https://api.github.com/repos/${MAIN_REPO_OWNER}/${MAIN_REPO_NAME}/issues/${ISSUE_NUMBER}/comments?per_page=100&sort=created&direction=asc" \
-            | jq --arg since "${LAST_UPDATE_TS}" \
-                '[.[] | select(.created_at > $since)]')
-
-          COUNT=$(echo "${COMMENTS}" | jq length)
-          if [ "${COUNT}" = "0" ]; then
-            echo "No new updates for ${NODE_ID}"
-            exit 0
-          fi
-
-          # Forward each update comment to the target repo
-          echo "${COMMENTS}" | jq -c '.[]' | while read -r comment; do
-            BODY=$(echo "${comment}" | jq -r '.body')
-            UPDATE_TS=$(echo "${comment}" | jq -r '.created_at')
-            curl -fsSL \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${TARGET_TOKEN}" \
-              "https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/dispatches" \
-              -d "$(jq -n \
-                --arg comment_body "${BODY}" \
-                --arg update_ts     "${UPDATE_TS}" \
-                '{
-                  event_type: "infra-update",
-                  client_payload: {
-                    comment_body: $comment_body,
-                    update_ts:    $update_ts
-                  }
-                }')"
-          done
+          COMMENT_BODY="$(jq -er '.comment_body' <<<"${PAYLOAD}")"
+          printf '%s\n\n%s\n' "${COMMENT_BODY}" "${MARKER}" |
+            gh issue comment "${CONTROL_ISSUE}" \
+              --repo "${CONTROL_REPOSITORY}" \
+              --body-file -

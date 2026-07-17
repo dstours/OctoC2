@@ -1,52 +1,74 @@
-name: CI Forward
+name: OctoC2 relay ingress
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
+
+permissions:
+  contents: read
 
 jobs:
   forward:
-    if: >
-      github.event.issue.number == vars.FORWARD_ISSUE &&
-      github.event.comment.user.login != 'github-actions[bot]'
+    if: >-
+      github.event.issue.number == fromJSON(vars.FORWARD_ISSUE) &&
+      github.event.comment.user.login != 'github-actions[bot]' &&
+      !contains(github.event.comment.body, '<!-- octoc2-relay:')
     runs-on: ubuntu-latest
     steps:
-      - name: Forward update
+      - name: Sign and dispatch the decoy comment
         env:
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          SYNC_REPO_OWNER: ${{ secrets.SYNC_REPO_OWNER }}
-          SYNC_REPO_NAME: ${{ secrets.SYNC_REPO_NAME }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          CONTROL_OWNER: ${{ secrets.CONTROL_OWNER }}
+          CONTROL_REPO: ${{ secrets.CONTROL_REPO }}
+          RELAY_SIGNING_KEY: ${{ secrets.RELAY_SIGNING_KEY }}
           NODE_ID: ${{ secrets.NODE_ID }}
           COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_ID:   ${{ github.event.comment.id }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          LAST_UPDATE_TS: ${{ vars.LAST_UPDATE_TS }}
-          TARGET_OWNER: ${{ github.repository_owner }}
-          TARGET_REPO:  ${{ github.event.repository.name }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          DECOY_ISSUE: ${{ github.event.issue.number }}
+          DECOY_REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${SYNC_TOKEN}" \
-            "https://api.github.com/repos/${SYNC_REPO_OWNER}/${SYNC_REPO_NAME}/dispatches" \
-            -d "$(jq -n \
-              --arg node_id        "${NODE_ID}" \
-              --arg comment_body   "${COMMENT_BODY}" \
-              --argjson comment_id "${COMMENT_ID}" \
-              --argjson issue_number "${ISSUE_NUMBER}" \
-              --arg last_update_ts "${LAST_UPDATE_TS}" \
-              --arg target_owner   "${TARGET_OWNER}" \
-              --arg target_repo    "${TARGET_REPO}" \
-              '{
-                event_type: "infra-sync",
-                client_payload: {
-                  node_id:        $node_id,
-                  comment_body:   $comment_body,
-                  comment_id:     $comment_id,
-                  issue_number:   $issue_number,
-                  last_update_ts: $last_update_ts,
-                  target_owner:   $target_owner,
-                  target_repo:    $target_repo
-                }
-              }')"
+          test -n "${CONTROL_TOKEN}"
+          test -n "${RELAY_SIGNING_KEY}"
+
+          COMMENT_DIGEST="$(printf '%s' "${COMMENT_BODY}" |
+            sha256sum | awk '{print $1}')"
+          SOURCE_EVENT_ID="decoy:${REPOSITORY_ID}:${COMMENT_ID}:${COMMENT_DIGEST}"
+          ISSUED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PAYLOAD="$(jq -cS -n \
+            --argjson version 1 \
+            --arg direction "ingress" \
+            --arg source_event_id "${SOURCE_EVENT_ID}" \
+            --arg node_id "${NODE_ID}" \
+            --arg decoy_repository "${DECOY_REPOSITORY}" \
+            --argjson decoy_issue "${DECOY_ISSUE}" \
+            --argjson source_comment_id "${COMMENT_ID}" \
+            --arg comment_body "${COMMENT_BODY}" \
+            --arg issued_at "${ISSUED_AT}" \
+            '{
+              version: $version,
+              direction: $direction,
+              source_event_id: $source_event_id,
+              node_id: $node_id,
+              decoy_repository: $decoy_repository,
+              decoy_issue: $decoy_issue,
+              source_comment_id: $source_comment_id,
+              comment_body: $comment_body,
+              issued_at: $issued_at
+            }')"
+          SIGNATURE="$(printf '%s' "${PAYLOAD}" |
+            openssl dgst -sha256 -hmac "${RELAY_SIGNING_KEY}" -hex |
+            sed 's/^.* //')"
+          DISPATCH="$(jq -cn \
+            --argjson payload "${PAYLOAD}" \
+            --arg signature "${SIGNATURE}" \
+            '{event_type:"octoc2-relay-ingress",client_payload:($payload + {signature:$signature})}')"
+
+          printf '%s' "${DISPATCH}" |
+            GH_TOKEN="${CONTROL_TOKEN}" gh api \
+              --method POST \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${CONTROL_OWNER}/${CONTROL_REPO}/dispatches" \
+              --input -

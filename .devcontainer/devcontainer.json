@@ -11,24 +11,23 @@
   "features": {
     // GitHub CLI (authenticated via GITHUB_TOKEN / gh auth login)
     "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/node:1": { "version": "22.14.0" },
     // SSH server — required for gRPC-over-SSH tunnel tentacle
-    "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" }
+    "ghcr.io/devcontainers/features/sshd:1": {}
   },
 
   // ── Port forwarding ────────────────────────────────────────────────────────
   // These mirror Codespaces port mappings exactly
   "forwardPorts": [5173, 8080, 50051, 2222],
   "portsAttributes": {
-    "5173":  { "label": "Operator Dashboard (Vite)", "onAutoForward": "openBrowser", "protocol": "http" },
-    "8080":  { "label": "Operator API",               "onAutoForward": "notify" },
-    "50051": { "label": "gRPC Server",                 "onAutoForward": "silent" },
+    "5173":  { "label": "Operator Dashboard (opt-in)", "onAutoForward": "notify", "protocol": "http" },
+    "8080":  { "label": "Operator API (opt-in)",       "onAutoForward": "notify" },
+    "50051": { "label": "gRPC Server (opt-in TLS)",    "onAutoForward": "silent" },
     "2222":  { "label": "SSH Tunnel",                  "onAutoForward": "silent" }
   },
 
   // ── Lifecycle hooks ────────────────────────────────────────────────────────
   "postCreateCommand": "bash .devcontainer/post-create.sh",
-  // Auto-start dashboard on Codespace resume; operator can open it immediately
-  "postStartCommand": "cd dashboard && bun run dev -- --host 0.0.0.0 &",
 
   // ── Container user ─────────────────────────────────────────────────────────
   "remoteUser": "vscode",

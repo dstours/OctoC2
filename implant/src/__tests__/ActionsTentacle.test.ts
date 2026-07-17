@@ -1,58 +1,72 @@
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test";
-
-// ── Octokit mock factory ──────────────────────────────────────────────────────
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  mock,
+} from "bun:test";
+import { decodeBase64Url, verifyEnvelope } from "@octoc2/shared";
 
 function makeActions(overrides: Record<string, any> = {}) {
   return {
-    getRepoVariable:        mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }),
-    createRepoVariable:     mock(async () => ({})),
-    updateRepoVariable:     mock(async () => ({})),
-    deleteRepoVariable:     mock(async () => ({})),
-    listRepoVariables:      mock(async () => ({ data: { variables: [] } })),
-    ...(overrides ?? {}),
+    getRepoVariable: mock(async () => {
+      throw Object.assign(new Error("Not Found"), { status: 404 });
+    }),
+    createRepoVariable: mock(async () => ({})),
+    updateRepoVariable: mock(async () => ({})),
+    deleteRepoVariable: mock(async () => ({})),
+    listRepoVariables: mock(async () => ({ data: { variables: [] } })),
+    ...overrides,
   };
 }
 
 function makeRepos(overrides: Record<string, any> = {}) {
   return {
-    get:                    mock(async () => ({})),
-    createDispatchEvent:    mock(async () => ({})),
-    ...(overrides ?? {}),
+    get: mock(async () => ({})),
+    createDispatchEvent: mock(async () => ({})),
+    ...overrides,
   };
 }
 
-function makeOctokit(actionsOverrides: Record<string, any> = {}, reposOverrides: Record<string, any> = {}) {
+function makeOctokit(
+  actionsOverrides: Record<string, any> = {},
+  reposOverrides: Record<string, any> = {},
+) {
   return {
     hook: { wrap: (_name: string, _fn: Function) => {} },
     rest: {
       actions: makeActions(actionsOverrides),
-      repos:   makeRepos(reposOverrides),
+      repos: makeRepos(reposOverrides),
     },
   } as any;
 }
 
-// Mock @octokit/rest before importing anything that imports it
 mock.module("@octokit/rest", () => ({
   Octokit: class {
     hook = { wrap: (_name: string, _fn: Function) => {} };
-    rest  = {
+    rest = {
       actions: makeActions(),
-      repos:   makeRepos(),
+      repos: makeRepos(),
     };
   },
 }));
 
-import { ActionsTentacle } from "../tentacles/ActionsTentacle.ts";
-import {
-  generateKeyPair, encryptBox, openSealBox, bytesToBase64,
-} from "../crypto/sodium.ts";
-import type { BeaconConfig } from "../types.ts";
+const { ActionsTentacle } = await import("../tentacles/ActionsTentacle.ts");
+const { clearSharedGitHubTokenProviders } = await import(
+  "../lib/GitHubTokenProvider.ts"
+);
+const {
+  encryptBox,
+  generateKeyPair,
+  openSealBox,
+} = await import("../crypto/sodium.ts");
+const { signedCheckin } = await import("./signedCheckinFixture.ts");
+type BeaconConfig = import("../types.ts").BeaconConfig;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-async function makeConfig(overrides: Partial<BeaconConfig> = {}): Promise<BeaconConfig> {
-  const operatorKp = await generateKeyPair();
-  const beaconKp   = await generateKeyPair();
+async function makeConfig(
+  overrides: Partial<BeaconConfig> = {},
+): Promise<BeaconConfig> {
   return {
     id: "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
     repo: { owner: "testowner", name: "testrepo" },
@@ -60,311 +74,299 @@ async function makeConfig(overrides: Partial<BeaconConfig> = {}): Promise<Beacon
     tentaclePriority: ["actions"],
     sleepSeconds: 60,
     jitter: 0.3,
-    operatorPublicKey: operatorKp.publicKey,
-    beaconKeyPair: beaconKp,
+    operatorPublicKey: (await generateKeyPair()).publicKey,
+    beaconKeyPair: await generateKeyPair(),
     ...overrides,
-    // Allow overriding individual key pair fields
-  } as BeaconConfig;
+  };
 }
 
-const CHECKIN_PAYLOAD = {
-  beaconId:  "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
-  publicKey: "",
-  hostname:  "runner-host",
-  username:  "runner",
-  os:        "linux",
-  arch:      "x64",
-  pid:       1234,
-  checkinAt: new Date().toISOString(),
-};
-
-// Save and restore GITHUB_TOKEN around each test
-let savedGithubToken: string | undefined;
+let originalGitHubToken: string | undefined;
 
 beforeEach(() => {
-  savedGithubToken = process.env["GITHUB_TOKEN"];
+  clearSharedGitHubTokenProviders();
+  originalGitHubToken = process.env["GITHUB_TOKEN"];
   delete process.env["GITHUB_TOKEN"];
 });
 
 afterEach(() => {
-  if (savedGithubToken !== undefined) {
-    process.env["GITHUB_TOKEN"] = savedGithubToken;
-  } else {
+  if (originalGitHubToken === undefined) {
     delete process.env["GITHUB_TOKEN"];
+  } else {
+    process.env["GITHUB_TOKEN"] = originalGitHubToken;
   }
 });
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-describe("ActionsTentacle.isActionsAvailable()", () => {
-  it("returns false when GITHUB_TOKEN is absent", () => {
-    expect(ActionsTentacle.isActionsAvailable()).toBe(false);
+describe("ActionsTentacle availability", () => {
+  it("uses the configured credential outside GitHub Actions", async () => {
+    const tentacle = new ActionsTentacle(await makeConfig({
+      token: "configured-app-lease",
+    }));
+    expect(await (tentacle as any).tokenProvider.getToken()).toBe(
+      "configured-app-lease",
+    );
   });
 
-  it("returns true when GITHUB_TOKEN is set and non-empty", () => {
-    process.env["GITHUB_TOKEN"] = "gha_fake_token_123";
-    expect(ActionsTentacle.isActionsAvailable()).toBe(true);
+  it("binds API calls to the ambient short-lived Actions credential", async () => {
+    process.env["GITHUB_TOKEN"] = "gha_runtime_token";
+    const tentacle = new ActionsTentacle(await makeConfig({
+      token: "configured-fallback",
+    }));
+    expect(await (tentacle as any).tokenProvider.getToken()).toBe(
+      "gha_runtime_token",
+    );
   });
 
-  it("returns false when GITHUB_TOKEN is set to empty string", () => {
-    process.env["GITHUB_TOKEN"] = "";
-    expect(ActionsTentacle.isActionsAvailable()).toBe(false);
-  });
-
-  it("returns false when GITHUB_TOKEN is set to whitespace only", () => {
+  it("ignores a blank ambient GITHUB_TOKEN", async () => {
     process.env["GITHUB_TOKEN"] = "   ";
-    expect(ActionsTentacle.isActionsAvailable()).toBe(false);
+    const tentacle = new ActionsTentacle(await makeConfig({
+      token: "configured-fallback",
+    }));
+    expect(await (tentacle as any).tokenProvider.getToken()).toBe(
+      "configured-fallback",
+    );
+  });
+
+  it("reports available when the repository Variables API is accessible", async () => {
+    const tentacle = new ActionsTentacle(await makeConfig());
+    (tentacle as any).octokit = makeOctokit();
+    expect(await tentacle.isAvailable()).toBe(true);
+  });
+
+  it("converts availability probe errors into false", async () => {
+    const tentacle = new ActionsTentacle(await makeConfig());
+    (tentacle as any).octokit = makeOctokit({
+      listRepoVariables: mock(async () => {
+        throw new Error("probe failed");
+      }),
+    });
+    expect(await tentacle.isAvailable()).toBe(false);
+  });
+
+  it("exposes the actions channel kind", async () => {
+    expect(new ActionsTentacle(await makeConfig()).kind).toBe("actions");
   });
 });
 
-describe("ActionsTentacle.isAvailable()", () => {
-  it("returns false when GITHUB_TOKEN is absent", async () => {
-    const t = new ActionsTentacle(await makeConfig());
-    expect(await t.isAvailable()).toBe(false);
-  });
-
-  it("returns true when GITHUB_TOKEN is set (delegates to isActionsAvailable)", async () => {
-    process.env["GITHUB_TOKEN"] = "gha_fake_token_abc";
-    const t = new ActionsTentacle(await makeConfig());
-    expect(await t.isAvailable()).toBe(true);
-  });
-
-  it("returns false (never throws) even when isActionsAvailable would throw", async () => {
-    const orig = ActionsTentacle.isActionsAvailable;
-    ActionsTentacle.isActionsAvailable = () => { throw new Error("simulated failure"); };
-    try {
-      const t = new ActionsTentacle(await makeConfig());
-      expect(await t.isAvailable()).toBe(false);
-    } finally {
-      ActionsTentacle.isActionsAvailable = orig;
-    }
-  });
-});
-
-describe("ActionsTentacle kind", () => {
-  it("kind is 'actions'", async () => {
-    const t = new ActionsTentacle(await makeConfig());
-    expect(t.kind).toBe("actions");
-  });
-});
-
-describe("ActionsTentacle.checkin()", () => {
-  it("creates ACK variable on first checkin", async () => {
-    const cfg = await makeConfig();
-    const t   = new ActionsTentacle(cfg);
-
-    const updateVar = mock(async () => ({}));
-    const createVar = mock(async () => ({}));
-    const dispatch  = mock(async () => ({}));
-    const getVar    = mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); });
-
-    (t as any).octokit = makeOctokit(
-      { updateRepoVariable: updateVar, createRepoVariable: createVar,
-        deleteRepoVariable: mock(async () => ({})),
-        getRepoVariable: getVar },
-      { createDispatchEvent: dispatch },
+describe("ActionsTentacle signed checkin", () => {
+  it("writes and dispatches a verifiable signed ACK", async () => {
+    const config = await makeConfig();
+    const tentacle = new ActionsTentacle(config);
+    let ackValue: string | undefined;
+    let dispatchIdentity: unknown;
+    (tentacle as any).octokit = makeOctokit(
+      {
+        updateRepoVariable: mock(async (params: any) => {
+          ackValue = params.value;
+          return {};
+        }),
+      },
+      {
+        createDispatchEvent: mock(async (params: any) => {
+          dispatchIdentity = params.client_payload.identity;
+          return {};
+        }),
+      },
     );
 
-    await t.checkin(CHECKIN_PAYLOAD);
+    await tentacle.checkin(await signedCheckin(config, {
+      hostname: "runner-host",
+      username: "runner",
+    }));
 
-    // Either updateRepoVariable or createRepoVariable must have been called
-    // (create is called as fallback when update returns 404)
-    const ackWritten = updateVar.mock.calls.length > 0 || createVar.mock.calls.length > 0;
-    expect(ackWritten).toBe(true);
+    expect(ackValue).toBeDefined();
+    const ack = JSON.parse(ackValue!);
+    expect(ack.publicKey).toBe(ack.identity.payload.encryptionPublicKey);
+    const signingPublicKey = await decodeBase64Url(
+      ack.identity.payload.signingPublicKey,
+    );
+    expect(await verifyEnvelope(ack.identity, signingPublicKey)).toBe(true);
+    expect(dispatchIdentity).toEqual(ack.identity);
   });
 
-  it("does NOT re-send ACK on subsequent checkins", async () => {
-    const cfg = await makeConfig();
-    const t   = new ActionsTentacle(cfg);
+  it("creates the ACK variable when update reports it missing", async () => {
+    const config = await makeConfig();
+    const tentacle = new ActionsTentacle(config);
+    const create = mock(async () => ({}));
+    (tentacle as any).octokit = makeOctokit({
+      updateRepoVariable: mock(async () => {
+        throw Object.assign(new Error("Not Found"), { status: 404 });
+      }),
+      createRepoVariable: create,
+    });
 
-    const updateVar = mock(async () => ({}));
-    const getVar    = mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); });
+    await tentacle.checkin(await signedCheckin(config));
 
-    (t as any).octokit = makeOctokit(
-      { updateRepoVariable: updateVar, createRepoVariable: mock(async () => ({})),
-        deleteRepoVariable: mock(async () => ({})),
-        getRepoVariable: getVar },
-      { createDispatchEvent: mock(async () => ({})) },
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(((create.mock.calls[0] as any)[0] as any).name).toBe(
+      "INFRA_STATUS_AAAA1111",
     );
-
-    await t.checkin(CHECKIN_PAYLOAD);
-    const callsAfterFirst = updateVar.mock.calls.length;
-
-    await t.checkin(CHECKIN_PAYLOAD);
-    // No additional ACK write on second call
-    expect(updateVar.mock.calls.length).toBe(callsAfterFirst);
   });
 
-  it("returns [] when INFRA_JOB variable is absent (404)", async () => {
-    const cfg = await makeConfig();
-    const t   = new ActionsTentacle(cfg);
-
-    (t as any).octokit = makeOctokit(
-      { updateRepoVariable: mock(async () => ({})),
-        createRepoVariable: mock(async () => ({})),
-        deleteRepoVariable: mock(async () => ({})),
-        getRepoVariable:    mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }) },
-      { createDispatchEvent: mock(async () => ({})) },
-    );
-
-    const tasks = await t.checkin(CHECKIN_PAYLOAD);
-    expect(tasks).toEqual([]);
-  });
-
-  it("decrypts tasks from TASK variable and deletes it after reading", async () => {
-    const operatorKp = await generateKeyPair();
-    const beaconKp   = await generateKeyPair();
-    const cfg = await makeConfig({ operatorPublicKey: operatorKp.publicKey, beaconKeyPair: beaconKp });
-    const t   = new ActionsTentacle(cfg);
-
-    const taskPayload = [{ taskId: "task-abc", kind: "shell", args: { cmd: "id" } }];
-    const encrypted   = await encryptBox(
-      JSON.stringify(taskPayload),
-      beaconKp.publicKey,
-      operatorKp.secretKey,
-    );
-
-    const deleteVar = mock(async () => ({}));
-    const getVar    = mock(async (params: any) => {
-      if ((params.name as string).startsWith("INFRA_JOB_")) {
-        return { data: { value: JSON.stringify(encrypted) } };
-      }
+  it("refreshes the signed ACK on every checkin, dispatches once, and keeps polling", async () => {
+    const config = await makeConfig();
+    const tentacle = new ActionsTentacle(config);
+    const update = mock(async () => ({}));
+    const poll = mock(async () => {
       throw Object.assign(new Error("Not Found"), { status: 404 });
     });
-
-    (t as any).octokit = makeOctokit(
-      { updateRepoVariable: mock(async () => ({})),
-        createRepoVariable: mock(async () => ({})),
-        deleteRepoVariable: deleteVar,
-        getRepoVariable:    getVar },
-      { createDispatchEvent: mock(async () => ({})) },
+    const dispatch = mock(async () => ({}));
+    (tentacle as any).octokit = makeOctokit(
+      {
+        updateRepoVariable: update,
+        getRepoVariable: poll,
+      },
+      {
+        createDispatchEvent: dispatch,
+      },
     );
 
-    const tasks = await t.checkin(CHECKIN_PAYLOAD);
+    await tentacle.checkin(await signedCheckin(config, {
+      checkinAt: "2026-07-16T12:00:00.000Z",
+    }));
+    await tentacle.checkin(await signedCheckin(config, {
+      checkinAt: "2026-07-16T12:00:01.000Z",
+    }));
 
-    expect(tasks).toHaveLength(1);
-    expect(tasks[0]!.taskId).toBe("task-abc");
-    expect(tasks[0]!.kind).toBe("shell");
-
-    // Variable should have been deleted after reading
-    expect(deleteVar.mock.calls.length).toBeGreaterThan(0);
-    const deletedVarName = ((deleteVar.mock.calls[0] as any)[0] as any).name as string;
-    expect(deletedVarName).toMatch(/^INFRA_JOB_/);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(poll).toHaveBeenCalledTimes(2);
+    const firstAck = JSON.parse(((update.mock.calls[0] as any)[0] as any).value);
+    const secondAck = JSON.parse(((update.mock.calls[1] as any)[0] as any).value);
+    expect(secondAck.identity.sequence).toBeGreaterThan(firstAck.identity.sequence);
+    expect(secondAck.identity.signature).not.toBe(firstAck.identity.signature);
   });
 
-  it("returns [] and does not throw when task variable value is malformed", async () => {
-    const cfg = await makeConfig();
-    const t   = new ActionsTentacle(cfg);
-
-    (t as any).octokit = makeOctokit(
-      { updateRepoVariable: mock(async () => ({})),
-        createRepoVariable: mock(async () => ({})),
-        deleteRepoVariable: mock(async () => ({})),
-        getRepoVariable:    mock(async () => ({ data: { value: "not-valid-json" } })) },
-      { createDispatchEvent: mock(async () => ({})) },
-    );
-
-    const tasks = await t.checkin(CHECKIN_PAYLOAD);
-    expect(tasks).toEqual([]);
-  });
-});
-
-describe("ActionsTentacle.submitResult()", () => {
-  it("writes a RESULT variable with sealed payload", async () => {
-    const operatorKp = await generateKeyPair();
-    const cfg = await makeConfig({ operatorPublicKey: operatorKp.publicKey });
-    const t   = new ActionsTentacle(cfg);
-
-    const updateVar = mock(async () => ({}));
-    const createVar = mock(async () => ({}));
-
-    (t as any).octokit = makeOctokit(
-      { updateRepoVariable: updateVar, createRepoVariable: createVar,
-        deleteRepoVariable: mock(async () => ({})),
-        getRepoVariable:    mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }) },
-    );
-
-    const result = {
-      taskId:      "task-def0",
-      beaconId:    "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
-      success:     true,
-      output:      "root",
-      completedAt: new Date().toISOString(),
-    };
-
-    await t.submitResult(result);
-
-    // Either update or create must have been called
-    const varWritten = updateVar.mock.calls.length > 0 || createVar.mock.calls.length > 0;
-    expect(varWritten).toBe(true);
-
-    // Whichever was called, check the variable name starts with INFRA_RESULT_
-    const writeCalls = [...updateVar.mock.calls, ...createVar.mock.calls];
-    const varName = ((writeCalls[0] as any)[0] as any).name as string;
-    expect(varName).toMatch(/^INFRA_RESULT_/);
-    expect(varName).toContain("TASK-DEF");
-  });
-
-  it("result variable value is a sealed base64 string decryptable with operator key", async () => {
-    const operatorKp = await generateKeyPair();
-    const cfg = await makeConfig({ operatorPublicKey: operatorKp.publicKey });
-    const t   = new ActionsTentacle(cfg);
-
-    let capturedValue: string | undefined;
-    const captureCreate = mock(async (params: any) => {
-      capturedValue = params.value;
-      return {};
+  it("returns an empty task list when the task variable is absent", async () => {
+    const config = await makeConfig();
+    const tentacle = new ActionsTentacle(config);
+    (tentacle as any).octokit = makeOctokit({
+      getRepoVariable: mock(async () => {
+        throw Object.assign(new Error("Not Found"), { status: 404 });
+      }),
     });
 
-    (t as any).octokit = makeOctokit(
-      { updateRepoVariable: mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }),
-        createRepoVariable: captureCreate,
-        deleteRepoVariable: mock(async () => ({})),
-        getRepoVariable:    mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }) },
+    expect(
+      await tentacle.checkin(await signedCheckin(config)),
+    ).toEqual([]);
+  });
+
+  it("decrypts a task variable and deletes it after reading", async () => {
+    const operatorKeyPair = await generateKeyPair();
+    const beaconKeyPair = await generateKeyPair();
+    const config = await makeConfig({
+      operatorPublicKey: operatorKeyPair.publicKey,
+      beaconKeyPair,
+    });
+    const encrypted = await encryptBox(
+      JSON.stringify([{
+        taskId: "task-abc",
+        kind: "shell",
+        args: { cmd: "id" },
+      }]),
+      beaconKeyPair.publicKey,
+      operatorKeyPair.secretKey,
     );
+    const remove = mock(async () => ({}));
+    const tentacle = new ActionsTentacle(config);
+    (tentacle as any).octokit = makeOctokit({
+      getRepoVariable: mock(async () => ({
+        data: { value: JSON.stringify(encrypted) },
+      })),
+      deleteRepoVariable: remove,
+    });
 
-    const result = {
-      taskId:      "task-1234",
-      beaconId:    "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
-      success:     true,
-      output:      "uid=0(root)",
-      completedAt: new Date().toISOString(),
-    };
+    const tasks = await tentacle.checkin(await signedCheckin(config));
 
-    await t.submitResult(result);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]?.taskId).toBe("task-abc");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(((remove.mock.calls[0] as any)[0] as any).name).toBe(
+      "INFRA_JOB_AAAA1111",
+    );
+  });
 
-    expect(capturedValue).toBeDefined();
-    // Decrypt and verify
-    const plainBytes = await openSealBox(capturedValue!, operatorKp.publicKey, operatorKp.secretKey);
-    const plain = new TextDecoder().decode(plainBytes);
-    const decoded = JSON.parse(plain);
-    expect(decoded.taskId).toBe("task-1234");
-    expect(decoded.output).toBe("uid=0(root)");
+  it("returns an empty task list for malformed encrypted content", async () => {
+    const config = await makeConfig();
+    const tentacle = new ActionsTentacle(config);
+    (tentacle as any).octokit = makeOctokit({
+      getRepoVariable: mock(async () => ({
+        data: { value: "not-valid-json" },
+      })),
+    });
+
+    expect(
+      await tentacle.checkin(await signedCheckin(config)),
+    ).toEqual([]);
   });
 });
 
-describe("ActionsTentacle.teardown()", () => {
-  it("resolves without throwing", async () => {
-    const t = new ActionsTentacle(await makeConfig());
-    (t as any).octokit = makeOctokit(
-      { deleteRepoVariable: mock(async () => ({})) },
+describe("ActionsTentacle results and teardown", () => {
+  it("writes a task-scoped result variable", async () => {
+    const config = await makeConfig();
+    const tentacle = new ActionsTentacle(config);
+    const update = mock(async () => ({}));
+    (tentacle as any).octokit = makeOctokit({
+      updateRepoVariable: update,
+    });
+
+    await tentacle.submitResult({
+      taskId: "task-def0",
+      beaconId: config.id,
+      success: true,
+      output: "root",
+      completedAt: new Date().toISOString(),
+    });
+
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(((update.mock.calls[0] as any)[0] as any).name).toBe(
+      "INFRA_RESULT_TASK-DEF",
     );
-    await expect(t.teardown()).resolves.toBeUndefined();
   });
 
-  it("resolves without throwing even when delete returns 404", async () => {
-    const t = new ActionsTentacle(await makeConfig());
-    (t as any).octokit = makeOctokit(
-      { deleteRepoVariable: mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }) },
+  it("seals result content to the operator key", async () => {
+    const operatorKeyPair = await generateKeyPair();
+    const config = await makeConfig({
+      operatorPublicKey: operatorKeyPair.publicKey,
+    });
+    const tentacle = new ActionsTentacle(config);
+    let capturedValue: string | undefined;
+    (tentacle as any).octokit = makeOctokit({
+      updateRepoVariable: mock(async () => {
+        throw Object.assign(new Error("Not Found"), { status: 404 });
+      }),
+      createRepoVariable: mock(async (params: any) => {
+        capturedValue = params.value;
+        return {};
+      }),
+    });
+
+    await tentacle.submitResult({
+      taskId: "task-1234",
+      beaconId: config.id,
+      success: true,
+      output: "uid=0(root)",
+      completedAt: new Date().toISOString(),
+    });
+
+    const plaintext = await openSealBox(
+      capturedValue!,
+      operatorKeyPair.publicKey,
+      operatorKeyPair.secretKey,
     );
-    await expect(t.teardown()).resolves.toBeUndefined();
+    expect(JSON.parse(new TextDecoder().decode(plaintext)).output).toBe(
+      "uid=0(root)",
+    );
   });
 
-  it("resolves without throwing even when delete throws an unexpected error", async () => {
-    const t = new ActionsTentacle(await makeConfig());
-    (t as any).octokit = makeOctokit(
-      { deleteRepoVariable: mock(async () => { throw new Error("Network timeout"); }) },
-    );
-    await expect(t.teardown()).resolves.toBeUndefined();
+  it("teardown preserves registration and unread task variables", async () => {
+    const tentacle = new ActionsTentacle(await makeConfig());
+    const remove = mock(async () => ({}));
+    (tentacle as any).octokit = makeOctokit({
+      deleteRepoVariable: remove,
+    });
+
+    await tentacle.teardown();
+
+    expect(remove).not.toHaveBeenCalled();
   });
 });
