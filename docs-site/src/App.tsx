@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-const owner = import.meta.env.VITE_GITHUB_OWNER || 'octoc2'
+const owner = import.meta.env.VITE_GITHUB_OWNER || 'dstours'
 const repo = import.meta.env.VITE_GITHUB_REPO || 'OctoC2'
 const repositoryUrl = `https://github.com/${owner}/${repo}`
 const docsUrl = (path: string) => `${repositoryUrl}/blob/main/${path}`
@@ -77,10 +77,46 @@ const transportGroups = [
 
 const guides = [
   {
+    title: 'Installation',
+    description: 'Install the pinned toolchain, run each component, and build platform beacon binaries.',
+    href: docsUrl('docs/INSTALLATION.md'),
+    label: 'Install',
+  },
+  {
+    title: 'GitHub setup',
+    description: 'Configure repositories, the GitHub App, least-privilege permissions, PAT roles, and rotation.',
+    href: docsUrl('docs/GITHUB_SETUP.md'),
+    label: 'Provision',
+  },
+  {
     title: 'Quickstart',
-    description: 'Install, configure role-separated credentials, and launch the local stack.',
+    description: 'Build and import a pre-enrolled beacon, then verify an accepted ping result.',
     href: docsUrl('docs/QUICKSTART.md'),
-    label: 'Start here',
+    label: 'First run',
+  },
+  {
+    title: 'Architecture',
+    description: 'Understand components, identity boundaries, task lifecycle, durable state, and recovery.',
+    href: docsUrl('docs/ARCHITECTURE.md'),
+    label: 'Learn',
+  },
+  {
+    title: 'Channel guide',
+    description: 'Compare every transport, permission, prerequisite, priority rule, and qualification step.',
+    href: docsUrl('docs/CHANNELS.md'),
+    label: 'Transports',
+  },
+  {
+    title: 'Configuration',
+    description: 'Look up controller, listener, beacon, OIDC, recovery, dashboard, and CLI settings.',
+    href: docsUrl('docs/CONFIGURATION.md'),
+    label: 'Reference',
+  },
+  {
+    title: 'CLI reference',
+    description: 'Use setup, enrollment, builds, inventory, tasks, results, proxy, and service commands.',
+    href: docsUrl('docs/CLI.md'),
+    label: 'Operate',
   },
   {
     title: 'Operations & assurance',
@@ -93,6 +129,18 @@ const guides = [
     description: 'Provision signed recovery records and short-lived GitHub App token leases.',
     href: docsUrl('docs/RECOVERY.md'),
     label: 'Configure recovery',
+  },
+  {
+    title: 'Troubleshooting',
+    description: 'Diagnose GitHub errors, decrypt failures, acknowledgements, proxy, TLS, gRPC, OIDC, and state.',
+    href: docsUrl('docs/TROUBLESHOOTING.md'),
+    label: 'Diagnose',
+  },
+  {
+    title: 'Development',
+    description: 'Work with shared contracts, tests, builds, generated protocol bindings, and change checks.',
+    href: docsUrl('docs/DEVELOPMENT.md'),
+    label: 'Contribute',
   },
   {
     title: 'Verification evidence',
@@ -178,6 +226,7 @@ function App() {
             <a href="#quickstart">Quickstart</a>
             <a href="#transports">Transports</a>
             <a href="#security">Security</a>
+            <a href="#guides">Guides</a>
           </nav>
           <a className="repo-link" href={repositoryUrl}>GitHub <span aria-hidden="true">↗</span></a>
         </div>
@@ -194,11 +243,12 @@ function App() {
         <section className="hero">
           <div className="hero-glow" aria-hidden="true" />
           <div className="hero-copy">
-            <p className="eyebrow"><span className="pulse-dot" /> GitHub-native control plane</p>
+            <p className="eyebrow"><span className="pulse-dot" /> GitHub-native command and control</p>
             <h1>GitHub is the transport.<br /><span>Trust is the protocol.</span></h1>
             <p className="hero-lede">
-              OctoC2 connects a TypeScript beacon, durable controller, local dashboard,
-              and operator CLI through encrypted, authenticated transport paths.
+              OctoC2 is built for authorized security research, connecting a TypeScript
+              beacon, durable controller, local dashboard, and operator CLI through
+              encrypted multi-channel transport with resilient failover.
             </p>
             <div className="hero-actions">
               <a className="button button-primary" href="#quickstart">Start local setup <span>→</span></a>
@@ -314,7 +364,7 @@ function App() {
               </article>
             ))}
           </div>
-          <p className="section-note">Transport selection never changes task ownership or signature requirements. Review exact permissions and prerequisites in the quickstart before enabling a channel.</p>
+          <p className="section-note">Transport selection never changes task ownership or signature requirements. Review exact permissions, credentials, and environment prerequisites in the channel guide before enabling a path.</p>
         </section>
 
         <section className="content-section security-section" id="security">
@@ -366,8 +416,8 @@ function App() {
         <section className="guides-section" id="guides">
           <SectionHeading
             eyebrow="Guides"
-            title="Go deeper when you need to"
-            description="Focused references keep setup, operations, recovery, and evidence separate and easy to scan."
+            title="A complete operator and engineering manual"
+            description="Follow the first-run path or jump directly to setup, channels, configuration, operations, recovery, troubleshooting, and development references."
           />
           <div className="guide-grid">
             {guides.map((guide) => (
@@ -385,12 +435,14 @@ function App() {
       <footer>
         <div className="footer-brand">
           <img src={logoUrl} alt="" />
-          <div><strong>OctoC2</strong><span>GitHub-native systems research</span></div>
+          <div><strong>OctoC2</strong><span>Encrypted multi-channel operations</span></div>
         </div>
         <div className="footer-links">
+          <a href={docsUrl('docs/README.md')}>Documentation index ↗</a>
           <a href="#quickstart">Quickstart</a>
           <a href="#security">Security</a>
           <a href="#verification">Verification</a>
+          <a href="#guides">All guides</a>
           <a href={repositoryUrl}>Repository ↗</a>
         </div>
         <p>Use only on systems and repositories you are explicitly authorized to test.</p>

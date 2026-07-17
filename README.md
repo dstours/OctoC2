@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  A GitHub-native, encrypted control plane for authorized systems research.
+  GitHub-native command-and-control for authorized security research, with encrypted multi-channel transport and resilient failover.
 </p>
 
 > [!IMPORTANT]
@@ -21,15 +21,25 @@ OctoC2 combines a TypeScript beacon, durable controller, local operator
 dashboard, and CLI. GitHub-backed and direct transports share one signed task
 protocol, one identity model, and the same result-ownership rules.
 
+**Documentation:** [Browse the complete manual](docs/README.md) or open the
+[documentation site](https://dstours.github.io/OctoC2/).
+
 ## Start here
 
 | I want to… | Read or run |
 |---|---|
 | Browse all documentation | [Documentation index](docs/README.md) |
-| Understand the system | [Architecture](#architecture) |
-| Set up a local environment | [Local evaluation quickstart](docs/QUICKSTART.md) |
+| Understand the system | [Architecture guide](docs/ARCHITECTURE.md) |
+| Install the toolchain and binaries | [Installation](docs/INSTALLATION.md) |
+| Configure the GitHub App, repos, and PATs | [GitHub setup](docs/GITHUB_SETUP.md) |
+| Complete a first local run | [Quickstart](docs/QUICKSTART.md) |
+| Configure every channel | [Channel guide](docs/CHANNELS.md) |
+| Use operator commands | [CLI reference](docs/CLI.md) |
+| Look up an environment variable | [Configuration reference](docs/CONFIGURATION.md) |
 | Configure listeners and certificates | [Operations and assurance](docs/PRODUCTION.md) |
 | Configure GitHub App recovery | [Recovery guide](docs/RECOVERY.md) |
+| Diagnose a failure | [Troubleshooting](docs/TROUBLESHOOTING.md) |
+| Contribute a change | [Development guide](docs/DEVELOPMENT.md) |
 | Review implementation and live evidence | [Verification traceability](docs/REMEDIATION_TRACEABILITY.md) |
 | Use the dashboard | [Dashboard guide](dashboard/README.md) |
 
