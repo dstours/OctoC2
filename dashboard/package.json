@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "lint": "eslint .",
-    "test": "bun test",
+    "test": "bun run src/testRunner.ts",
     "test:watch": "bun test --watch",
     "typecheck": "tsc --noEmit"
   },
