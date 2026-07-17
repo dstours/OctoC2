@@ -1,64 +1,332 @@
 import {
-  phaseCredentials,
-  phaseValidate,
-  phaseKeygen,
-  phaseAuthMode,
-  phaseTentacles,
   phaseAdvanced,
-  phaseWriteEnv,
   phaseBuildBeacon,
-  phaseDeadDrop,
+  phaseCredentials,
   phaseInstall,
+  phaseKeygen,
+  phaseServerRecovery,
+  phaseTentacles,
+  phaseValidate,
   phaseVerify,
+  phaseWriteEnv,
+  type SetupProxyPolicy,
   type SetupState,
 } from "./setup/phases.ts";
-import { wizardIntro, wizardOutro, promptSelect, promptText, promptConfirm } from "./setup/prompts.ts";
-import { loadEnvFile, findProjectRoot } from "./service.ts";
+import {
+  promptSelect,
+  promptText,
+  wizardIntro,
+  wizardOutro,
+} from "./setup/prompts.ts";
+import { findProjectRoot, loadEnvFile } from "./service.ts";
 import * as p from "@clack/prompts";
 
-const DIM   = "\x1b[2m";
+const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
 export interface SetupOptions {
   phase?: string;
 }
 
+function parseJsonRecord(
+  raw: string | undefined,
+  name: string,
+): Record<string, unknown> {
+  if (!raw) throw new Error(`${name} is required`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${name} must be valid JSON`);
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed)
+  ) {
+    throw new Error(`${name} must be a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function requireString(
+  vars: Record<string, string>,
+  name: string,
+): string {
+  const value = vars[name]?.trim();
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
+function requirePositiveInteger(value: unknown, name: string): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value <= 0
+  ) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function requireObject(
+  value: unknown,
+  name: string,
+): Record<string, unknown> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value)
+  ) {
+    throw new Error(`${name} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
 /**
- * Load an existing .env and build a partial SetupState from it.
- * Missing fields stay undefined — the wizard will prompt for them.
+ * Import only the remediated controller environment. Legacy setup files are
+ * rejected explicitly so an obsolete shared PAT/App-key beacon flow cannot be
+ * reintroduced silently.
  */
-function stateFromEnv(vars: Record<string, string>): Partial<SetupState> {
+export function stateFromEnv(
+  vars: Record<string, string>,
+): SetupState {
+  const legacyFields = [
+    "OCTOC2_GITHUB_TOKEN",
+    "SVC_APP_ID",
+    "SVC_INSTALLATION_ID",
+    "SVC_APP_PRIVATE_KEY",
+    "OCTOC2_APP_PRIVATE_KEY",
+    "SVC_PROXY_REPOS",
+  ].filter((name) => vars[name]?.trim());
+  if (legacyFields.length > 0) {
+    throw new Error(
+      `Legacy setup fields are not importable: ${legacyFields.join(", ")}. ` +
+      "Run guided setup to create separated controller credentials and signed recovery policy.",
+    );
+  }
+
+  const appPolicies = parseJsonRecord(
+    vars["OCTOC2_GITHUB_APP_POLICIES"],
+    "OCTOC2_GITHUB_APP_POLICIES",
+  );
+  const recoveryPolicies = parseJsonRecord(
+    vars["OCTOC2_RECOVERY_POLICIES"],
+    "OCTOC2_RECOVERY_POLICIES",
+  );
+  const beaconTokens = parseJsonRecord(
+    vars["OCTOC2_BEACON_API_TOKENS"],
+    "OCTOC2_BEACON_API_TOKENS",
+  );
+  const beaconIds = Object.keys(appPolicies);
+  if (
+    beaconIds.length !== 1 ||
+    Object.keys(recoveryPolicies).length !== 1 ||
+    Object.keys(beaconTokens).length !== 1 ||
+    !(beaconIds[0]! in recoveryPolicies) ||
+    !(beaconIds[0]! in beaconTokens)
+  ) {
+    throw new Error(
+      "Setup import requires exactly one matching beacon entry in the App, recovery, and controller-token policies",
+    );
+  }
+
+  const beaconId = beaconIds[0]!;
+  const appPolicy = requireObject(
+    appPolicies[beaconId],
+    `GitHub App policy for ${beaconId}`,
+  );
+  const recoveryPolicy = requireObject(
+    recoveryPolicies[beaconId],
+    `Recovery policy for ${beaconId}`,
+  );
+  const repository = requireObject(
+    appPolicy["repository"],
+    "GitHub App policy repository",
+  );
+  const owner = repository["owner"];
+  const repo = repository["repo"];
+  if (typeof owner !== "string" || typeof repo !== "string") {
+    throw new Error("GitHub App policy repository coordinates are invalid");
+  }
+
+  const primaryInstallationId = requirePositiveInteger(
+    appPolicy["installationId"],
+    "GitHub App installationId",
+  );
+  const rawAppProxies = appPolicy["proxyRepositories"] ?? [];
+  const rawRecoveryProxies = recoveryPolicy["proxyRepos"] ?? [];
+  if (!Array.isArray(rawAppProxies) || !Array.isArray(rawRecoveryProxies)) {
+    throw new Error("Imported proxy policies must be arrays");
+  }
+  if (rawAppProxies.length > 1 || rawRecoveryProxies.length > 1) {
+    throw new Error("Imported policy supports at most one proxy route per beacon");
+  }
+  const appProxyByRepo = new Map(
+    rawAppProxies.map((raw, index) => {
+      const proxy = requireObject(raw, `App proxy policy ${index}`);
+      const proxyRepository = requireObject(
+        proxy["repository"],
+        `App proxy policy ${index} repository`,
+      );
+      if (
+        typeof proxyRepository["owner"] !== "string" ||
+        typeof proxyRepository["repo"] !== "string"
+      ) {
+        throw new Error(`App proxy policy ${index} repository is invalid`);
+      }
+      return [
+        `${proxyRepository["owner"]}/${proxyRepository["repo"]}`.toLowerCase(),
+        requirePositiveInteger(
+          proxy["installationId"],
+          `App proxy policy ${index} installationId`,
+        ),
+      ] as const;
+    }),
+  );
+  const proxyPolicies: SetupProxyPolicy[] = rawRecoveryProxies.map(
+    (raw, index) => {
+      const proxy = requireObject(raw, `Recovery proxy policy ${index}`);
+      if (
+        typeof proxy["owner"] !== "string" ||
+        typeof proxy["repo"] !== "string" ||
+        proxy["innerKind"] !== "issues" ||
+        !Number.isSafeInteger(proxy["decoyIssue"]) ||
+        (proxy["decoyIssue"] as number) <= 0
+      ) {
+        throw new Error(`Recovery proxy policy ${index} is invalid`);
+      }
+      const key = `${proxy["owner"]}/${proxy["repo"]}`.toLowerCase();
+      const installationId = appProxyByRepo.get(key);
+      if (!installationId) {
+        throw new Error(
+          `Recovery proxy ${proxy["owner"]}/${proxy["repo"]} has no matching App policy`,
+        );
+      }
+      return {
+        owner: proxy["owner"],
+        repo: proxy["repo"],
+        installationId,
+        innerKind: "issues",
+        decoyIssue: proxy["decoyIssue"] as number,
+      };
+    },
+  );
+
+  const rawPriority = recoveryPolicy["tentaclePriority"];
+  if (
+    !Array.isArray(rawPriority) ||
+    rawPriority.some((value) => typeof value !== "string")
+  ) {
+    throw new Error("Imported recovery tentaclePriority is invalid");
+  }
+  const serverUrl = recoveryPolicy["serverUrl"];
+  const beaconControllerToken = beaconTokens[beaconId];
+  if (
+    typeof beaconControllerToken !== "string" ||
+    typeof recoveryPolicy["controllerToken"] !== "string" ||
+    recoveryPolicy["controllerToken"] !== beaconControllerToken ||
+    typeof recoveryPolicy["monitoringPublicKey"] !== "string" ||
+    typeof serverUrl !== "string"
+  ) {
+    throw new Error("Imported recovery/controller credential policy is invalid");
+  }
+
+  const sleepSeconds = recoveryPolicy["sleepSeconds"];
+  const jitter = recoveryPolicy["jitter"];
+  if (
+    typeof sleepSeconds !== "number" ||
+    !Number.isSafeInteger(sleepSeconds) ||
+    sleepSeconds <= 0 ||
+    typeof jitter !== "number" ||
+    !Number.isFinite(jitter) ||
+    jitter < 0 ||
+    jitter > 1
+  ) {
+    throw new Error("Imported recovery timing policy is invalid");
+  }
+  const appId = requirePositiveInteger(
+    Number(requireString(vars, "OCTOC2_GITHUB_APP_ID")),
+    "OCTOC2_GITHUB_APP_ID",
+  );
+
   return {
-    token: vars["OCTOC2_GITHUB_TOKEN"],
-    owner: vars["OCTOC2_REPO_OWNER"],
-    repo: vars["OCTOC2_REPO_NAME"],
-    operatorSecret: vars["OCTOC2_OPERATOR_SECRET"],
-    operatorPublicKey: vars["MONITORING_PUBKEY"],
-    authMode: vars["SVC_APP_ID"] ? "app" : "pat",
-    appId: vars["SVC_APP_ID"] ? parseInt(vars["SVC_APP_ID"], 10) : undefined,
-    installationId: vars["SVC_INSTALLATION_ID"] ? parseInt(vars["SVC_INSTALLATION_ID"], 10) : undefined,
-    tentaclePriority: vars["SVC_TENTACLE_PRIORITY"],
-    proxyRepos: vars["SVC_PROXY_REPOS"],
-    codespaceName: vars["SVC_GRPC_CODESPACE_NAME"],
-    githubUser: vars["SVC_GITHUB_USER"],
-    grpcPort: vars["SVC_GRPC_PORT"],
-    httpUrl: vars["SVC_HTTP_URL"],
-    sleepSeconds: vars["SVC_SLEEP"] ? parseInt(vars["SVC_SLEEP"], 10) : undefined,
-    jitter: vars["SVC_JITTER"] ? parseFloat(vars["SVC_JITTER"]) : undefined,
-    cleanupDays: vars["SVC_CLEANUP_DAYS"] ? parseInt(vars["SVC_CLEANUP_DAYS"], 10) : undefined,
-    logLevel: vars["OCTOC2_LOG_LEVEL"],
+    operatorGitHubToken: requireString(
+      vars,
+      "OCTOC2_OPERATOR_GITHUB_TOKEN",
+    ),
+    serverGitHubToken: requireString(vars, "OCTOC2_SERVER_GITHUB_TOKEN"),
+    owner,
+    repo,
+    operatorSecret: requireString(vars, "OCTOC2_OPERATOR_SECRET"),
+    operatorPublicKey: requireString(vars, "MONITORING_PUBKEY"),
+    operatorApiToken: requireString(vars, "OCTOC2_OPERATOR_API_TOKEN"),
+    beaconControllerToken,
+    beaconId,
+    appId,
+    installationId: primaryInstallationId,
+    appPrivateKeyFile: requireString(
+      vars,
+      "OCTOC2_GITHUB_APP_PRIVATE_KEY_FILE",
+    ),
+    recoveryRepoOwner: requireString(
+      vars,
+      "OCTOC2_RECOVERY_REPO_OWNER",
+    ),
+    recoveryRepoName: requireString(vars, "OCTOC2_RECOVERY_REPO_NAME"),
+    recoveryRepoRef: requireString(vars, "OCTOC2_RECOVERY_REPO_REF"),
+    recoveryWriteToken: requireString(
+      vars,
+      "OCTOC2_RECOVERY_WRITE_TOKEN",
+    ),
+    recoverySigningSecretFile: requireString(
+      vars,
+      "OCTOC2_RECOVERY_SIGNING_SECRET_FILE",
+    ),
+    recoverySigningPublicKey: requireString(
+      vars,
+      "OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY",
+    ),
+    recoverySigningKeyId: requireString(
+      vars,
+      "OCTOC2_RECOVERY_SIGNING_KEY_ID",
+    ),
+    tentaclePriority: rawPriority.join(","),
+    ...(proxyPolicies.length > 0 && {
+      proxyRepos: JSON.stringify(proxyPolicies),
+    }),
+    ...(
+      serverUrl !== "https://127.0.0.1:8080" &&
+      serverUrl !== "https://localhost:8080"
+      ? { httpUrl: serverUrl }
+      : {}
+    ),
+    sleepSeconds,
+    jitter,
+    enrollmentDir:
+      vars["OCTOC2_ENROLLMENT_DIR"]?.trim() || findProjectRoot(),
+    ...(vars["OCTOC2_LOG_LEVEL"]?.trim() && {
+      logLevel: vars["OCTOC2_LOG_LEVEL"].trim(),
+    }),
   };
 }
 
-export async function runSetup(opts: SetupOptions): Promise<void> {
+export async function runSetup(_opts: SetupOptions): Promise<void> {
   wizardIntro();
 
-  // ── Choose mode: fresh setup or import existing .env ─────────────────────
   const mode = await promptSelect<"fresh" | "import">({
     message: "How would you like to set up?",
     options: [
-      { value: "fresh", label: "Guided setup", hint: "walk through all configuration from scratch" },
-      { value: "import", label: "Import existing .env", hint: "load credentials from an existing file, then build/install" },
+      {
+        value: "fresh",
+        label: "Guided setup",
+        hint: "create separated credentials, identity enrollment, and signed recovery",
+      },
+      {
+        value: "import",
+        label: "Import modern .env",
+        hint: "rebuild the single beacon already represented by a remediated policy",
+      },
     ],
   });
 
@@ -67,118 +335,76 @@ export async function runSetup(opts: SetupOptions): Promise<void> {
   if (mode === "import") {
     const { resolve } = await import("node:path");
     const defaultPath = resolve(findProjectRoot(), ".env");
-
     const envPath = await promptText({
-      message: "Path to existing .env file",
+      message: "Path to existing controller .env file",
       initialValue: defaultPath,
       placeholder: defaultPath,
-      validate: (v) => {
+      validate: (value) => {
         const { existsSync } = require("node:fs");
-        if (!existsSync(v.trim())) return "File not found";
+        return existsSync(value.trim()) ? undefined : "File not found";
       },
     });
 
-    const vars = loadEnvFile(envPath.trim());
-    const partial = stateFromEnv(vars);
-
-    // Validate required fields
-    if (!partial.token || !partial.owner || !partial.repo) {
-      p.log.error("Missing required fields: OCTOC2_GITHUB_TOKEN, OCTOC2_REPO_OWNER, OCTOC2_REPO_NAME");
-      p.log.info(`${DIM}Falling back to guided setup…${RESET}`);
-      return runSetup({ ...opts }); // restart as fresh
+    try {
+      state = {
+        ...stateFromEnv(loadEnvFile(envPath.trim())),
+        envPath: envPath.trim(),
+      };
+    } catch (error) {
+      p.log.error((error as Error).message);
+      p.log.info(
+        `${DIM}Legacy files are not upgraded implicitly; choose guided setup.${RESET}`,
+      );
+      return;
     }
 
-    if (!partial.operatorSecret) {
-      p.log.warn("No OCTOC2_OPERATOR_SECRET found — will generate a new keypair");
-      const keys = await phaseKeygen(partial.token, partial.owner, partial.repo);
-      partial.operatorSecret = keys.operatorSecret;
-      partial.operatorPublicKey = keys.operatorPublicKey;
+    p.log.success(`Loaded remediated policy for beacon ${state.beaconId}`);
+  } else {
+    let credentials: Awaited<ReturnType<typeof phaseCredentials>>;
+    while (true) {
+      credentials = await phaseCredentials();
+      try {
+        await phaseValidate(
+          credentials.operatorGitHubToken,
+          credentials.owner,
+          credentials.repo,
+        );
+        break;
+      } catch (error) {
+        if ((error as Error).message === "RETRY_CREDENTIALS") continue;
+        throw error;
+      }
     }
+
+    const keys = await phaseKeygen(
+      credentials.operatorGitHubToken,
+      credentials.owner,
+      credentials.repo,
+    );
+    const recovery = await phaseServerRecovery(
+      credentials.owner,
+      credentials.operatorGitHubToken,
+      credentials.serverGitHubToken,
+    );
+    const tentaclePriority = await phaseTentacles();
+    const advanced = await phaseAdvanced(recovery.installationId);
 
     state = {
-      token: partial.token!,
-      owner: partial.owner!,
-      repo: partial.repo!,
-      operatorSecret: partial.operatorSecret!,
-      operatorPublicKey: partial.operatorPublicKey ?? "(from env)",
-      authMode: partial.authMode ?? "pat",
-      appId: partial.appId,
-      installationId: partial.installationId,
-      tentaclePriority: partial.tentaclePriority,
-      proxyRepos: partial.proxyRepos,
-      codespaceName: partial.codespaceName,
-      githubUser: partial.githubUser,
-      grpcPort: partial.grpcPort,
-      httpUrl: partial.httpUrl,
-      sleepSeconds: partial.sleepSeconds,
-      jitter: partial.jitter,
-      cleanupDays: partial.cleanupDays,
-      logLevel: partial.logLevel,
-      envPath: envPath.trim(),
+      ...credentials,
+      ...keys,
+      ...recovery,
+      ...(tentaclePriority !== undefined && { tentaclePriority }),
+      ...advanced,
     };
-
-    p.log.success(`Loaded ${Object.keys(vars).length} variables from ${envPath.trim()}`);
-
-    // Skip straight to build/install/verify
-    const beaconId = await phaseBuildBeacon(state);
-    await phaseDeadDrop(state, beaconId);
-    await phaseInstall();
-    await phaseVerify(state);
-    wizardOutro("Setup complete.");
-    return;
   }
 
-  // ── Fresh guided setup ───────────────────────────────────────────────────
+  const build = await phaseBuildBeacon(state);
+  state.beaconId = build.beaconId;
+  state.enrollmentDir = build.enrollmentDir;
+  if (build.binaryPath) state.binaryPath = build.binaryPath;
 
-  // Phase 1: Credentials (with retry loop)
-  let creds: { token: string; owner: string; repo: string };
-  while (true) {
-    creds = await phaseCredentials();
-    try {
-      // Phase 2: Validate
-      await phaseValidate(creds.token, creds.owner, creds.repo);
-      break;
-    } catch (err) {
-      if ((err as Error).message === "RETRY_CREDENTIALS") continue;
-      throw err;
-    }
-  }
-
-  // Phase 3: Keygen
-  const keys = await phaseKeygen(creds.token, creds.owner, creds.repo);
-
-  // Phase 4: Auth mode
-  const auth = await phaseAuthMode();
-
-  // Phase 5: Tentacle priority
-  const tentaclePriority = await phaseTentacles();
-
-  // Phase 6: Advanced config
-  const advanced = await phaseAdvanced();
-
-  // Assemble state
-  state = {
-    ...creds,
-    ...keys,
-    ...auth,
-    tentaclePriority,
-    ...advanced,
-  };
-
-  // Phase 7: Write .env
   state.envPath = await phaseWriteEnv(state);
-
-  // Phase 8: Build beacon
-  const beaconId = await phaseBuildBeacon(state);
-
-  // Phase 8b: Dead-drop (App auth only)
-  await phaseDeadDrop(state, beaconId);
-
-  // Phase 9: Install to PATH
   await phaseInstall();
-
-  // Phase 10: Next steps
   await phaseVerify(state);
-
   wizardOutro("Setup complete.");
 }

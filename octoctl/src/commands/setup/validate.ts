@@ -45,7 +45,7 @@ export async function checkRepo(
   } catch {
     return {
       exists: false, private: false, hasIssues: false, scopes: [],
-      error: "PAT is invalid or expired",
+      error: "Operator GitHub credential is invalid or expired",
     };
   }
 
@@ -61,7 +61,7 @@ export async function checkRepo(
     if (err.status === 404) {
       return {
         exists: false, private: false, hasIssues: false, scopes,
-        error: `Repository ${owner}/${repo} not found (or PAT lacks access)`,
+        error: `Repository ${owner}/${repo} not found (or the operator credential lacks access)`,
       };
     }
     return {

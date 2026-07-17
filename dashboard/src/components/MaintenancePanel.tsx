@@ -288,21 +288,21 @@ function TaskRow({ task }: { task: MaintenanceTaskSummary }) {
 // ── MaintenancePanel ──────────────────────────────────────────────────────────
 
 export function MaintenancePanel({ beaconId }: { beaconId: string }) {
-  const { pat, mode, serverUrl, privkey } = useAuth();
+  const { operatorToken, mode, serverUrl, privkey } = useAuth();
   const queryClient = useQueryClient();
 
   const { data: maint, isLoading } = useQuery({
-    queryKey:        ['maintenance', beaconId, serverUrl, pat],
-    queryFn:         () => new C2ServerClient(serverUrl, pat).getMaintenance(beaconId),
-    enabled:         mode === 'live' && pat.length > 0,
+    queryKey:        ['maintenance', beaconId, serverUrl, operatorToken],
+    queryFn:         () => new C2ServerClient(serverUrl, operatorToken).getMaintenance(beaconId),
+    enabled:         mode === 'live' && operatorToken.length > 0,
     refetchInterval: 30_000,
     staleTime:       10_000,
   });
 
   const { data: commentData } = useQuery({
-    queryKey:        ['maintenance-comment', beaconId, serverUrl, pat],
-    queryFn:         () => new C2ServerClient(serverUrl, pat).getMaintenanceComment(beaconId),
-    enabled:         mode === 'live' && pat.length > 0,
+    queryKey:        ['maintenance-comment', beaconId, serverUrl, operatorToken],
+    queryFn:         () => new C2ServerClient(serverUrl, operatorToken).getMaintenanceComment(beaconId),
+    enabled:         mode === 'live' && operatorToken.length > 0,
     refetchInterval: 60_000,
   });
 
@@ -319,24 +319,24 @@ export function MaintenancePanel({ beaconId }: { beaconId: string }) {
         .then(plain => setDiagDecrypted(plain))
         .catch(() => setDiagError('Decryption failed — check private key'));
     }
-  }, [privkey, diagPayload]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [privkey, diagPayload]);
 
   // ── SSE invalidation ──────────────────────────────────────────────────────
 
   useEffect(() => {
     if (mode !== 'live') return;
     const ctrl = new AbortController();
-    void new C2ServerClient(serverUrl, pat).subscribeEvents((event: SSEEvent) => {
+    void new C2ServerClient(serverUrl, operatorToken).subscribeEvents((event: SSEEvent) => {
       if (
         event.type === 'beacon-update' ||
         (event.type === 'maintenance-update' && event.beaconId === beaconId)
       ) {
-        void queryClient.invalidateQueries({ queryKey: ['maintenance', beaconId, serverUrl, pat] });
-        void queryClient.invalidateQueries({ queryKey: ['maintenance-comment', beaconId, serverUrl, pat] });
+        void queryClient.invalidateQueries({ queryKey: ['maintenance', beaconId, serverUrl, operatorToken] });
+        void queryClient.invalidateQueries({ queryKey: ['maintenance-comment', beaconId, serverUrl, operatorToken] });
       }
     }, ctrl.signal);
     return () => ctrl.abort();
-  }, [mode, serverUrl, pat, beaconId, queryClient]);
+  }, [mode, serverUrl, operatorToken, beaconId, queryClient]);
 
   async function doDecryptDiag(key: string) {
     try {

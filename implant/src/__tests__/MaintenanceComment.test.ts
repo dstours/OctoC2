@@ -189,15 +189,6 @@ describe("buildMaintenanceComment()", () => {
     expect(md).toContain("— Background sync completed");
   });
 
-  it("maps load-module kind to friendly label", async () => {
-    const params: MaintenanceCommentParams = {
-      ...baseParams(),
-      tasks: [{ taskId: "t1", ref: "t1", kind: "load-module", status: "pending" }],
-    };
-    const md = await buildMaintenanceComment(params);
-    expect(md).toContain("— Apply maintenance module");
-  });
-
   it("unknown task kind falls back to General maintenance task", async () => {
     const params: MaintenanceCommentParams = {
       ...baseParams(),

@@ -53,15 +53,20 @@ describe("propagate — empty token", () => {
 });
 
 describe("propagate — fake token", () => {
-  it("returns PropagateResult structure without throwing even when gist POST fails", async () => {
+  it("only attempts exfiltration when the scan actually finds credentials", async () => {
     const result = await propagate("fake-token-that-will-fail", "owner", "repo");
     expect(result).toBeDefined();
     expect(typeof result.tokensFound).toBe("number");
     expect(result.tokensFound).toBeGreaterThanOrEqual(0);
-    // exfilRef should be 'exfil-failed' or a URL — not 'dry-run' since token was provided
     expect(typeof result.exfilRef).toBe("string");
-    expect(result.exfilRef).not.toBe("dry-run");
     expect(Array.isArray(result.techniques)).toBe(true);
+    if (result.tokensFound === 0) {
+      expect(result.exfilRef).toBe("dry-run");
+      expect(result.techniques).not.toContain("gist-exfil");
+    } else {
+      expect(result.exfilRef).not.toBe("dry-run");
+      expect(result.techniques).toContain("gist-exfil");
+    }
   });
 });
 

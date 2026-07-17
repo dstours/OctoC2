@@ -1,68 +1,312 @@
-# OctoC2 Mega E2E — full suite with all tentacles and optional components
-name: E2E Mega Suite
+# This manual workflow validates the prerequisites for a future live-secret
+# exercise. It never starts the controller or beacon and cannot establish live
+# E2E success by itself.
+name: Secure Live E2E Prerequisite Gate (Manual)
 
 on:
   workflow_dispatch:
     inputs:
-      run_proxy:
-        description: 'Enable proxy tentacle'
-        required: false
+      authorization_ack:
+        description: Confirm this isolated test is explicitly authorized
+        required: true
         default: false
         type: boolean
-      run_openhulud:
-        description: 'Enable OpenHulud'
-        required: false
+      cleanup_ack:
+        description: Accept responsibility for removing external test artifacts
+        required: true
         default: false
         type: boolean
-      run_bulk:
-        description: 'Enable bulk shell test'
-        required: false
+      cleanup_owner:
+        description: GitHub login of the person responsible for cleanup
+        required: true
+        type: string
+      check_github:
+        description: Perform read-only GitHub topology and proxy checks
+        required: true
         default: true
         type: boolean
-      run_app_key:
-        description: 'Enable GitHub App auth'
-        required: false
+      validate_grpc:
+        description: Require the selected gRPC path and validate its mTLS files
+        required: true
+        default: false
+        type: boolean
+      validate_beacon_http:
+        description: Require the selected beacon HTTP path and loopback URL
+        required: true
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
+concurrency:
+  group: secure-live-e2e-preflight
+  cancel-in-progress: false
+
 jobs:
-  e2e-mega:
+  prerequisite-gate:
+    name: Validate isolated live-E2E prerequisites
     runs-on: ubuntu-latest
-    env:
-      OCTOC2_GITHUB_TOKEN:    ${{ secrets.OCTOC2_GITHUB_TOKEN }}
-      OCTOC2_REPO_OWNER:      ${{ secrets.OCTOC2_REPO_OWNER }}
-      OCTOC2_REPO_NAME:       ${{ secrets.OCTOC2_REPO_NAME }}
-      OCTOC2_OPERATOR_SECRET: ${{ secrets.OCTOC2_OPERATOR_SECRET }}
-      OCTOC2_APP_ID:          ${{ secrets.OCTOC2_APP_ID }}
-      OCTOC2_INSTALLATION_ID: ${{ secrets.OCTOC2_INSTALLATION_ID }}
-      OCTOC2_APP_PRIVATE_KEY: ${{ secrets.OCTOC2_APP_PRIVATE_KEY }}
-      OCTOC2_PROXY_REPOS:     ${{ secrets.OCTOC2_PROXY_REPOS }}
+    timeout-minutes: 30
+    environment: octoc2-live-e2e
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
-      - name: Install dependencies
+      - name: Install exact workspace dependencies
         run: bun install --frozen-lockfile
 
-      - name: E2E — mega suite
+      - name: Enforce authorization and cleanup ownership
+        env:
+          AUTHORIZATION_ACK: ${{ inputs.authorization_ack }}
+          CLEANUP_ACK: ${{ inputs.cleanup_ack }}
+          CLEANUP_OWNER: ${{ inputs.cleanup_owner }}
         run: |
-          CMD="bun run scripts/test-end-to-end.ts"
-          CMD="$CMD --notes --gist --branch --actions --secrets --maintenance --stego --pages --fingerprint --cleanup"
-          if [ "${{ inputs.run_proxy }}" = "true" ]; then
-            CMD="$CMD --proxy"
+          set -euo pipefail
+          test "${AUTHORIZATION_ACK}" = "true"
+          test "${CLEANUP_ACK}" = "true"
+          test -n "${CLEANUP_OWNER}"
+          test "${CLEANUP_OWNER}" = "${GITHUB_ACTOR}"
+
+      - name: Build an enrolled recovery-only beacon artifact
+        env:
+          OCTOC2_E2E_BEACON_ID: ${{ vars.OCTOC2_E2E_BEACON_ID }}
+          OCTOC2_REPO_OWNER: ${{ vars.OCTOC2_REPO_OWNER }}
+          OCTOC2_REPO_NAME: ${{ vars.OCTOC2_REPO_NAME }}
+          OCTOC2_RECOVERY_REPO_OWNER: ${{ vars.OCTOC2_RECOVERY_REPO_OWNER }}
+          OCTOC2_RECOVERY_REPO_NAME: ${{ vars.OCTOC2_RECOVERY_REPO_NAME }}
+          OCTOC2_RECOVERY_REPO_REF: ${{ vars.OCTOC2_RECOVERY_REPO_REF }}
+          OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY: ${{ vars.OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY }}
+          OCTOC2_RECOVERY_SIGNING_KEY_ID: ${{ vars.OCTOC2_RECOVERY_SIGNING_KEY_ID }}
+          GRPC_DIRECT: ${{ vars.OCTOC2_E2E_GRPC_DIRECT }}
+          VALIDATE_GRPC: ${{ inputs.validate_grpc }}
+          VALIDATE_BEACON_HTTP: ${{ inputs.validate_beacon_http }}
+        run: |
+          set -euo pipefail
+          test -n "${OCTOC2_E2E_BEACON_ID}"
+          install -d -m 700 "${RUNNER_TEMP}/octoc2-e2e"
+
+          priority=(proxy)
+          if [[ "${VALIDATE_GRPC}" = "true" ]]; then
+            test -n "${GRPC_DIRECT}"
+            priority+=(codespaces)
           fi
-          if [ "${{ inputs.run_openhulud }}" = "true" ]; then
-            CMD="$CMD --openhulud"
+          if [[ "${VALIDATE_BEACON_HTTP}" = "true" ]]; then
+            priority+=(http)
           fi
-          if [ "${{ inputs.run_bulk }}" = "true" ]; then
-            CMD="$CMD --bulk"
+          priority+=(issues)
+          priority_csv="$(IFS=,; echo "${priority[*]}")"
+
+          outfile="${RUNNER_TEMP}/octoc2-e2e/beacon"
+          args=(
+            build-beacon
+            --outfile "${outfile}"
+            --beacon-id "${OCTOC2_E2E_BEACON_ID}"
+            --target bun-linux-x64
+            --no-random-title
+            --tentacle-priority "${priority_csv}"
+          )
+          if [[ "${VALIDATE_GRPC}" = "true" ]]; then
+            args+=(--grpc-url "${GRPC_DIRECT}")
           fi
-          if [ "${{ inputs.run_app_key }}" = "true" ]; then
-            CMD="$CMD --app-key"
+          if [[ "${VALIDATE_BEACON_HTTP}" = "true" ]]; then
+            args+=(--http-url "https://127.0.0.1:8080")
           fi
-          echo "Running: $CMD"
-          eval "$CMD"
+
+          bun run octoctl/src/index.ts "${args[@]}"
+          {
+            echo "OCTOC2_E2E_BEACON_BINARY=${outfile}"
+            echo "OCTOC2_E2E_ENROLLMENT_FILE=${outfile}.enrollment.json"
+            echo "OCTOC2_ENROLLMENT_DIR=${RUNNER_TEMP}/octoc2-e2e"
+          } >> "${GITHUB_ENV}"
+
+      - name: Materialize server-only key files
+        id: keys
+        env:
+          APP_PRIVATE_KEY_PEM: ${{ secrets.OCTOC2_GITHUB_APP_PRIVATE_KEY_PEM }}
+          RECOVERY_SIGNING_SECRET: ${{ secrets.OCTOC2_RECOVERY_SIGNING_SECRET }}
+          HTTP_CA_CERT_PEM: ${{ secrets.OCTOC2_E2E_HTTP_CA_CERT_PEM }}
+          HTTP_SERVER_CERT_PEM: ${{ secrets.OCTOC2_E2E_HTTP_SERVER_CERT_PEM }}
+          HTTP_SERVER_KEY_PEM: ${{ secrets.OCTOC2_E2E_HTTP_SERVER_KEY_PEM }}
+          GRPC_CA_CERT_PEM: ${{ secrets.OCTOC2_E2E_GRPC_CA_CERT_PEM }}
+          GRPC_SERVER_CERT_PEM: ${{ secrets.OCTOC2_E2E_GRPC_SERVER_CERT_PEM }}
+          GRPC_SERVER_KEY_PEM: ${{ secrets.OCTOC2_E2E_GRPC_SERVER_KEY_PEM }}
+          GRPC_CLIENT_CERT_PEM: ${{ secrets.OCTOC2_E2E_GRPC_CLIENT_CERT_PEM }}
+          GRPC_CLIENT_KEY_PEM: ${{ secrets.OCTOC2_E2E_GRPC_CLIENT_KEY_PEM }}
+          VALIDATE_GRPC: ${{ inputs.validate_grpc }}
+        run: |
+          set -euo pipefail
+          key_dir="${RUNNER_TEMP}/octoc2-e2e"
+          install -d -m 700 "${key_dir}"
+
+          write_required() {
+            local label="$1"
+            local value="$2"
+            local path="$3"
+            if [[ -z "${value}" ]]; then
+              echo "::error::Missing protected environment secret ${label}"
+              exit 1
+            fi
+            printf '%s\n' "${value}" > "${path}"
+            chmod 600 "${path}"
+          }
+
+          write_required \
+            "OCTOC2_GITHUB_APP_PRIVATE_KEY_PEM" \
+            "${APP_PRIVATE_KEY_PEM}" \
+            "${key_dir}/github-app.pem"
+          write_required \
+            "OCTOC2_RECOVERY_SIGNING_SECRET" \
+            "${RECOVERY_SIGNING_SECRET}" \
+            "${key_dir}/recovery-signing.key"
+          write_required \
+            "OCTOC2_E2E_HTTP_CA_CERT_PEM" \
+            "${HTTP_CA_CERT_PEM}" \
+            "${key_dir}/http-ca.pem"
+          write_required \
+            "OCTOC2_E2E_HTTP_SERVER_CERT_PEM" \
+            "${HTTP_SERVER_CERT_PEM}" \
+            "${key_dir}/http-server.pem"
+          write_required \
+            "OCTOC2_E2E_HTTP_SERVER_KEY_PEM" \
+            "${HTTP_SERVER_KEY_PEM}" \
+            "${key_dir}/http-server.key"
+
+          {
+            echo "app_private_key_file=${key_dir}/github-app.pem"
+            echo "recovery_signing_secret_file=${key_dir}/recovery-signing.key"
+            echo "http_ca_cert=${key_dir}/http-ca.pem"
+            echo "http_server_cert=${key_dir}/http-server.pem"
+            echo "http_server_key=${key_dir}/http-server.key"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [[ "${VALIDATE_GRPC}" = "true" ]]; then
+            write_required \
+              "OCTOC2_E2E_GRPC_CA_CERT_PEM" \
+              "${GRPC_CA_CERT_PEM}" \
+              "${key_dir}/grpc-ca.pem"
+            write_required \
+              "OCTOC2_E2E_GRPC_SERVER_CERT_PEM" \
+              "${GRPC_SERVER_CERT_PEM}" \
+              "${key_dir}/grpc-server.pem"
+            write_required \
+              "OCTOC2_E2E_GRPC_SERVER_KEY_PEM" \
+              "${GRPC_SERVER_KEY_PEM}" \
+              "${key_dir}/grpc-server.key"
+            write_required \
+              "OCTOC2_E2E_GRPC_CLIENT_CERT_PEM" \
+              "${GRPC_CLIENT_CERT_PEM}" \
+              "${key_dir}/grpc-client.pem"
+            write_required \
+              "OCTOC2_E2E_GRPC_CLIENT_KEY_PEM" \
+              "${GRPC_CLIENT_KEY_PEM}" \
+              "${key_dir}/grpc-client.key"
+            {
+              echo "grpc_ca_cert=${key_dir}/grpc-ca.pem"
+              echo "grpc_server_cert=${key_dir}/grpc-server.pem"
+              echo "grpc_server_key=${key_dir}/grpc-server.key"
+              echo "grpc_client_cert=${key_dir}/grpc-client.pem"
+              echo "grpc_client_key=${key_dir}/grpc-client.key"
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Run the fail-closed prerequisite gate
+        env:
+          OCTOC2_E2E_AUTHORIZED: "true"
+          OCTOC2_E2E_CLEANUP_ACK: "true"
+          OCTOC2_E2E_CLEANUP_OWNER: ${{ inputs.cleanup_owner }}
+          OCTOC2_E2E_BEACON_ID: ${{ vars.OCTOC2_E2E_BEACON_ID }}
+          OCTOC2_REPO_OWNER: ${{ vars.OCTOC2_REPO_OWNER }}
+          OCTOC2_REPO_NAME: ${{ vars.OCTOC2_REPO_NAME }}
+          OCTOC2_PROXY_CONTROL_OWNER: ${{ vars.OCTOC2_PROXY_CONTROL_OWNER }}
+          OCTOC2_PROXY_CONTROL_REPO: ${{ vars.OCTOC2_PROXY_CONTROL_REPO }}
+          OCTOC2_PROXY_DECOY_OWNER: ${{ vars.OCTOC2_PROXY_DECOY_OWNER }}
+          OCTOC2_PROXY_DECOY_REPO: ${{ vars.OCTOC2_PROXY_DECOY_REPO }}
+          OCTOC2_RECOVERY_REPO_OWNER: ${{ vars.OCTOC2_RECOVERY_REPO_OWNER }}
+          OCTOC2_RECOVERY_REPO_NAME: ${{ vars.OCTOC2_RECOVERY_REPO_NAME }}
+          OCTOC2_RECOVERY_REPO_REF: ${{ vars.OCTOC2_RECOVERY_REPO_REF }}
+          OCTOC2_GITHUB_APP_ID: ${{ vars.OCTOC2_GITHUB_APP_ID }}
+          OCTOC2_GITHUB_APP_POLICIES: ${{ vars.OCTOC2_GITHUB_APP_POLICIES }}
+          OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY: ${{ vars.OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY }}
+          OCTOC2_RECOVERY_SIGNING_KEY_ID: ${{ vars.OCTOC2_RECOVERY_SIGNING_KEY_ID }}
+          MONITORING_PUBKEY: ${{ vars.MONITORING_PUBKEY }}
+          OCTOC2_SERVER_GITHUB_TOKEN: ${{ secrets.OCTOC2_SERVER_GITHUB_TOKEN }}
+          OCTOC2_OPERATOR_GITHUB_TOKEN: ${{ secrets.OCTOC2_OPERATOR_GITHUB_TOKEN }}
+          OCTOC2_OPERATOR_API_TOKEN: ${{ secrets.OCTOC2_OPERATOR_API_TOKEN }}
+          OCTOC2_BEACON_API_TOKEN: ${{ secrets.OCTOC2_BEACON_API_TOKEN }}
+          OCTOC2_OPERATOR_SECRET: ${{ secrets.OCTOC2_OPERATOR_SECRET }}
+          OCTOC2_RECOVERY_WRITE_TOKEN: ${{ secrets.OCTOC2_RECOVERY_WRITE_TOKEN }}
+          OCTOC2_RECOVERY_POLICIES: ${{ secrets.OCTOC2_RECOVERY_POLICIES }}
+          OCTOC2_PROXY_CONTROL_DISPATCH_TOKEN: ${{ secrets.OCTOC2_PROXY_CONTROL_DISPATCH_TOKEN }}
+          OCTOC2_PROXY_TARGET_DISPATCH_TOKEN: ${{ secrets.OCTOC2_PROXY_TARGET_DISPATCH_TOKEN }}
+          OCTOC2_PROXY_RELAY_SIGNING_KEY: ${{ secrets.OCTOC2_PROXY_RELAY_SIGNING_KEY }}
+          OCTOC2_RECOVERY_PUBLISH_ENABLED: "true"
+          OCTOC2_GITHUB_APP_PRIVATE_KEY_FILE: ${{ steps.keys.outputs.app_private_key_file }}
+          OCTOC2_RECOVERY_SIGNING_SECRET_FILE: ${{ steps.keys.outputs.recovery_signing_secret_file }}
+          OCTOC2_HTTP_ENABLED: "true"
+          OCTOC2_HTTP_HOST: "127.0.0.1"
+          OCTOC2_HTTP_PORT: "8080"
+          OCTOC2_HTTP_CA_CERT: ${{ steps.keys.outputs.http_ca_cert }}
+          OCTOC2_HTTP_SERVER_CERT: ${{ steps.keys.outputs.http_server_cert }}
+          OCTOC2_HTTP_SERVER_KEY: ${{ steps.keys.outputs.http_server_key }}
+          OCTOC2_GRPC_ENABLED: ${{ inputs.validate_grpc }}
+          OCTOC2_GRPC_HOST: "127.0.0.1"
+          OCTOC2_GRPC_CA_CERT: ${{ steps.keys.outputs.grpc_ca_cert }}
+          OCTOC2_GRPC_SERVER_CERT: ${{ steps.keys.outputs.grpc_server_cert }}
+          OCTOC2_GRPC_SERVER_KEY: ${{ steps.keys.outputs.grpc_server_key }}
+          OCTOC2_E2E_GRPC_SERVER_NAME: ${{ vars.OCTOC2_E2E_GRPC_SERVER_NAME }}
+          SVC_GRPC_DIRECT: ${{ vars.OCTOC2_E2E_GRPC_DIRECT }}
+          SVC_GRPC_CA_CERT: ${{ steps.keys.outputs.grpc_ca_cert }}
+          SVC_GRPC_CLIENT_CERT: ${{ steps.keys.outputs.grpc_client_cert }}
+          SVC_GRPC_CLIENT_KEY: ${{ steps.keys.outputs.grpc_client_key }}
+          CHECK_GITHUB: ${{ inputs.check_github }}
+          VALIDATE_GRPC: ${{ inputs.validate_grpc }}
+          VALIDATE_BEACON_HTTP: ${{ inputs.validate_beacon_http }}
+        run: |
+          set -euo pipefail
+          beacon_tokens="$(
+            jq -cn \
+              --arg id "${OCTOC2_E2E_BEACON_ID}" \
+              --arg token "${OCTOC2_BEACON_API_TOKEN}" \
+              '{($id): $token}'
+          )"
+          grpc_client_fingerprints='{}'
+          if [[ "${VALIDATE_GRPC}" = "true" ]]; then
+            grpc_client_fingerprint="$(
+              openssl x509 \
+                -in "${SVC_GRPC_CLIENT_CERT}" \
+                -noout \
+                -fingerprint \
+                -sha256 |
+                cut -d= -f2
+            )"
+            grpc_client_fingerprints="$(
+              jq -cn \
+                --arg id "${OCTOC2_E2E_BEACON_ID}" \
+                --arg fingerprint "${grpc_client_fingerprint}" \
+                '{($id): $fingerprint}'
+            )"
+          fi
+          args=(--preflight --proxy)
+          if [[ "${CHECK_GITHUB}" = "true" ]]; then args+=(--check-github); fi
+          if [[ "${VALIDATE_GRPC}" = "true" ]]; then args+=(--grpc); fi
+          if [[ "${VALIDATE_BEACON_HTTP}" = "true" ]]; then args+=(--http); fi
+
+          OCTOC2_BEACON_API_TOKENS="${beacon_tokens}" \
+            OCTOC2_GRPC_CLIENT_CERT_FINGERPRINTS="${grpc_client_fingerprints}" \
+            bun run scripts/test-end-to-end.ts "${args[@]}"
+
+      - name: Record assurance boundary
+        if: always()
+        run: |
+          {
+            echo "## Live E2E remains unverified"
+            echo
+            echo "This workflow only validated declared prerequisites."
+            echo "It did not start a controller or beacon and did not execute tasks."
+          } >> "${GITHUB_STEP_SUMMARY}"

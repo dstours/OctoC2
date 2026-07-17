@@ -14,12 +14,13 @@ export default defineConfig({
     include: ['libsodium-wrappers'],
   },
   server: {
-    port: 3000,
-    host: '0.0.0.0', // Needed for Codespaces port forwarding
+    port: 5173,
+    host: '127.0.0.1',
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'https://127.0.0.1:8080',
         changeOrigin: true,
+        secure: true,
       },
     },
   },

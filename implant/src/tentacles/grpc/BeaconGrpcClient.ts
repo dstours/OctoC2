@@ -1,15 +1,15 @@
 /**
  * OctoC2 — BeaconGrpcClient
  *
- * Wraps a @grpc/grpc-js channel for the BeaconService RPC calls.
- * Loads the proto definition from the inlined PROTO_DEFINITION string
- * by writing it to a temp file (proto-loader requires a file path).
+ * Wraps a mutually authenticated @grpc/grpc-js channel for BeaconService.
+ * The generated shared proto definition is parsed in memory so compiled
+ * beacons do not depend on writable temporary files.
  */
 
 import * as grpc        from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import * as protobuf    from "protobufjs";
-import { PROTO_DEFINITION }  from "./proto-def.ts";
+import { PROTO_DEFINITION }  from "@octoc2/shared/proto";
 
 // ── Internal proto types (keepCase:false → camelCase field names) ─────────────
 
@@ -22,6 +22,7 @@ interface CheckinReq {
   arch:      string;
   pid:       number;
   checkinAt: string;
+  identityEnvelope: string;
 }
 
 interface ProtoTask {
@@ -44,6 +45,8 @@ interface SubmitResultReq {
     data:        string;
     completedAt: string;
     signature:   string;
+    metadataJson: string;
+    hasData:      boolean;
   };
 }
 
@@ -73,6 +76,23 @@ interface BeaconServiceStub extends grpc.Client {
 export class BeaconGrpcClient {
   private stub: BeaconServiceStub | null = null;
 
+  constructor(
+    private readonly bearerToken: string,
+    private readonly tls: {
+      rootCerts: Buffer;
+      privateKey: Buffer;
+      certChain: Buffer;
+    },
+  ) {
+    if (!bearerToken) throw new Error("gRPC bearer token is required");
+  }
+
+  private metadata(): grpc.Metadata {
+    const metadata = new grpc.Metadata();
+    metadata.set("authorization", `Bearer ${this.bearerToken}`);
+    return metadata;
+  }
+
   // ── connect ──────────────────────────────────────────────────────────────────
 
   async connect(address: string): Promise<void> {
@@ -95,18 +115,21 @@ export class BeaconGrpcClient {
     const BeaconService = pkg["BeaconService"];
     if (!BeaconService) throw new Error("gRPC package definition missing BeaconService");
 
-    // Detect HTTPS URLs (Codespace public forwarded port or cloud gRPC endpoint).
-    // Strip the scheme and default to port 443 for the gRPC target address.
+    // Strip an HTTPS scheme for grpc-js. Plain HTTP is never accepted.
     let target: string;
-    let creds: grpc.ChannelCredentials;
     if (address.startsWith("https://")) {
       const url = new URL(address);
       target = `${url.hostname}:${url.port || "443"}`;
-      creds  = grpc.credentials.createSsl();
+    } else if (address.startsWith("http://")) {
+      throw new Error("insecure gRPC URLs are not permitted");
     } else {
       target = address;
-      creds  = grpc.credentials.createInsecure();
     }
+    const creds = grpc.credentials.createSsl(
+      this.tls.rootCerts,
+      this.tls.privateKey,
+      this.tls.certChain,
+    );
 
     this.stub = new BeaconService(target, creds) as unknown as BeaconServiceStub;
   }
@@ -116,7 +139,7 @@ export class BeaconGrpcClient {
   checkin(req: CheckinReq): Promise<CheckinResp> {
     return new Promise((resolve, reject) => {
       const opts: grpc.CallOptions = { deadline: new Date(Date.now() + 30_000) };
-      this.stub!.checkin(req, new grpc.Metadata(), opts, (err, res) => {
+      this.stub!.checkin(req, this.metadata(), opts, (err, res) => {
         if (err) return reject(err);
         resolve(res);
       });
@@ -128,7 +151,7 @@ export class BeaconGrpcClient {
   submitResult(req: SubmitResultReq): Promise<SubmitResultResp> {
     return new Promise((resolve, reject) => {
       const opts: grpc.CallOptions = { deadline: new Date(Date.now() + 30_000) };
-      this.stub!.submitResult(req, new grpc.Metadata(), opts, (err, res) => {
+      this.stub!.submitResult(req, this.metadata(), opts, (err, res) => {
         if (err) return reject(err);
         resolve(res);
       });

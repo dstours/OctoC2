@@ -24,6 +24,7 @@ import {
   runTentaclesHealth,
   buildChannels,
   computeChannelStats,
+  normalizeActiveChannel,
   printErrorDetails,
   statusDisplay,
   type TentaclesListResult,
@@ -84,6 +85,17 @@ async function captureJsonOutput(opts: Parameters<typeof runTentaclesList>[0]): 
   return JSON.parse(parts[parts.length - 1]!) as TentaclesListResult;
 }
 
+describe("active channel normalization", () => {
+  it("maps canonical numeric and historical string IDs to channel kinds", () => {
+    expect(normalizeActiveChannel(13)).toBe("http");
+    expect(normalizeActiveChannel("13")).toBe("http");
+    expect(normalizeActiveChannel("7b")).toBe("secrets");
+    expect(normalizeActiveChannel("notes")).toBe("notes");
+    expect(normalizeActiveChannel(8)).toBeNull();
+    expect(normalizeActiveChannel("unknown")).toBeNull();
+  });
+});
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("runTentaclesList — offline mode", () => {
@@ -91,7 +103,7 @@ describe("runTentaclesList — offline mode", () => {
     mockBeacons.length = 0;
   });
 
-  it("returns all 12 channel kinds in JSON output", async () => {
+  it("returns all selectable channel kinds in JSON output", async () => {
     mockBeacons.push(makeBeacon({ activeTentacle: "issues" }));
 
     const result = await captureJsonOutput({
@@ -211,7 +223,7 @@ describe("runTentaclesList — offline mode", () => {
     expect(Array.isArray(result.channels)).toBe(true);
   });
 
-  it("returns exactly 12 channels regardless of activeTentacle value", async () => {
+  it("returns the selectable catalog regardless of activeTentacle value", async () => {
     for (const kind of ALL_KINDS) {
       mockBeacons.length = 0;
       mockBeacons.push(makeBeacon({ activeTentacle: kind }));
@@ -459,7 +471,7 @@ describe("runTentaclesHealth — alias for runTentaclesList", () => {
     mockBeacons.length = 0;
   });
 
-  it("returns all 12 channels in JSON output (including pages and stego)", async () => {
+  it("returns all selectable channels in JSON output (including pages and stego)", async () => {
     mockBeacons.push(makeBeacon({ activeTentacle: "stego" }));
 
     // runTentaclesHealth === runTentaclesList; captureJsonOutput is equivalent

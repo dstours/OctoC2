@@ -73,7 +73,6 @@ function ResultOutput({ task, privkey, onSetPrivkey }: {
     if (privkey && encData && decrypted === null && decryptErr === null) {
       void doDecrypt(privkey);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [privkey, encData]);
 
   // Mark plaintext as notified (for ref tracking consistency)
@@ -81,7 +80,6 @@ function ResultOutput({ task, privkey, onSetPrivkey }: {
     if (!notifiedRef.current && r?.output && !r?.data) {
       notifiedRef.current = true;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [r?.output, r?.data]);
 
   if (!r) return null;
@@ -164,9 +162,9 @@ function BeaconResultGroup({ beaconId, privkey, onSetPrivkey }: {
   privkey:      string | null;
   onSetPrivkey: (key: string) => void;
 }) {
-  const { serverUrl, pat } = useAuth();
+  const { serverUrl, operatorToken } = useAuth();
 
-  const client = new C2ServerClient(serverUrl ?? '', pat);
+  const client = new C2ServerClient(serverUrl ?? '', operatorToken);
 
   const { data: tasks, isLoading, isError } = useQuery<ServerTask[]>({
     queryKey: ['results', beaconId],

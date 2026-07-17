@@ -13,7 +13,10 @@ function makeFetchMock(responses: Array<{ ok: boolean; status: number; body: unk
   let idx = 0;
 
   const mockFetch = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    calls.push({ url: String(url), init });
+    calls.push({
+      url: String(url),
+      ...(init !== undefined && { init }),
+    });
     const resp = responses[idx] ?? responses[responses.length - 1]!;
     idx++;
     const bodyText = JSON.stringify(resp.body);

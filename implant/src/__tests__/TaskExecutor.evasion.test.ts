@@ -97,6 +97,18 @@ describe("evasion task — sleep", () => {
   });
 });
 
+describe("evasion task — self_delete", () => {
+  it("defers deletion until the signed result is acknowledged", async () => {
+    const { result, directive } = await executor.execute(
+      makeEvasionTask("self_delete"),
+      BEACON_ID,
+    );
+    expect(result.success).toBe(true);
+    expect(directive).toEqual({ kind: "self_delete" });
+    expect(result.output).toContain("scheduled after result acknowledgement");
+  });
+});
+
 describe("evasion task — persist", () => {
   it("returns JSON payload with 'method' field", async () => {
     const { result } = await executor.execute(

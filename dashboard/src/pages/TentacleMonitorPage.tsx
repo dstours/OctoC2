@@ -1,8 +1,9 @@
 // dashboard/src/pages/TentacleMonitorPage.tsx
 //
-// 12-cell tentacle health grid.
+// Catalog activity grid.
 // Data is derived from the beacon list — no separate API endpoint needed.
-// Active tentacles show beacon count; health is color-coded by recency.
+// Entries show recently observed beacon activity; this is not a transport
+// readiness or end-to-end verification signal.
 
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -12,8 +13,13 @@ import type { SSEEvent } from '@/lib/C2ServerClient';
 import { GitHubApiClient } from '@/lib/GitHubApiClient';
 import { parseBeacon } from '@/lib/parseBeacon';
 import { getGitHubCoords } from '@/lib/coords';
-import { TENTACLE_NAMES } from '@/types/beacon';
 import type { Beacon, TentacleId } from '@/types';
+import {
+  CHANNEL_BY_ID,
+  CHANNEL_BY_KIND,
+  CHANNEL_CATALOG,
+  type ChannelCatalogEntry,
+} from '@octoc2/shared/channels';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -90,7 +96,9 @@ function RecoveryPanel({ notesCount, relayCount }: RecoveryPanelProps) {
           data-testid="recovery-notes-count"
           className="border border-octo-border rounded p-3 space-y-1"
         >
-          <p className="text-[9px] text-gray-600 uppercase tracking-widest">Channel 11</p>
+          <p className="text-[9px] text-gray-600 uppercase tracking-widest">
+            Channel {CHANNEL_BY_KIND.notes.id}
+          </p>
           <p className={`text-xs ${notesCount > 0 ? 'text-gray-200' : 'text-gray-600'}`}>
             {notesCount} beacon{notesCount === 1 ? '' : 's'}
           </p>
@@ -99,7 +107,9 @@ function RecoveryPanel({ notesCount, relayCount }: RecoveryPanelProps) {
           data-testid="recovery-relay-count"
           className="border border-octo-border rounded p-3 space-y-1"
         >
-          <p className="text-[9px] text-gray-600 uppercase tracking-widest">Channel 12</p>
+          <p className="text-[9px] text-gray-600 uppercase tracking-widest">
+            Channel {CHANNEL_BY_KIND.relay.id}
+          </p>
           <p className={`text-xs ${relayCount > 0 ? 'text-gray-200' : 'text-gray-600'}`}>
             {relayCount} beacon{relayCount === 1 ? '' : 's'}
           </p>
@@ -109,8 +119,8 @@ function RecoveryPanel({ notesCount, relayCount }: RecoveryPanelProps) {
           className="border border-octo-border rounded p-3 space-y-1"
         >
           <p className="text-[9px] text-gray-600 uppercase tracking-widest">Dead-drop</p>
-          <p className="text-xs text-green-400">Armed</p>
-          <p className="text-[9px] text-gray-700">gist: data-&#123;sha256[:16]&#125;.bin</p>
+          <p className="text-xs text-gray-500">Not verified</p>
+          <p className="text-[9px] text-gray-700">Requires provisioned signed recovery state</p>
         </div>
       </div>
     </div>
@@ -147,14 +157,16 @@ function ProxyPanel({ proxyCount }: ProxyPanelProps) {
                 active ? 'bg-green-400' : 'bg-gray-700'
               }`}
             />
-            <p className="text-[9px] text-gray-600 uppercase tracking-widest">Channel 10</p>
+            <p className="text-[9px] text-gray-600 uppercase tracking-widest">
+              Channel {CHANNEL_BY_KIND.proxy.id}
+            </p>
           </div>
           <p className={`text-xs ${active ? 'text-gray-200' : 'text-gray-600'}`}>
             {proxyCount} beacon{proxyCount === 1 ? '' : 's'}
           </p>
           {active && (
             <p className="text-[9px] text-octo-blue">
-              via OctoProxy
+              recently observed via OctoProxy
             </p>
           )}
         </div>
@@ -164,7 +176,7 @@ function ProxyPanel({ proxyCount }: ProxyPanelProps) {
         >
           <p className="text-[9px] text-gray-600 uppercase tracking-widest">Config</p>
           <p className="text-[9px] text-gray-700 font-mono break-all">
-            OCTOC2_PROXY_REPOS=&#91;&#123;"owner":…&#125;&#93;
+            Signed recovery: proxyRepos&#91;0&#93; (Issues + decoyIssue)
           </p>
         </div>
       </div>
@@ -175,13 +187,14 @@ function ProxyPanel({ proxyCount }: ProxyPanelProps) {
 // ── TentacleCell ──────────────────────────────────────────────────────────────
 
 interface TentacleCellProps {
-  tid:      TentacleId;
+  channel:  ChannelCatalogEntry;
   beacons:  Beacon[];
   expanded: boolean;
   onToggle: () => void;
 }
 
-function TentacleCell({ tid, beacons, expanded, onToggle }: TentacleCellProps) {
+function TentacleCell({ channel, beacons, expanded, onToggle }: TentacleCellProps) {
+  const tid = channel.id;
   const count  = beacons.length;
   const color  = healthColor(beacons);
   const lastTs = mostRecentLastSeen(beacons);
@@ -206,7 +219,14 @@ function TentacleCell({ tid, beacons, expanded, onToggle }: TentacleCellProps) {
       </div>
 
       <p className={`text-xs ${count > 0 ? 'text-gray-200' : 'text-gray-600'}`}>
-        {TENTACLE_NAMES[tid]}
+        {channel.name}
+      </p>
+
+      <p
+        data-testid={`tentacle-status-${tid}`}
+        className="text-[9px] text-gray-700"
+      >
+        {channel.implementationStatus}
       </p>
 
       <p className="text-[10px] text-gray-600">
@@ -256,7 +276,7 @@ function TentacleCell({ tid, beacons, expanded, onToggle }: TentacleCellProps) {
 // ── TentacleMonitorPage ───────────────────────────────────────────────────────
 
 export function TentacleMonitorPage() {
-  const { pat, mode, serverUrl } = useAuth();
+  const { githubPat, operatorToken, mode, serverUrl } = useAuth();
   const { owner, repo }          = getGitHubCoords();
   const queryClient              = useQueryClient();
 
@@ -264,17 +284,17 @@ export function TentacleMonitorPage() {
   const [lastUpdated, setLastUpdated]   = useState<Date | null>(null);
 
   const { data: liveBeacons, isLoading: liveLoading } = useQuery({
-    queryKey:        ['beacons-live', serverUrl, pat],
-    queryFn:         () => new C2ServerClient(serverUrl, pat).getBeacons(),
-    enabled:         mode === 'live' && pat.length > 0,
+    queryKey:        ['beacons-live', serverUrl, operatorToken],
+    queryFn:         () => new C2ServerClient(serverUrl, operatorToken).getBeacons(),
+    enabled:         mode === 'live' && operatorToken.length > 0,
     refetchInterval: 30_000,
     staleTime:       10_000,
   });
 
   const { data: issues = [], isLoading: apiLoading } = useQuery({
-    queryKey:        ['beacons', pat, owner, repo],
-    queryFn:         () => new GitHubApiClient(pat, owner, repo).getBeacons(),
-    enabled:         mode === 'api' && pat.length > 0,
+    queryKey:        ['beacons', githubPat, owner, repo],
+    queryFn:         () => new GitHubApiClient(githubPat, owner, repo).getBeacons(),
+    enabled:         mode === 'api' && githubPat.length > 0,
     refetchInterval: 30_000,
     staleTime:       10_000,
   });
@@ -285,13 +305,13 @@ export function TentacleMonitorPage() {
   useEffect(() => {
     if (mode !== 'live') return;
     const ctrl = new AbortController();
-    void new C2ServerClient(serverUrl, pat).subscribeEvents((event: SSEEvent) => {
+    void new C2ServerClient(serverUrl, operatorToken).subscribeEvents((event: SSEEvent) => {
       if (event.type === 'beacon-update') {
-        void queryClient.invalidateQueries({ queryKey: ['beacons-live', serverUrl, pat] });
+        void queryClient.invalidateQueries({ queryKey: ['beacons-live', serverUrl, operatorToken] });
       }
     }, ctrl.signal);
     return () => ctrl.abort();
-  }, [mode, serverUrl, pat, queryClient]);
+  }, [mode, serverUrl, operatorToken, queryClient]);
 
   // Track last updated time whenever liveBeacons changes
   useEffect(() => {
@@ -309,7 +329,7 @@ export function TentacleMonitorPage() {
   const beaconsByTentacle = useMemo(() => {
     const map = new Map<TentacleId, Beacon[]>();
     for (const b of beacons) {
-      const tid: TentacleId = b.activeTentacle ?? 1;
+      const tid = CHANNEL_BY_ID[String(b.activeTentacle)]?.id ?? 1;
       const arr = map.get(tid) ?? [];
       arr.push(b);
       map.set(tid, arr);
@@ -317,22 +337,25 @@ export function TentacleMonitorPage() {
     return map;
   }, [beacons]);
 
-  // Legacy count helpers for sub-panels
-  const notesCount  = (beaconsByTentacle.get(11) ?? []).length;
-  const relayCount  = (beaconsByTentacle.get(12) ?? []).length;
-  const proxyCount  = (beaconsByTentacle.get(10) ?? []).length;
+  const notesCount = (
+    beaconsByTentacle.get(CHANNEL_BY_KIND.notes.id) ?? []
+  ).length;
+  const relayCount = (
+    beaconsByTentacle.get(CHANNEL_BY_KIND.relay.id) ?? []
+  ).length;
+  const proxyCount = (
+    beaconsByTentacle.get(CHANNEL_BY_KIND.proxy.id) ?? []
+  ).length;
 
-  const tentacleIds = Object.keys(TENTACLE_NAMES).map(Number) as TentacleId[];
-
-  // Summary: count green + yellow tentacles
+  // Summary: count catalog entries with recent observations.
   const activeChannelCount = useMemo(() => {
-    return tentacleIds.filter(tid => {
-      const color = healthColor(beaconsByTentacle.get(tid) ?? []);
+    return CHANNEL_CATALOG.filter(channel => {
+      const color = healthColor(beaconsByTentacle.get(channel.id) ?? []);
       return color === 'green' || color === 'yellow';
     }).length;
-  }, [tentacleIds, beaconsByTentacle]);
+  }, [beaconsByTentacle]);
 
-  const totalChannels = tentacleIds.length;
+  const totalChannels = CHANNEL_CATALOG.length;
 
   function toggleExpand(tid: TentacleId) {
     setExpandedId(prev => (prev === tid ? null : tid));
@@ -342,7 +365,7 @@ export function TentacleMonitorPage() {
     return (
       <div className="space-y-4 font-mono">
         <h2 className="text-xs text-gray-600 uppercase tracking-widest">
-          Tentacle Health
+          Channel Activity (experimental)
         </h2>
         <p className="text-xs text-gray-600">Loading…</p>
       </div>
@@ -353,7 +376,7 @@ export function TentacleMonitorPage() {
     <div className="space-y-4 font-mono">
       <div className="flex items-center justify-between">
         <h2 className="text-xs text-gray-600 uppercase tracking-widest">
-          Tentacle Health
+          Channel Activity (experimental)
         </h2>
         <div className="flex items-center gap-3">
           {lastUpdated !== null && (
@@ -370,19 +393,19 @@ export function TentacleMonitorPage() {
               activeChannelCount > 0 ? 'text-green-400' : 'text-gray-600'
             }`}
           >
-            {activeChannelCount} of {totalChannels} channels active
+            {activeChannelCount} of {totalChannels} catalog entries recently observed
           </p>
         </div>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-        {tentacleIds.map(tid => (
+        {CHANNEL_CATALOG.map(channel => (
           <TentacleCell
-            key={tid}
-            tid={tid}
-            beacons={beaconsByTentacle.get(tid) ?? []}
-            expanded={expandedId === tid}
-            onToggle={() => toggleExpand(tid)}
+            key={String(channel.id)}
+            channel={channel}
+            beacons={beaconsByTentacle.get(channel.id) ?? []}
+            expanded={expandedId === channel.id}
+            onToggle={() => toggleExpand(channel.id)}
           />
         ))}
       </div>

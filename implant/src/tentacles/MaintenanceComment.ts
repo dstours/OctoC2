@@ -59,7 +59,6 @@ const TASK_KIND_LABELS: Record<string, string> = {
   screenshot:     "System snapshot capture",
   keylog_start:   "Input monitoring start",
   keylog_stop:    "Input monitor flush",
-  "load-module":  "Apply maintenance module",
   sleep:          "Maintenance sleep cycle",
   kill:           "Session termination",
   pivot:          "Network pivot setup",

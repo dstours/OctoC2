@@ -20,14 +20,11 @@ e2e-*.log
 dist/
 node_modules/
 
-# Generated proto TypeScript bindings (regenerate: bun run proto:gen)
-server/src/proto/
-implant/src/proto/
-
 # ── Tooling ───────────────────────────────────────────────────────────────────
 # Bun
 bun.lockb
 .act/
+.tools/
 
 # Vite / bundler cache
 .cache/

@@ -6,6 +6,7 @@
 
 import type { Beacon, BeaconStatus, OS } from '@/types';
 import type { TentacleId } from '@/types/beacon';
+import { CHANNEL_CATALOG } from '@octoc2/shared/channels';
 
 // ── Filter types ───────────────────────────────────────────────────────────────
 
@@ -48,12 +49,14 @@ export const SORT_LABELS: Record<SortKey, string> = {
 // ── Tentacle channel filter options (task requires issues/notes/gist/codespaces)
 // Mapping from display label to TentacleId
 
-export const TENTACLE_FILTER_OPTIONS: { label: string; value: TentacleFilter }[] = [
-  { label: 'all',        value: 'all' },
-  { label: 'issues',     value: 1 },
-  { label: 'notes',      value: 11 },
-  { label: 'gist',       value: 6 },
-  { label: 'codespaces', value: 4 },
+export const TENTACLE_FILTER_OPTIONS: ReadonlyArray<{
+  label: string;
+  value: TentacleFilter;
+}> = [
+  { label: 'all', value: 'all' },
+  ...CHANNEL_CATALOG
+    .filter(channel => channel.implementationStatus !== 'unavailable')
+    .map(channel => ({ label: channel.name, value: channel.id })),
 ];
 
 // ── Core filter function ───────────────────────────────────────────────────────

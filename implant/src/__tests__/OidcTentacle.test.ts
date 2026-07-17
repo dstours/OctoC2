@@ -9,7 +9,7 @@ mock.module("@octokit/rest", () => ({
 }));
 
 import { OidcTentacle } from "../tentacles/OidcTentacle.ts";
-import type { BeaconConfig } from "../types.ts";
+import type { BeaconConfig, CheckinPayload } from "../types.ts";
 import {
   generateKeyPair,
   encryptBox,
@@ -34,7 +34,8 @@ function makeConfig(extra: Partial<BeaconConfig> = {}): BeaconConfig {
   } as BeaconConfig;
 }
 
-const CHECKIN_PAYLOAD = {
+const CHECKIN_AT = new Date().toISOString();
+const CHECKIN_PAYLOAD: CheckinPayload = {
   beaconId:  "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
   publicKey: "",
   hostname:  "runner-host",
@@ -42,7 +43,28 @@ const CHECKIN_PAYLOAD = {
   os:        "linux",
   arch:      "x64",
   pid:       1234,
-  checkinAt: new Date().toISOString(),
+  checkinAt: CHECKIN_AT,
+  identity: {
+    protocol: "octoc2",
+    version: 1,
+    kind: "checkin",
+    signerId: "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+    keyId: "ed25519:test",
+    issuedAt: CHECKIN_AT,
+    sequence: 1,
+    payload: {
+      beaconId: "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+      encryptionPublicKey: "",
+      signingPublicKey: "test-public-key",
+      hostname: "runner-host",
+      username: "runner",
+      os: "linux",
+      arch: "x64",
+      pid: 1234,
+      checkinAt: CHECKIN_AT,
+    },
+    signature: "test-signature",
+  },
 };
 
 // Save and restore env vars around each test
@@ -108,8 +130,19 @@ describe("OidcTentacle.isAvailable()", () => {
   it("returns true when OIDC env vars are present (delegates to isOidcAvailable)", async () => {
     process.env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "tok_xyz";
     process.env["ACTIONS_ID_TOKEN_REQUEST_URL"]   = "https://example.com/oidc";
-    const t = new OidcTentacle(makeConfig());
+    const t = new OidcTentacle(makeConfig({
+      serverUrl: "https://c2.example.com",
+    }));
     expect(await t.isAvailable()).toBe(true);
+  });
+
+  it("returns false when the controller URL is not HTTPS", async () => {
+    process.env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "tok_xyz";
+    process.env["ACTIONS_ID_TOKEN_REQUEST_URL"] = "https://example.com/oidc";
+    const t = new OidcTentacle(makeConfig({
+      serverUrl: "http://127.0.0.1:8080",
+    }));
+    expect(await t.isAvailable()).toBe(false);
   });
 
   it("returns false (never throws) even when isOidcAvailable would throw", async () => {
@@ -265,7 +298,7 @@ describe("OidcTentacle.checkin()", () => {
 
       // Verify the checkin POST body
       expect((capturedBody as any).jwt).toBe(fakeJwt);
-      expect(typeof (capturedBody as any).pubkey).toBe("string");
+      expect((capturedBody as any).checkin).toEqual(CHECKIN_PAYLOAD);
 
       // Returned tasks should be the decrypted task
       expect(tasks).toHaveLength(1);
@@ -307,6 +340,17 @@ describe("OidcTentacle.checkin()", () => {
 
     const t = new OidcTentacle(makeConfig());
     await expect(t.checkin(CHECKIN_PAYLOAD)).rejects.toThrow("serverUrl");
+  });
+
+  it("refuses a plaintext controller URL before fetching a JWT", async () => {
+    process.env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "req-tok";
+    process.env["ACTIONS_ID_TOKEN_REQUEST_URL"] =
+      "https://oidc.example.com/token";
+
+    const t = new OidcTentacle(makeConfig({
+      serverUrl: "http://127.0.0.1:8080",
+    }));
+    await expect(t.checkin(CHECKIN_PAYLOAD)).rejects.toThrow("must use HTTPS");
   });
 });
 
@@ -378,6 +422,23 @@ describe("OidcTentacle.submitResult()", () => {
     await expect(t.submitResult({
       taskId: "t1", beaconId: "b1", success: true, output: "", completedAt: "",
     })).rejects.toThrow("serverUrl");
+  });
+
+  it("refuses a plaintext controller URL before fetching a JWT", async () => {
+    process.env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "req-tok";
+    process.env["ACTIONS_ID_TOKEN_REQUEST_URL"] =
+      "https://oidc.example.com/token";
+
+    const t = new OidcTentacle(makeConfig({
+      serverUrl: "http://127.0.0.1:8080",
+    }));
+    await expect(t.submitResult({
+      taskId: "t1",
+      beaconId: "b1",
+      success: true,
+      output: "",
+      completedAt: "",
+    })).rejects.toThrow("must use HTTPS");
   });
 });
 

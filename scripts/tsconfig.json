@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true,
+    "sourceMap": false,
+    "types": ["bun-types"]
+  },
+  "include": ["test-end-to-end.ts", "__tests__/test-end-to-end.test.ts"]
+}

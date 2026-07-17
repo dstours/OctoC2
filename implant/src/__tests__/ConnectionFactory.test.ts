@@ -1,6 +1,31 @@
 import { describe, it, expect } from "bun:test";
 import { ConnectionFactory } from "../factory/ConnectionFactory.ts";
-import type { ITentacle, TentacleKind, CheckinPayload } from "../types.ts";
+import type {
+  CheckinPayload,
+  ITentacle,
+  ResultSubmissionOutcome,
+  TaskResult,
+  TentacleKind,
+} from "../types.ts";
+
+function proxyLease(owner: string, repo: string) {
+  return {
+    version: 1 as const,
+    leaseId: `lease-${repo}`,
+    beaconId: "test-beacon",
+    installationId: 99,
+    token: `ghs-${repo}`,
+    repository: { owner, repo },
+    permissions: {
+      metadata: "read" as const,
+      issues: "write" as const,
+      variables: "read" as const,
+    },
+    issuedAt: "2026-07-16T12:00:00.000Z",
+    renewAfter: "2026-07-16T12:50:00.000Z",
+    expiresAt: "2026-07-16T13:00:00.000Z",
+  };
+}
 
 function makeConfig(
   priority: TentacleKind[] | Partial<{ tentaclePriority: TentacleKind[]; proxyRepos: import("../types.ts").ProxyConfig[] }> = ["issues"]
@@ -35,7 +60,25 @@ function makeTentacle(kind: TentacleKind, available: boolean): ITentacle {
     kind,
     isAvailable: async () => available,
     checkin: async () => [],
-    submitResult: async () => {},
+    submitResult: async () => ({
+      artifactWritten: false,
+      controllerAccepted: false,
+      channel: kind,
+      acceptance: null,
+    }),
+    teardown: async () => {},
+  };
+}
+
+function makeSubmissionTentacle(
+  kind: TentacleKind,
+  submit: () => Promise<ResultSubmissionOutcome>,
+): ITentacle {
+  return {
+    kind,
+    isAvailable: async () => true,
+    checkin: async () => [],
+    submitResult: submit,
     teardown: async () => {},
   };
 }
@@ -43,6 +86,14 @@ function makeTentacle(kind: TentacleKind, available: boolean): ITentacle {
 const DUMMY_PAYLOAD: CheckinPayload = {
   beaconId: "x", publicKey: "", hostname: "", username: "",
   os: "", arch: "", pid: 1, checkinAt: "",
+};
+
+const DUMMY_RESULT: TaskResult = {
+  taskId: "task-1",
+  beaconId: "test-beacon",
+  success: true,
+  output: "ok",
+  completedAt: "2026-07-16T12:00:00.000Z",
 };
 
 describe("ConnectionFactory.isFullyExhausted", () => {
@@ -146,18 +197,48 @@ describe("ConnectionFactory.setProxyTentacles", () => {
 });
 
 describe("ConnectionFactory.getTentacles (proxy)", () => {
-  it("creates one OctoProxyTentacle per entry in config.proxyRepos", () => {
+  it("creates the configured OctoProxyTentacle", () => {
     const config = makeConfig({
       tentaclePriority: ["proxy"],
       proxyRepos: [
-        { owner: "decoy1", repo: "fake-dots", innerKind: "issues" },
-        { owner: "decoy2", repo: "config-dump", innerKind: "notes" },
+        {
+          owner: "decoy1",
+          repo: "fake-dots",
+          innerKind: "issues",
+          decoyIssue: 7,
+          githubTokenLease: proxyLease("decoy1", "fake-dots"),
+        },
       ],
     });
     const factory = new ConnectionFactory({ config });
     const tentacles = factory.getTentacles();
     const proxies = tentacles.filter(t => t.kind === "proxy");
-    expect(proxies).toHaveLength(2);
+    expect(proxies).toHaveLength(1);
+  });
+
+  it("rejects multiple proxy routes for the same beacon", () => {
+    const route = {
+      owner: "decoy1",
+      repo: "fake-dots",
+      innerKind: "issues" as const,
+      decoyIssue: 7,
+      githubTokenLease: proxyLease("decoy1", "fake-dots"),
+    };
+    const config = makeConfig({
+      tentaclePriority: ["proxy"],
+      proxyRepos: [
+        route,
+        {
+          ...route,
+          owner: "decoy2",
+          repo: "other",
+          decoyIssue: 8,
+          githubTokenLease: proxyLease("decoy2", "other"),
+        },
+      ],
+    });
+    const factory = new ConnectionFactory({ config });
+    expect(() => factory.getTentacles()).toThrow("At most one proxy route");
   });
 
   it("creates no proxy tentacles when proxyRepos is empty", () => {
@@ -181,5 +262,93 @@ describe("ConnectionFactory.teardown", () => {
     f.register(makeTentacle("issues", true));
     // We verify indirectly: isFullyExhausted should be false after re-register
     expect(f.isFullyExhausted()).toBe(false);
+  });
+});
+
+describe("ConnectionFactory.submitResult", () => {
+  it("falls through an async written-but-unaccepted artifact to a direct accepted transport", async () => {
+    const calls: TentacleKind[] = [];
+    const factory = new ConnectionFactory({
+      config: makeConfig(["actions", "codespaces"]),
+    });
+    factory.register(makeSubmissionTentacle("actions", async () => {
+      calls.push("actions");
+      return {
+        artifactWritten: true,
+        controllerAccepted: false,
+        channel: "actions",
+        acceptance: null,
+      };
+    }));
+    factory.register(makeSubmissionTentacle("codespaces", async () => {
+      calls.push("codespaces");
+      return {
+        artifactWritten: true,
+        controllerAccepted: true,
+        channel: "codespaces",
+        acceptance: "direct-response",
+      };
+    }));
+
+    await expect(factory.submitResult(DUMMY_RESULT)).resolves.toEqual({
+      artifactWritten: true,
+      controllerAccepted: true,
+      channel: "codespaces",
+      acceptance: "direct-response",
+    });
+    expect(calls).toEqual(["actions", "codespaces"]);
+  });
+
+  it("aggregates written artifacts when no transport obtains controller acceptance", async () => {
+    const factory = new ConnectionFactory({
+      config: makeConfig(["actions", "gist"]),
+    });
+    factory.register(makeSubmissionTentacle("actions", async () => ({
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "actions",
+      acceptance: null,
+    })));
+    factory.register(makeSubmissionTentacle("gist", async () => ({
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "gist",
+      acceptance: null,
+    })));
+
+    await expect(factory.submitResult(DUMMY_RESULT)).resolves.toEqual({
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "gist",
+      acceptance: null,
+    });
+  });
+
+  it("fails over when a transport throws during result submission", async () => {
+    const calls: TentacleKind[] = [];
+    const factory = new ConnectionFactory({
+      config: makeConfig(["issues", "codespaces"]),
+    });
+    factory.register(makeSubmissionTentacle("issues", async () => {
+      calls.push("issues");
+      throw new Error("transport unavailable");
+    }));
+    factory.register(makeSubmissionTentacle("codespaces", async () => {
+      calls.push("codespaces");
+      return {
+        artifactWritten: true,
+        controllerAccepted: true,
+        channel: "codespaces",
+        acceptance: "direct-response",
+      };
+    }));
+
+    await expect(factory.submitResult(DUMMY_RESULT)).resolves.toEqual({
+      artifactWritten: true,
+      controllerAccepted: true,
+      channel: "codespaces",
+      acceptance: "direct-response",
+    });
+    expect(calls).toEqual(["issues", "codespaces"]);
   });
 });

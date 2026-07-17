@@ -9,7 +9,9 @@ const mockRepos = {
 const mockActions = {
   getRepoVariable: mock(async () => ({ data: { value: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } })),
 };
-const mockReposBase = { get: mock(async () => ({})) };
+const mockReposBase = {
+  get: mock(async () => ({ data: { default_branch: "release" } })),
+};
 
 mock.module("@octokit/rest", () => ({
   Octokit: class {
@@ -24,6 +26,7 @@ mock.module("@octokit/rest", () => ({
 import { PagesTentacle } from "../tentacles/PagesTentacle.ts";
 import { generateKeyPair, bytesToBase64, encryptBox } from "../crypto/sodium.ts";
 import type { BeaconConfig } from "../types.ts";
+import { signedCheckin } from "./signedCheckinFixture.ts";
 
 async function makeConfig(): Promise<BeaconConfig> {
   const kp = await generateKeyPair();
@@ -59,6 +62,7 @@ describe("PagesTentacle", () => {
     const t = new PagesTentacle(await makeConfig());
     expect(await t.isAvailable()).toBe(true);
     expect(mockRepos.listDeployments).toHaveBeenCalledTimes(1);
+    expect(mockReposBase.get).toHaveBeenCalledTimes(1);
   });
 
   it("isAvailable returns false when listDeployments throws", async () => {
@@ -73,28 +77,33 @@ describe("PagesTentacle", () => {
     // listDeployments returns empty (no task deployment)
     mockRepos.listDeployments.mockResolvedValueOnce({ data: [] });
 
-    const t = new PagesTentacle(await makeConfig());
-    const tasks = await t.checkin(PAYLOAD);
+    const cfg = await makeConfig();
+    const t = new PagesTentacle(cfg);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
 
     // ACK deployment should have been created
     expect(mockRepos.createDeployment).toHaveBeenCalledTimes(1);
     const createCall = (mockRepos.createDeployment.mock.calls[0] as any)[0] as any;
     expect(createCall.environment).toMatch(/^ci-abcd1234$/);
-    const desc = JSON.parse(createCall.description);
-    expect(desc.beaconId).toBe("abcd1234-5678-90ab-cdef-1234567890ab");
-    expect(desc.hostname).toBe("host");
+    expect(createCall.ref).toBe("release");
+    expect(createCall.description).toBe("ack");
+    expect(createCall.payload.beaconId).toBe(
+      "abcd1234-5678-90ab-cdef-1234567890ab",
+    );
+    expect(createCall.payload.hostname).toBe("host");
   });
 
   it("checkin returns [] when no task deployment found", async () => {
     mockRepos.listDeployments.mockResolvedValueOnce({ data: [] });
 
-    const t = new PagesTentacle(await makeConfig());
-    const tasks = await t.checkin(PAYLOAD);
+    const cfg = await makeConfig();
+    const t = new PagesTentacle(cfg);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
   });
 
-  it("checkin returns [] when task deployment id is unchanged (already seen)", async () => {
+  it("checkin creates a distinct ACK deployment on every call and keeps polling", async () => {
     const cfg = await makeConfig();
     const id8 = cfg.id.slice(0, 8);
 
@@ -108,18 +117,30 @@ describe("PagesTentacle", () => {
     mockRepos.listDeployments.mockResolvedValueOnce({ data: [taskDeploy] });
 
     const t = new PagesTentacle(cfg);
-    const first = await t.checkin(PAYLOAD);
+    const firstPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:00.000Z",
+    });
+    const first = await t.checkin(firstPayload);
     expect(first).toEqual([]);  // decrypt fails gracefully
 
     mockRepos.listDeployments.mockResolvedValueOnce({ data: [taskDeploy] });
     mockRepos.createDeployment.mockClear();
 
-    // Second checkin — same deployment id, should bail early
-    const second = await t.checkin({ ...PAYLOAD });
+    const secondPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:01.000Z",
+    });
+    const second = await t.checkin(secondPayload);
     expect(second).toEqual([]);
-    // createDeployment should NOT be called for task (no new deployment)
-    // Only the ACK is from the first call; second call has ackSent=true
-    expect(mockRepos.createDeployment).not.toHaveBeenCalled();
+    expect(mockRepos.createDeployment).toHaveBeenCalledTimes(1);
+    expect(mockRepos.listDeployments).toHaveBeenCalledTimes(2);
+    const written = ((mockRepos.createDeployment.mock.calls[0] as any)[0] as any)
+      .payload;
+    expect(written.identity.sequence).toBe(secondPayload.identity!.sequence);
+    expect(written.identity.signature).not.toBe(
+      firstPayload.identity!.signature,
+    );
   });
 
   it("checkin decrypts tasks from task deployment payload (full crypto round-trip)", async () => {
@@ -147,7 +168,7 @@ describe("PagesTentacle", () => {
     mockRepos.listDeployments.mockResolvedValueOnce({ data: [taskDeploy] });
 
     const t = new PagesTentacle(cfg);
-    const tasks = await t.checkin({ ...PAYLOAD, beaconId: cfg.id });
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
 
     expect(tasks).toHaveLength(1);
     expect(tasks[0]!.taskId).toBe("t1");
@@ -168,24 +189,37 @@ describe("PagesTentacle", () => {
     const createCall = (mockRepos.createDeployment.mock.calls[0] as any)[0] as any;
     expect(createCall.environment).toMatch(/^ci-r-abcd1234$/);
     expect(createCall.description).toBe("result");
+    expect(createCall.ref).toBe("release");
   });
 
-  it("teardown marks ack deployment inactive", async () => {
+  it("submitResult propagates deployment failures for channel failover", async () => {
+    mockRepos.createDeployment.mockRejectedValueOnce(
+      new Error("deployment unavailable"),
+    );
+    const t = new PagesTentacle(await makeConfig());
+
+    await expect(t.submitResult({
+      taskId: "t-fail",
+      beaconId: "abcd1234-5678-90ab-cdef-1234567890ab",
+      success: false,
+      output: "failed",
+      completedAt: new Date().toISOString(),
+    })).rejects.toThrow("deployment unavailable");
+  });
+
+  it("teardown preserves the ACK deployment after registration", async () => {
     mockRepos.listDeployments.mockResolvedValueOnce({ data: [] });
 
-    const t = new PagesTentacle(await makeConfig());
-    // First checkin to set ackDeploymentId (mocked createDeployment returns id: 42)
-    await t.checkin(PAYLOAD);
+    const cfg = await makeConfig();
+    const t = new PagesTentacle(cfg);
+    await t.checkin(await signedCheckin(cfg, PAYLOAD));
     mockRepos.createDeploymentStatus.mockClear();
 
     await t.teardown();
-    expect(mockRepos.createDeploymentStatus).toHaveBeenCalledTimes(1);
-    const statusCall = (mockRepos.createDeploymentStatus.mock.calls[0] as any)[0] as any;
-    expect(statusCall.deployment_id).toBe(42);
-    expect(statusCall.state).toBe("inactive");
+    expect(mockRepos.createDeploymentStatus).not.toHaveBeenCalled();
   });
 
-  it("teardown does nothing when no ACK deployment was created", async () => {
+  it("teardown does nothing before the first checkin", async () => {
     const t = new PagesTentacle(await makeConfig());
     // Never called checkin — ackDeploymentId is null
     await expect(t.teardown()).resolves.toBeUndefined();

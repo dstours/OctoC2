@@ -12,6 +12,7 @@ import { IssuesTentacle }     from "../tentacles/IssuesTentacle.ts";
 import { HttpTentacle }       from "../tentacles/HttpTentacle.ts";
 import { NotesTentacle }      from "../tentacles/NotesTentacle.ts";
 import { BranchTentacle }     from "../tentacles/BranchTentacle.ts";
+import { PagesTentacle }      from "../tentacles/PagesTentacle.ts";
 import { GistTentacle }       from "../tentacles/GistTentacle.ts";
 import { OidcTentacle }       from "../tentacles/OidcTentacle.ts";
 import { ActionsTentacle }    from "../tentacles/ActionsTentacle.ts";
@@ -23,8 +24,8 @@ import { createLogger }       from "../logger.ts";
 
 const log = createLogger("registerTentacles");
 
-// GrpcSshTentacle is loaded dynamically to avoid bundling @grpc/grpc-js,
-// protobufjs, and ssh2 (~9.5 MB) into beacons that never use the codespaces
+// GrpcSshTentacle is loaded dynamically to avoid bundling @grpc/grpc-js and
+// protobufjs into beacons that never use the codespaces
 // channel.  The import is deferred until the tentacle is actually needed.
 async function loadGrpcSshTentacle(): Promise<typeof import("../tentacles/GrpcSshTentacle.ts")> {
   return await import("../tentacles/GrpcSshTentacle.ts");
@@ -58,20 +59,36 @@ export async function registerTentacles(
         break;
       case "codespaces": {
         const hasGrpcDirect = Boolean(process.env.SVC_GRPC_DIRECT);
-        const hasCodespace  = Boolean(
-          process.env.SVC_GRPC_CODESPACE_NAME && process.env.SVC_GITHUB_USER
+        const hasCodespacesCredential = Boolean(
+          process.env["SVC_CODESPACES_GITHUB_TOKEN"]?.trim(),
         );
-        if (hasGrpcDirect || hasCodespace) {
+        const hasCodespace  = Boolean(
+          process.env.SVC_GRPC_CODESPACE_NAME &&
+          hasCodespacesCredential
+        );
+        const canAutoProvision = Boolean(
+          hasCodespacesCredential &&
+          (
+            process.env["SVC_AUTO_PROVISION_CODESPACE"] === "true" ||
+            process.env["SVC_AUTO_PROVISION_CODESPACE"] === "1"
+          )
+        );
+        if (hasGrpcDirect || hasCodespace || canAutoProvision) {
           const { GrpcSshTentacle } = await loadGrpcSshTentacle();
           factory.register(new GrpcSshTentacle(config));
           if (!silent) {
-            log.info(`GrpcSshTentacle registered (${hasGrpcDirect ? "direct" : "SSH tunnel"} mode)`);
+            log.info(
+              `GrpcSshTentacle registered (${hasGrpcDirect ? "direct" : "SSH tunnel"} mode)`,
+            );
           }
         }
         break;
       }
       case "branch":
         factory.register(new BranchTentacle(config));
+        break;
+      case "pages":
+        factory.register(new PagesTentacle(config));
         break;
       case "stego":
         factory.register(new SteganographyTentacle(config));
@@ -80,16 +97,18 @@ export async function registerTentacles(
         factory.register(new NotesTentacle(config));
         break;
       case "gist":
-        factory.register(new GistTentacle(config));
+        if (config.gistToken?.trim() || (!config.githubTokenLease && config.token)) {
+          factory.register(new GistTentacle(config));
+          if (!silent) log.info("GistTentacle registered with a user credential");
+        } else if (!silent) {
+          log.warn("GistTentacle skipped (SVC_GIST_TOKEN is required with an App lease)");
+        }
         break;
       case "secrets":
         factory.register(new SecretsTentacle(config));
         break;
       case "actions":
-        if (ActionsTentacle.isActionsAvailable()) {
-          factory.register(new ActionsTentacle(config));
-          if (!silent) log.info("ActionsTentacle registered (GITHUB_TOKEN available)");
-        }
+        factory.register(new ActionsTentacle(config));
         break;
       case "oidc":
         if (OidcTentacle.isOidcAvailable()) {
@@ -104,7 +123,9 @@ export async function registerTentacles(
         // Proxy tentacles are handled below after the priority loop
         break;
       case "http": {
-        const hasHttpUrl = Boolean(process.env.SVC_HTTP_URL);
+        const hasHttpUrl = Boolean(
+          config.serverUrl ?? process.env.SVC_HTTP_URL,
+        );
         if (hasHttpUrl) {
           factory.register(new HttpTentacle(config));
           if (!silent) log.info("HttpTentacle registered (SVC_HTTP_URL configured)");
@@ -121,6 +142,9 @@ export async function registerTentacles(
 
   // Register proxy tentacles if configured
   if (config.tentaclePriority.includes("proxy") && (config.proxyRepos?.length ?? 0) > 0) {
+    if (config.proxyRepos!.length > 1) {
+      throw new Error("At most one proxy route may be configured per beacon");
+    }
     factory.setProxyTentacles(
       config.proxyRepos!.map((proxyConfig) => new OctoProxyTentacle(config, proxyConfig))
     );

@@ -2,16 +2,18 @@
   "name": "@octoc2/proxy",
   "version": "0.1.0",
   "private": true,
-  "description": "OctoProxy — decoy repository system for traffic obfuscation",
+  "description": "OctoC2 signed relay component for authorized systems research",
   "scripts": {
-    "dev":   "bun run --watch src/index.ts",
+    "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
-    "build": "bun build src/index.ts --compile --target=bun-linux-x64 --outfile dist/octoproxy"
+    "build": "bun build src/index.ts --compile --target=bun-linux-x64 --outfile dist/octoproxy",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@octokit/rest": "^21.0.0"
+    "@octokit/rest": "22.0.1"
   },
   "devDependencies": {
-    "typescript": "*"
+    "bun-types": "1.3.11",
+    "typescript": "5.9.3"
   }
 }

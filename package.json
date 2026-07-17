@@ -2,8 +2,12 @@
   "name": "octoc2",
   "version": "0.1.0",
   "private": true,
-  "description": "GitHub-Native Octopus Command & Control Framework",
-  "workspaces": ["implant", "server", "dashboard", "octoctl", "proxy"],
+  "description": "GitHub-native encrypted control plane for authorized systems research",
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "node": ">=22.14.0 <23"
+  },
+  "workspaces": ["shared", "implant", "server", "dashboard", "octoctl", "proxy", "docs-site"],
   "scripts": {
     "build": "bun run --filter='*' build",
     "build:implant": "cd implant   && bun run build",
@@ -14,20 +18,40 @@
     "dev:dashboard": "cd dashboard && bun run dev",
     "dashboard:dev": "cd dashboard && bun run dev",
     "dev:octoctl": "cd octoctl   && bun run dev",
-    "proto:gen": "bash scripts/proto-gen.sh",
-    "lint": "eslint . --ext .ts,.tsx"
+    "proto:gen": "bun run scripts/generate-proto.ts",
+    "proto:check": "bun run scripts/generate-proto.ts --check",
+    "deps:check": "bun run scripts/check-dependency-policy.ts",
+    "docs:check": "bun run scripts/check-doc-consistency.ts",
+    "workflows:check": "bun run scripts/check-workflow-pins.ts",
+    "toolchain:check": "bun run scripts/check-toolchain-policy.ts",
+    "contracts:check": "bun run --cwd=shared test && bun run --cwd=shared typecheck",
+    "smoke:builds": "bun run scripts/smoke-test-builds.ts",
+    "lint": "eslint . --max-warnings=0",
+    "audit": "bun audit"
   },
   "devDependencies": {
-    "@types/libsodium-wrappers": "0.7.13",
-    "@types/node": "^22.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0",
-    "eslint": "^9.0.0",
-    "prettier": "^3.0.0",
-    "typescript": "^5.7.0"
+    "@eslint/js": "9.39.4",
+    "@types/libsodium-wrappers": "0.8.2",
+    "@types/node": "22.19.15",
+    "@typescript-eslint/eslint-plugin": "8.64.0",
+    "@typescript-eslint/parser": "8.64.0",
+    "eslint": "9.39.4",
+    "bun-types": "1.3.11",
+    "prettier": "3.8.1",
+    "typescript": "5.9.3"
   },
   "dependencies": {
-    "@grpc/grpc-js": "^1.14.3",
-    "@grpc/proto-loader": "^0.8.0"
+    "@grpc/grpc-js": "1.14.4",
+    "@grpc/proto-loader": "0.8.1",
+    "@octokit/rest": "22.0.1",
+    "jose": "6.2.2",
+    "protobufjs": "8.7.1"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "js-yaml": "5.2.1",
+    "postcss": "8.5.19",
+    "undici": "7.28.0",
+    "ws": "8.21.1"
   }
 }

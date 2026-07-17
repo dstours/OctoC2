@@ -1,26 +1,37 @@
 // dashboard/src/components/__tests__/MaintenancePanel.test.tsx
 import { render, screen, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MaintenancePanel } from '../MaintenancePanel';
 import type { MaintenanceState } from '@/lib/C2ServerClient';
+import * as AuthContextModule from '@/context/AuthContext';
+import * as CryptoModule from '@/lib/crypto';
+import * as C2ServerClientModule from '@/lib/C2ServerClient';
+import { restoreModuleMocks } from '@/test/moduleMocks';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
-const mockGetMaintenance        = vi.hoisted(() => vi.fn());
-const mockGetMaintenanceComment = vi.hoisted(() => vi.fn());
-const mockSubscribeEvents       = vi.hoisted(() => vi.fn());
-const mockDecryptSealedResult   = vi.hoisted(() => vi.fn());
-const mockParsePayload          = vi.hoisted(() => vi.fn());
+const mockGetMaintenance        = vi.fn();
+const mockGetMaintenanceComment = vi.fn();
+const mockSubscribeEvents       = vi.fn();
+const mockDecryptSealedResult   = vi.fn();
+const mockParsePayload          = vi.fn();
 const mockPrivkeyRef            = { value: null as string | null };
 
 let mockMode = 'live';
 
+restoreModuleMocks([
+  ['@/context/AuthContext', { ...AuthContextModule }],
+  ['@/lib/crypto', { ...CryptoModule }],
+  ['@/lib/C2ServerClient', { ...C2ServerClientModule }],
+]);
+
 vi.mock('@/context/AuthContext', () => ({
   useAuth: () => ({
-    pat: 'ghp_test',
+    githubPat: 'ghp_test',
+    operatorToken: 'operator-test',
     mode: mockMode,
-    serverUrl: 'http://localhost:8080',
+    serverUrl: 'https://localhost:8080',
     privkey: mockPrivkeyRef.value,
     login: vi.fn(),
     logout: vi.fn(),
@@ -34,11 +45,11 @@ vi.mock('@/lib/crypto', () => ({
 }));
 
 vi.mock('@/lib/C2ServerClient', () => ({
-  C2ServerClient: vi.fn(function (this: Record<string, unknown>) {
-    this['getMaintenance']        = mockGetMaintenance;
-    this['getMaintenanceComment'] = mockGetMaintenanceComment;
-    this['subscribeEvents']       = mockSubscribeEvents;
-  }),
+  C2ServerClient: class {
+    getMaintenance = mockGetMaintenance;
+    getMaintenanceComment = mockGetMaintenanceComment;
+    subscribeEvents = mockSubscribeEvents;
+  },
 }));
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

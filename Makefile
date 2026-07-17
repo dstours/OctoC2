@@ -2,10 +2,10 @@
 #
 # Usage:
 #   make test          — run all unit tests (implant + server + octoctl + dashboard)
-#   make agent-app     — build a beacon binary baked with GitHub App credentials
+#   make beacon        — build a provisioned beacon plus public enrollment artifact
 #   make clean         — remove build artefacts
 
-.PHONY: test agent-app clean
+.PHONY: test beacon clean
 
 # ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -19,32 +19,18 @@ test:
 	@echo "==> dashboard"
 	cd dashboard && bun test
 
-# ── Build beacon with GitHub App credentials baked in ─────────────────────────
+# ── Build a provisioned beacon ────────────────────────────────────────────────
 #
-# Required env vars:
-#   OCTOC2_APP_ID            — numeric GitHub App ID
-#   OCTOC2_INSTALLATION_ID   — installation ID for the C2 repo
-#
-# Private key is NOT baked — deliver it via dead-drop after deployment:
-#   bun run octoctl/src/index.ts drop create --beacon <id> --app-key-file ~/.config/octoc2/app-key.pem
+# The build generates distinct X25519 and Ed25519 keys and writes a public
+# enrollment artifact beside the binary. GitHub App private keys remain on the
+# server; short-lived repository leases arrive through signed recovery records.
 
-agent-app:
-ifndef OCTOC2_APP_ID
-	$(error OCTOC2_APP_ID is not set)
-endif
-ifndef OCTOC2_INSTALLATION_ID
-	$(error OCTOC2_INSTALLATION_ID is not set)
-endif
-	@echo "==> Building beacon with App ID=$(OCTOC2_APP_ID) Installation=$(OCTOC2_INSTALLATION_ID)"
-	cd octoctl && bun run src/index.ts build-beacon \
-		--outfile ../beacon-agent-app \
-		--app-id $(OCTOC2_APP_ID) \
-		--installation-id $(OCTOC2_INSTALLATION_ID)
-	@echo "==> Built: beacon-agent-app"
-	@echo "==> Next: deliver private key via dead-drop"
-	@echo "    bun run octoctl/src/index.ts drop create --beacon <id> --app-key-file ~/.config/octoc2/app-key.pem"
+beacon:
+	cd octoctl && bun run src/index.ts build-beacon --outfile ../beacon-agent
+	@echo "==> Built: beacon-agent"
+	@echo "==> Import the generated enrollment artifact before deployment."
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 
 clean:
-	rm -f beacon-agent-app beacon-prod
+	rm -f beacon-agent beacon-prod

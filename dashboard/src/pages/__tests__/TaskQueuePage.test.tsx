@@ -1,6 +1,6 @@
 // dashboard/src/pages/__tests__/TaskQueuePage.test.tsx
 import { render, screen } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { TaskQueuePage } from '../TaskQueuePage';
@@ -9,22 +9,22 @@ import type { ServerTask } from '@/lib/C2ServerClient';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
-const mockMode      = vi.hoisted(() => ({ value: 'live' as string }));
-const mockGetBeacons = vi.hoisted(() => vi.fn());
-const mockGetResults = vi.hoisted(() => vi.fn());
+const mockMode      = { value: 'live' as string };
+const mockGetBeacons = vi.fn();
+const mockGetResults = vi.fn();
 
 vi.mock('@/context/AuthContext', () => ({
   useAuth: () => ({
-    pat: 'ghp_test', mode: mockMode.value,
-    serverUrl: 'http://localhost:8080',
+    githubPat: 'ghp_test', operatorToken: 'operator-test', mode: mockMode.value,
+    serverUrl: 'https://localhost:8080',
   }),
 }));
 
 vi.mock('@/lib/C2ServerClient', () => ({
-  C2ServerClient: vi.fn(function (this: Record<string, unknown>) {
-    this['getBeacons'] = mockGetBeacons;
-    this['getResults'] = mockGetResults;
-  }),
+  C2ServerClient: class {
+    getBeacons = mockGetBeacons;
+    getResults = mockGetResults;
+  },
 }));
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

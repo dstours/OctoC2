@@ -1,12 +1,10 @@
 /**
  * OctoC2 Server — BeaconRegistry
  *
- * In-memory registry of all known beacons. Updated on every checkin.
- * Persisted to disk on shutdown and periodically so a server restart
- * doesn't lose beacon state.
- *
- * Phase 2: plain JSON file at $OCTOC2_DATA_DIR/registry.json (default: ./data/).
- * Phase 5: encrypt at rest with operator key.
+ * In-memory compatibility view of all known beacons. When constructed with an
+ * OctoStore, every mutation is durably reflected in SQLite. The JSON snapshot
+ * path remains only for unmigrated callers; OctoStore performs its one-time,
+ * backed-up import before this registry loads.
  *
  * Thread safety: single-threaded Bun runtime — no locks needed.
  */
@@ -14,6 +12,8 @@
 import { join } from "node:path";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { CHANNEL_BY_ID, type ChannelId } from "@octoc2/shared";
+import type { OctoStore, StoredBeacon } from "./store/index.ts";
 
 export type BeaconStatus = "active" | "dormant" | "lost";
 
@@ -35,8 +35,8 @@ export interface BeaconRecord {
    * Incremented monotonically by the beacon — server rejects replays.
    */
   lastSeq:     number;
-  /** TentacleId of the channel that processed the most recent checkin */
-  activeTentacle?: number;
+  /** Canonical channel ID that processed the most recent check-in. */
+  activeTentacle?: ChannelId;
 }
 
 interface RegistrySnapshot {
@@ -49,17 +49,44 @@ export class BeaconRegistry {
   private readonly records = new Map<string, BeaconRecord>();
   private readonly dataDir: string;
   private readonly persistPath: string;
+  private readonly store: OctoStore | null;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly DEBOUNCE_MS = 1000;
 
-  constructor(dataDir = process.env["OCTOC2_DATA_DIR"] ?? "./data") {
-    this.dataDir     = dataDir;
-    this.persistPath = join(dataDir, "registry.json");
+  constructor(dataDir?: string, store?: OctoStore);
+  constructor(store: OctoStore);
+  constructor(
+    dataDirOrStore: string | OctoStore =
+      process.env["OCTOC2_DATA_DIR"] ?? "./data",
+    explicitStore?: OctoStore,
+  ) {
+    if (typeof dataDirOrStore === "string") {
+      this.dataDir = dataDirOrStore;
+      this.store = explicitStore ?? null;
+    } else {
+      this.dataDir = dataDirOrStore.dataDir;
+      this.store = dataDirOrStore;
+    }
+    this.persistPath = join(this.dataDir, "registry.json");
   }
 
   /** Load persisted state from disk. Call once at server startup. */
   async load(): Promise<void> {
+    if (this.store) {
+      this.records.clear();
+      for (const stored of this.store.listBeacons()) {
+        const record = this.fromStoredBeacon(stored);
+        record.status = "dormant";
+        this.persistRecord(record);
+        this.records.set(record.beaconId, record);
+      }
+      console.log(
+        `[Registry] Loaded ${this.records.size} beacon(s) from ${this.store.databasePath}`,
+      );
+      return;
+    }
+
     if (!existsSync(this.persistPath)) return;
 
     try {
@@ -88,6 +115,10 @@ export class BeaconRegistry {
    */
   startAutoSave(intervalMs = 5 * 60 * 1000): void {
     if (this.saveTimer) clearInterval(this.saveTimer);
+    if (this.store) {
+      this.saveTimer = null;
+      return;
+    }
     this.saveTimer = setInterval(() => {
       this.persist().catch((err) =>
         console.warn("[Registry] Auto-save failed:", (err as Error).message)
@@ -105,7 +136,7 @@ export class BeaconRegistry {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
-    await this.persist();
+    if (!this.store) await this.persist();
   }
 
   /**
@@ -121,12 +152,12 @@ export class BeaconRegistry {
     os:          string;
     arch:        string;
     seq:         number;
-    tentacleId?: number;
+    tentacleId?: ChannelId;
   }): BeaconRecord {
     const existing = this.records.get(data.beaconId);
     const now      = new Date().toISOString();
 
-    const record: BeaconRecord = {
+    let record: BeaconRecord = {
       beaconId:    data.beaconId,
       issueNumber: data.issueNumber,
       publicKey:   data.publicKey,
@@ -147,6 +178,28 @@ export class BeaconRegistry {
           : {}),
     };
 
+    if (this.store) {
+      const persisted = this.store.getBeacon(record.beaconId);
+      const stored = this.store.upsertBeacon({
+        beaconId: record.beaconId,
+        issueNumber: record.issueNumber > 0 ? record.issueNumber : null,
+        x25519PublicKey: record.publicKey,
+        hostname: record.hostname,
+        username: record.username,
+        os: record.os,
+        arch: record.arch,
+        firstSeen: record.firstSeen,
+        lastSeen: record.lastSeen,
+        status: record.status,
+        lastSeq: Math.max(
+          persisted?.lastSeq ?? 0,
+          existing?.lastSeq ?? 0,
+          record.lastSeq,
+        ),
+        activeTentacle: record.activeTentacle ?? null,
+      });
+      record = this.fromStoredBeacon(stored);
+    }
     this.records.set(data.beaconId, record);
 
     const verb = existing ? "Re-registered" : "Registered";
@@ -157,8 +210,18 @@ export class BeaconRegistry {
 
     // Debounce persist so rapid registrations (e.g. 10 beacons checking in
     // within the same second) coalesce into a single disk write.
-    this.debouncedPersist();
+    if (!this.store) this.debouncedPersist();
 
+    return record;
+  }
+
+  /** Refresh one in-memory record after an atomic store-side transition. */
+  refreshFromStore(beaconId: string): BeaconRecord | undefined {
+    if (!this.store) return this.records.get(beaconId);
+    const stored = this.store.getBeacon(beaconId);
+    if (!stored) return undefined;
+    const record = this.fromStoredBeacon(stored);
+    this.records.set(beaconId, record);
     return record;
   }
 
@@ -179,11 +242,17 @@ export class BeaconRegistry {
   }
 
   /** Update the active tentacle channel for a known beacon. Returns false if beacon unknown or tentacleId invalid. */
-  updateActiveTentacle(beaconId: string, tentacleId: number): boolean {
-    if (tentacleId <= 0 || !Number.isInteger(tentacleId)) return false;
+  updateActiveTentacle(beaconId: string, tentacleId: ChannelId): boolean {
+    if (
+      !Object.prototype.hasOwnProperty.call(CHANNEL_BY_ID, String(tentacleId))
+    ) {
+      return false;
+    }
     const record = this.records.get(beaconId);
     if (!record) return false;
-    record.activeTentacle = tentacleId;
+    const updated = { ...record, activeTentacle: tentacleId };
+    this.persistRecord(updated);
+    Object.assign(record, updated);
     return true;
   }
 
@@ -192,9 +261,14 @@ export class BeaconRegistry {
     const record = this.records.get(beaconId);
     if (!record) return false;
 
-    record.lastSeen = new Date().toISOString();
-    record.status   = "active";
-    record.lastSeq  = seq;
+    const updated: BeaconRecord = {
+      ...record,
+      lastSeen: new Date().toISOString(),
+      status: "active",
+      lastSeq: this.store ? Math.max(record.lastSeq, seq) : seq,
+    };
+    this.persistRecord(updated);
+    Object.assign(record, updated);
     return true;
   }
 
@@ -215,6 +289,20 @@ export class BeaconRegistry {
 
     if (seq <= record.lastSeq) return "replay";
 
+    if (this.store) {
+      const result = this.store.advanceBeaconSequence(beaconId, seq);
+      if (result.status === "unknown") return "unknown";
+      if (result.status === "replay") {
+        const stored = this.store.getBeacon(beaconId);
+        if (stored) Object.assign(record, this.fromStoredBeacon(stored));
+        return "replay";
+      }
+      const stored = this.store.getBeacon(beaconId);
+      if (!stored) return "unknown";
+      Object.assign(record, this.fromStoredBeacon(stored));
+      return result.status === "gap" ? "gap" : "ok";
+    }
+
     const result = seq > record.lastSeq + 100 ? "gap" : "ok";
     record.lastSeq = seq;
     return result;
@@ -222,12 +310,18 @@ export class BeaconRegistry {
 
   markDormant(beaconId: string): void {
     const record = this.records.get(beaconId);
-    if (record) record.status = "dormant";
+    if (!record) return;
+    const updated: BeaconRecord = { ...record, status: "dormant" };
+    this.persistRecord(updated);
+    Object.assign(record, updated);
   }
 
   markLost(beaconId: string): void {
     const record = this.records.get(beaconId);
-    if (record) record.status = "lost";
+    if (!record) return;
+    const updated: BeaconRecord = { ...record, status: "lost" };
+    this.persistRecord(updated);
+    Object.assign(record, updated);
   }
 
   /**
@@ -235,11 +329,53 @@ export class BeaconRegistry {
    * `thresholdMs` as dormant. Call on each poll cycle.
    */
   sweepDormant(thresholdMs = 10 * 60 * 1000): void {
-    const cutoff = Date.now() - thresholdMs;
+    this.sweepStatuses(thresholdMs, Number.MAX_SAFE_INTEGER);
+  }
+
+  /**
+   * Apply both liveness transitions from the same last-seen timestamp.
+   *
+   * A very old active record transitions directly to lost. A later signed
+   * check-in reactivates either state through register/updateLastSeen.
+   */
+  sweepStatuses(
+    dormantAfterMs = 10 * 60 * 1000,
+    lostAfterMs = 24 * 60 * 60 * 1000,
+    nowMs = Date.now(),
+  ): void {
+    if (
+      !Number.isSafeInteger(dormantAfterMs) ||
+      dormantAfterMs <= 0 ||
+      !Number.isSafeInteger(lostAfterMs) ||
+      lostAfterMs <= dormantAfterMs ||
+      !Number.isSafeInteger(nowMs) ||
+      nowMs < 0
+    ) {
+      throw new Error(
+        "liveness thresholds must be positive safe integers with lostAfterMs > dormantAfterMs",
+      );
+    }
+
     for (const record of this.records.values()) {
-      if (record.status === "active" && new Date(record.lastSeen).getTime() < cutoff) {
-        record.status = "dormant";
-        console.log(`[Registry] Beacon ${record.beaconId} (${record.hostname}) marked dormant`);
+      const lastSeenMs = new Date(record.lastSeen).getTime();
+      if (!Number.isFinite(lastSeenMs)) continue;
+      const ageMs = nowMs - lastSeenMs;
+      let nextStatus: BeaconStatus | null = null;
+      if (ageMs >= lostAfterMs && record.status !== "lost") {
+        nextStatus = "lost";
+      } else if (
+        ageMs >= dormantAfterMs &&
+        record.status === "active"
+      ) {
+        nextStatus = "dormant";
+      }
+      if (nextStatus) {
+        const updated: BeaconRecord = { ...record, status: nextStatus };
+        this.persistRecord(updated);
+        Object.assign(record, updated);
+        console.log(
+          `[Registry] Beacon ${record.beaconId} (${record.hostname}) marked ${nextStatus}`,
+        );
       }
     }
   }
@@ -258,6 +394,7 @@ export class BeaconRegistry {
   }
 
   private async persist(): Promise<void> {
+    if (this.store) return;
     await mkdir(this.dataDir, { recursive: true });
 
     const snapshot: RegistrySnapshot = {
@@ -269,5 +406,42 @@ export class BeaconRegistry {
     const tmp = `${this.persistPath}.tmp`;
     await writeFile(tmp, JSON.stringify(snapshot, null, 2), "utf8");
     await rename(tmp, this.persistPath);
+  }
+
+  private persistRecord(record: BeaconRecord): void {
+    if (!this.store) return;
+    this.store.upsertBeacon({
+      beaconId: record.beaconId,
+      issueNumber: record.issueNumber > 0 ? record.issueNumber : null,
+      x25519PublicKey: record.publicKey,
+      hostname: record.hostname,
+      username: record.username,
+      os: record.os,
+      arch: record.arch,
+      firstSeen: record.firstSeen,
+      lastSeen: record.lastSeen,
+      status: record.status,
+      lastSeq: record.lastSeq,
+      activeTentacle: record.activeTentacle ?? null,
+    });
+  }
+
+  private fromStoredBeacon(stored: StoredBeacon): BeaconRecord {
+    return {
+      beaconId: stored.beaconId,
+      issueNumber: stored.issueNumber ?? 0,
+      publicKey: stored.x25519PublicKey,
+      hostname: stored.hostname,
+      username: stored.username,
+      os: stored.os,
+      arch: stored.arch,
+      firstSeen: stored.firstSeen,
+      lastSeen: stored.lastSeen,
+      status: stored.status,
+      lastSeq: stored.lastSeq,
+      ...(stored.activeTentacle !== null
+        ? { activeTentacle: stored.activeTentacle }
+        : {}),
+    };
   }
 }

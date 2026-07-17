@@ -7,6 +7,7 @@
 // Decrypted content never leaves the browser — no API call, no storage.
 
 import sodium from 'libsodium-wrappers';
+import { recoveryDropPath as sharedRecoveryDropPath } from '@octoc2/shared';
 
 /**
  * Decrypt a libsodium sealed-box result produced by a beacon.
@@ -36,18 +37,12 @@ export async function decryptSealedResult(data: string, privkeyB64: string): Pro
 }
 
 /**
- * Compute the dead-drop gist filename prefix for a given beaconId.
- * Matches DeadDropResolver in the implant: sha256(beaconId).slice(0, 16) as hex.
+ * Return the canonical signed-recovery drop path for a beacon.
  *
- * Usage: filename = `data-${await deadDropGistKey(beaconId)}.bin`
+ * Re-exporting the shared implementation keeps the dashboard aligned with the
+ * publisher and implant resolver instead of maintaining a second convention.
  */
-export async function deadDropGistKey(beaconId: string): Promise<string> {
-  const encoded = new TextEncoder().encode(beaconId);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-  return hex.slice(0, 16);
-}
+export const recoveryDropPath = sharedRecoveryDropPath;
 
 /**
  * Parse the sealed diagnostic payload from a maintenance comment body.

@@ -38,7 +38,9 @@ import { SecretsTentacle } from "../tentacles/SecretsTentacle.ts";
 import {
   generateKeyPair, encryptBox, openSealBox, bytesToBase64,
 } from "../crypto/sodium.ts";
+import { decodeBase64Url, verifyEnvelope } from "@octoc2/shared";
 import type { BeaconConfig } from "../types.ts";
+import { signedCheckin } from "./signedCheckinFixture.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -123,7 +125,7 @@ describe("SecretsTentacle.checkin() — ACK registration", () => {
       getRepoVariable:    getVar,
     });
 
-    await t.checkin(CHECKIN_PAYLOAD);
+    await t.checkin(await signedCheckin(cfg, CHECKIN_PAYLOAD));
 
     // Either updateRepoVariable or createRepoVariable must have been called
     const ackWritten = updateVar.mock.calls.length > 0 || createVar.mock.calls.length > 0;
@@ -136,7 +138,7 @@ describe("SecretsTentacle.checkin() — ACK registration", () => {
     expect(varName).toContain(cfg.id.slice(0, 8));
   });
 
-  it("ACK variable value is base64-encoded JSON containing public key", async () => {
+  it("ACK variable contains the signed checkin and matching public key", async () => {
     const cfg = await makeConfig();
     const t   = new SecretsTentacle(cfg);
 
@@ -153,18 +155,21 @@ describe("SecretsTentacle.checkin() — ACK registration", () => {
       getRepoVariable:    mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }),
     });
 
-    await t.checkin(CHECKIN_PAYLOAD);
+    await t.checkin(await signedCheckin(cfg, CHECKIN_PAYLOAD));
 
     expect(capturedValue).toBeDefined();
-    // Decode and verify structure
     const decoded = JSON.parse(Buffer.from(capturedValue!, "base64").toString("utf8"));
-    expect(decoded).toHaveProperty("k");
-    expect(decoded).toHaveProperty("t");
-    expect(typeof decoded.k).toBe("string");
-    expect(decoded.k.length).toBeGreaterThan(0);
+    expect(decoded.publicKey).toBe(await bytesToBase64(cfg.beaconKeyPair.publicKey));
+    expect(decoded.identity.kind).toBe("checkin");
+    expect(decoded.identity.payload.beaconId).toBe(cfg.id);
+    expect(decoded.identity.payload.encryptionPublicKey).toBe(decoded.publicKey);
+    const signingPublicKey = await decodeBase64Url(
+      decoded.identity.payload.signingPublicKey,
+    );
+    expect(await verifyEnvelope(decoded.identity, signingPublicKey)).toBe(true);
   });
 
-  it("does NOT re-send ACK on subsequent checkins", async () => {
+  it("refreshes the signed ACK variable on every checkin and keeps polling", async () => {
     const cfg = await makeConfig();
     const t   = new SecretsTentacle(cfg);
 
@@ -178,12 +183,28 @@ describe("SecretsTentacle.checkin() — ACK registration", () => {
       getRepoVariable:    getVar,
     });
 
-    await t.checkin(CHECKIN_PAYLOAD);
-    const callsAfterFirst = updateVar.mock.calls.length;
+    const firstPayload = await signedCheckin(cfg, {
+      ...CHECKIN_PAYLOAD,
+      checkinAt: "2026-07-16T12:00:00.000Z",
+    });
+    const secondPayload = await signedCheckin(cfg, {
+      ...CHECKIN_PAYLOAD,
+      checkinAt: "2026-07-16T12:00:01.000Z",
+    });
+    await t.checkin(firstPayload);
+    await t.checkin(secondPayload);
 
-    await t.checkin(CHECKIN_PAYLOAD);
-    // No additional ACK write on second call
-    expect(updateVar.mock.calls.length).toBe(callsAfterFirst);
+    expect(updateVar).toHaveBeenCalledTimes(2);
+    expect(getVar).toHaveBeenCalledTimes(2);
+    const decodeAck = (call: any) => JSON.parse(
+      Buffer.from(call[0].value, "base64").toString("utf8"),
+    );
+    const firstAck = decodeAck(updateVar.mock.calls[0] as any);
+    const secondAck = decodeAck(updateVar.mock.calls[1] as any);
+    expect(secondAck.identity.sequence).toBe(secondPayload.identity!.sequence);
+    expect(secondAck.identity.signature).not.toBe(
+      firstAck.identity.signature,
+    );
   });
 });
 
@@ -199,7 +220,7 @@ describe("SecretsTentacle.checkin() — task polling", () => {
       getRepoVariable:    mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }),
     });
 
-    const tasks = await t.checkin(CHECKIN_PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, CHECKIN_PAYLOAD));
     expect(tasks).toEqual([]);
   });
 
@@ -231,7 +252,7 @@ describe("SecretsTentacle.checkin() — task polling", () => {
       getRepoVariable:    getVar,
     });
 
-    const tasks = await t.checkin(CHECKIN_PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, CHECKIN_PAYLOAD));
 
     expect(tasks).toHaveLength(1);
     expect(tasks[0]!.taskId).toBe("task-aabb");
@@ -254,7 +275,7 @@ describe("SecretsTentacle.checkin() — task polling", () => {
       getRepoVariable:    mock(async () => ({ data: { value: "not-valid-json" } })),
     });
 
-    const tasks = await t.checkin(CHECKIN_PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, CHECKIN_PAYLOAD));
     expect(tasks).toEqual([]);
   });
 
@@ -269,7 +290,7 @@ describe("SecretsTentacle.checkin() — task polling", () => {
       getRepoVariable:    mock(async () => ({ data: { value: "" } })),
     });
 
-    const tasks = await t.checkin(CHECKIN_PAYLOAD);
+    const tasks = await t.checkin(await signedCheckin(cfg, CHECKIN_PAYLOAD));
     expect(tasks).toEqual([]);
   });
 });
@@ -350,45 +371,15 @@ describe("SecretsTentacle.submitResult()", () => {
 });
 
 describe("SecretsTentacle.teardown()", () => {
-  it("resolves without throwing", async () => {
-    const t = new SecretsTentacle(await makeConfig());
-    (t as any).octokit = makeOctokit({
-      deleteRepoVariable: mock(async () => ({})),
-    });
-    await expect(t.teardown()).resolves.toBeUndefined();
-  });
-
-  it("resolves without throwing even when delete returns 404", async () => {
-    const t = new SecretsTentacle(await makeConfig());
-    (t as any).octokit = makeOctokit({
-      deleteRepoVariable: mock(async () => { throw Object.assign(new Error("Not Found"), { status: 404 }); }),
-    });
-    await expect(t.teardown()).resolves.toBeUndefined();
-  });
-
-  it("resolves without throwing even when delete throws an unexpected error", async () => {
-    const t = new SecretsTentacle(await makeConfig());
-    (t as any).octokit = makeOctokit({
-      deleteRepoVariable: mock(async () => { throw new Error("Network timeout"); }),
-    });
-    await expect(t.teardown()).resolves.toBeUndefined();
-  });
-
-  it("attempts to delete both INFRA_CFG and INFRA_STATE variables", async () => {
+  it("preserves registration and unread task variables", async () => {
     const cfg = await makeConfig();
     const t   = new SecretsTentacle(cfg);
 
-    const deletedNames: string[] = [];
-    (t as any).octokit = makeOctokit({
-      deleteRepoVariable: mock(async (params: any) => {
-        deletedNames.push(params.name);
-        return {};
-      }),
-    });
+    const remove = mock(async () => ({}));
+    (t as any).octokit = makeOctokit({ deleteRepoVariable: remove });
 
     await t.teardown();
 
-    expect(deletedNames.some(n => n.startsWith("INFRA_CFG_"))).toBe(true);
-    expect(deletedNames.some(n => n.startsWith("INFRA_STATE_"))).toBe(true);
+    expect(remove).not.toHaveBeenCalled();
   });
 });

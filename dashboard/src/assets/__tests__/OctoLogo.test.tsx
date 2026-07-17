@@ -1,6 +1,6 @@
 // dashboard/src/assets/__tests__/OctoLogo.test.tsx
 import { render, screen } from '@testing-library/react';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { OctoLogo } from '../OctoLogo';
 
 describe('OctoLogo', () => {

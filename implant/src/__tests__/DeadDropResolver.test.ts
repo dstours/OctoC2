@@ -1,98 +1,233 @@
-import { describe, it, expect, beforeAll } from "bun:test";
-import { createHash } from "node:crypto";
-import { DeadDropResolver } from "../recovery/DeadDropResolver.ts";
-import { generateKeyPair, sealBox, bytesToBase64 } from "../crypto/sodium.ts";
+import { beforeAll, describe, expect, it } from "bun:test";
+import {
+  GITHUB_TOKEN_LEASE_VERSION,
+  createRecoveryRecord,
+  ed25519KeyId,
+  encodeBase64Url,
+  generateEd25519KeyPair,
+  recoveryDropPath,
+  type RecoveryConfigurationV2,
+  type RecoveryRecordV2,
+} from "@octoc2/shared";
+import {
+  DeadDropResolver,
+  type DeadDropSource,
+  type FetchLike,
+} from "../recovery/DeadDropResolver.ts";
+import {
+  bytesToBase64,
+  generateKeyPair,
+  sealBox,
+} from "../crypto/sodium.ts";
 
-type KeyPair = { publicKey: Uint8Array; secretKey: Uint8Array };
+const NOW = new Date("2026-07-16T12:00:00.000Z");
+const SOURCE: DeadDropSource = {
+  owner: "public-recovery",
+  repo: "drops",
+  ref: "main",
+};
 
 describe("DeadDropResolver", () => {
-  let kp: KeyPair;
+  let beaconKeys: Awaited<ReturnType<typeof generateKeyPair>>;
+  let signingKeys: Awaited<ReturnType<typeof generateEd25519KeyPair>>;
+  let signingKeyId: string;
 
   beforeAll(async () => {
-    kp = await generateKeyPair();
+    beaconKeys = await generateKeyPair();
+    signingKeys = await generateEd25519KeyPair();
+    signingKeyId = await ed25519KeyId(signingKeys.publicKey);
   });
 
-  it("returns null when the search yields no results", async () => {
-    const server = Bun.serve({
-      port: 0,
-      fetch() {
-        return Response.json({ total_count: 0, items: [] });
+  async function record(
+    beaconId: string,
+    generation = 7,
+    expiresAt = "2026-07-16T13:00:00.000Z",
+  ): Promise<RecoveryRecordV2> {
+    const monitoringKeys = await generateKeyPair();
+    const renewAfter = new Date(
+      NOW.getTime() + (Date.parse(expiresAt) - NOW.getTime()) / 2,
+    ).toISOString();
+    const configuration: RecoveryConfigurationV2 = {
+      serverUrl: "https://controller.example.test",
+      controllerToken: "controller-token",
+      monitoringPublicKey: await bytesToBase64(monitoringKeys.publicKey),
+      recoverySigningPublicKey: encodeBase64Url(signingKeys.publicKey),
+      recoverySigningKeyId: signingKeyId,
+      github: {
+        owner: "octo",
+        repo: "c2",
+        tokenLease: {
+          version: GITHUB_TOKEN_LEASE_VERSION,
+          leaseId: `lease-${generation}`,
+          beaconId,
+          installationId: 123,
+          token: `ghs_lease_${generation}`,
+          repository: { owner: "octo", repo: "c2" },
+          permissions: {
+            metadata: "read",
+            contents: "write",
+            issues: "write",
+            variables: "read",
+          },
+          issuedAt: NOW.toISOString(),
+          renewAfter,
+          expiresAt,
+        },
       },
+      tentaclePriority: ["issues", "branch"],
+      relayConsortium: [],
+      proxyRepos: [],
+      sleepSeconds: 60,
+      jitter: 0.2,
+    };
+    return createRecoveryRecord({
+      beaconId,
+      generation,
+      issuedAt: NOW.toISOString(),
+      expiresAt,
+      signingKeyId,
+      signingSecretKey: signingKeys.secretKey,
+      configuration,
     });
-    try {
-      const r = new DeadDropResolver("tok", "owner", "repo");
-      (r as any).apiBase = `http://localhost:${server.port}`;
-      expect(await r.resolve("beacon-id", kp.secretKey)).toBeNull();
-    } finally { server.stop(); }
+  }
+
+  function contentsFetch(
+    sealed: string,
+    seen?: (request: Request) => void,
+  ): FetchLike {
+    return async (input, init) => {
+      const request = new Request(input.toString(), init);
+      seen?.(request);
+      return Response.json({
+        type: "file",
+        encoding: "base64",
+        content: Buffer.from(`${sealed}\n`, "utf8").toString("base64"),
+      });
+    };
+  }
+
+  it("reads anonymously from the deterministic path and verifies the record", async () => {
+    const beaconId = "beacon-deterministic";
+    const signed = await record(beaconId);
+    const sealed = await sealBox(
+      JSON.stringify(signed),
+      beaconKeys.publicKey,
+    );
+    let request: Request | undefined;
+    const resolver = new DeadDropResolver(SOURCE, {
+      apiBase: "https://github.test",
+      fetchImpl: contentsFetch(sealed, (value) => {
+        request = value;
+      }),
+    });
+
+    const result = await resolver.resolve(beaconId, beaconKeys.secretKey, {
+      minimumGenerationExclusive: 0,
+      signingPublicKey: signingKeys.publicKey,
+      expectedSigningKeyId: signingKeyId,
+      now: NOW,
+    });
+
+    expect(result?.generation).toBe(7);
+    expect(result?.configuration.github.tokenLease.token).toBe("ghs_lease_7");
+    expect(request?.headers.has("authorization")).toBe(false);
+    expect(new URL(request!.url).pathname).toBe(
+      `/repos/public-recovery/drops/contents/${await recoveryDropPath(beaconId)}`,
+    );
   });
 
-  it("decrypts a valid dead-drop and returns the payload", async () => {
-    const beaconId = "test-beacon-abcdef12-3456-7890-abcd-ef1234567890";
-    const tag = createHash("sha256").update(beaconId).digest("hex").slice(0, 16);
-    const filename = `data-${tag}.bin`;
-    const payload = { version: 1 as const, serverUrl: "https://new-c2:8080" };
-    const sealed = await sealBox(JSON.stringify(payload), kp.publicKey);
-
-    const server = Bun.serve({
-      port: 0,
-      async fetch(req) {
-        const url = new URL(req.url);
-        if (url.pathname.includes("/search/")) {
-          return Response.json({
-            total_count: 1,
-            items: [{ html_url: "https://gist.github.com/user/deadbeef12345678" }],
-          });
-        }
-        if (url.pathname.includes("/gists/")) {
-          return Response.json({ files: { [filename]: { content: sealed } } });
-        }
-        return new Response("not found", { status: 404 });
-      },
+  it("rejects stale generations", async () => {
+    const beaconId = "beacon-stale";
+    const sealed = await sealBox(
+      JSON.stringify(await record(beaconId, 9)),
+      beaconKeys.publicKey,
+    );
+    const resolver = new DeadDropResolver(SOURCE, {
+      fetchImpl: contentsFetch(sealed),
     });
-    try {
-      const r = new DeadDropResolver("tok", "owner", "repo");
-      (r as any).apiBase = `http://localhost:${server.port}`;
-      const result = await r.resolve(beaconId, kp.secretKey);
-      expect(result).not.toBeNull();
-      expect(result!.version).toBe(1);
-      expect(result!.serverUrl).toBe("https://new-c2:8080");
-    } finally { server.stop(); }
+
+    expect(await resolver.resolve(beaconId, beaconKeys.secretKey, {
+      minimumGenerationExclusive: 9,
+      signingPublicKey: signingKeys.publicKey,
+      expectedSigningKeyId: signingKeyId,
+      now: NOW,
+    })).toBeNull();
+    expect(resolver.lastFailureReason).toBe("stale_generation");
   });
 
-  it("returns null when the ciphertext was encrypted to a different key", async () => {
-    const otherKp = await generateKeyPair();
-    const beaconId = "wrong-key-beacon";
-    const tag = createHash("sha256").update(beaconId).digest("hex").slice(0, 16);
-    const filename = `data-${tag}.bin`;
-    // Encrypt with otherKp so decryption with kp.secretKey fails
-    const sealed = await sealBox(JSON.stringify({ version: 1 }), otherKp.publicKey);
-
-    const server = Bun.serve({
-      port: 0,
-      async fetch(req) {
-        const url = new URL(req.url);
-        // Search route: returns successful search result
-        if (url.pathname.includes("/search/")) {
-          return Response.json({
-            total_count: 1,
-            items: [{ html_url: "https://gist.github.com/user/badbeef12345678" }],
-          });
-        }
-        // Gist fetch route: returns ciphertext that is encrypted to different key
-        return Response.json({ files: { [filename]: { content: sealed } } });
-      },
+  it("rejects tampered signed configuration", async () => {
+    const beaconId = "beacon-tampered";
+    const signed = await record(beaconId);
+    signed.configuration.serverUrl = "https://attacker.example.test";
+    const sealed = await sealBox(
+      JSON.stringify(signed),
+      beaconKeys.publicKey,
+    );
+    const resolver = new DeadDropResolver(SOURCE, {
+      fetchImpl: contentsFetch(sealed),
     });
-    try {
-      const r = new DeadDropResolver("tok", "owner", "repo");
-      (r as any).apiBase = `http://localhost:${server.port}`;
-      // Decryption fails because ciphertext was sealed to otherKp, not kp
-      expect(await r.resolve(beaconId, kp.secretKey)).toBeNull();
-    } finally { server.stop(); }
+
+    expect(await resolver.resolve(beaconId, beaconKeys.secretKey, {
+      minimumGenerationExclusive: 0,
+      signingPublicKey: signingKeys.publicKey,
+      expectedSigningKeyId: signingKeyId,
+      now: NOW,
+    })).toBeNull();
+    expect(resolver.lastFailureReason).toBe("configuration_mismatch");
   });
 
-  it("returns null on network error (never throws)", async () => {
-    const r = new DeadDropResolver("tok", "owner", "repo");
-    (r as any).apiBase = "http://localhost:1";  // nothing listening
-    expect(await r.resolve("any-id", kp.secretKey)).toBeNull();
+  it("rejects expired records and leases", async () => {
+    const beaconId = "beacon-expired";
+    const sealed = await sealBox(
+      JSON.stringify(
+        await record(beaconId, 10, "2026-07-16T12:30:00.000Z"),
+      ),
+      beaconKeys.publicKey,
+    );
+    const resolver = new DeadDropResolver(SOURCE, {
+      fetchImpl: contentsFetch(sealed),
+    });
+
+    expect(await resolver.resolve(beaconId, beaconKeys.secretKey, {
+      minimumGenerationExclusive: 0,
+      signingPublicKey: signingKeys.publicKey,
+      expectedSigningKeyId: signingKeyId,
+      now: new Date("2026-07-16T12:31:00.000Z"),
+    })).toBeNull();
+    expect(resolver.lastFailureReason).toBe("expired");
+  });
+
+  it("returns null for ciphertext sealed to another beacon", async () => {
+    const otherKeys = await generateKeyPair();
+    const beaconId = "beacon-wrong-key";
+    const sealed = await sealBox(
+      JSON.stringify(await record(beaconId)),
+      otherKeys.publicKey,
+    );
+    const resolver = new DeadDropResolver(SOURCE, {
+      fetchImpl: contentsFetch(sealed),
+    });
+
+    expect(await resolver.resolve(beaconId, beaconKeys.secretKey, {
+      minimumGenerationExclusive: 0,
+      signingPublicKey: signingKeys.publicKey,
+      expectedSigningKeyId: signingKeyId,
+      now: NOW,
+    })).toBeNull();
+    expect(resolver.lastFailureReason).toBe("decrypt_failed");
+  });
+
+  it("treats a missing deterministic path as best-effort recovery failure", async () => {
+    const fetchImpl: FetchLike = async () =>
+      new Response("not found", { status: 404 });
+    const resolver = new DeadDropResolver(SOURCE, { fetchImpl });
+
+    expect(await resolver.resolve("missing", beaconKeys.secretKey, {
+      minimumGenerationExclusive: 0,
+      signingPublicKey: signingKeys.publicKey,
+      expectedSigningKeyId: signingKeyId,
+      now: NOW,
+    })).toBeNull();
+    expect(resolver.lastFailureReason).toBe("not_found");
   });
 });

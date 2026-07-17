@@ -1,35 +1,108 @@
 name: CI
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  unit-tests:
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
-      - name: Install dependencies
+      - name: Install exact workspace dependencies
         run: bun install --frozen-lockfile
 
-      - name: Test — implant
-        run: cd implant && bun test
+      - name: Check dependency and documentation policy
+        run: |
+          bun run deps:check
+          bun run docs:check
+          bun run workflows:check
+          bun run toolchain:check
 
-      - name: Test — server
-        run: cd server && bun test
+      - name: Check generated protobuf consumers
+        run: |
+          bun run proto:check
+          bun run proto:gen
+          git diff --exit-code -- proto/svc.proto shared/src/generated/svc-proto.ts
 
-      - name: Test — octoctl
-        run: cd octoctl && bun test
+      - name: Lint
+        run: bun run lint
 
-      - name: Setup Node (for dashboard vitest)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Audit dependencies
+        run: bun audit
 
-      - name: Test — dashboard
-        run: cd dashboard && npx vitest run
+      - name: Test shared contracts
+        working-directory: shared
+        run: |
+          bun test --timeout 30000
+          bun run typecheck
+
+      - name: Test and type-check implant
+        working-directory: implant
+        run: |
+          bun test --timeout 30000
+          bun run typecheck
+
+      - name: Test and type-check server
+        working-directory: server
+        run: |
+          bun test --timeout 30000
+          bun run typecheck
+
+      - name: Test and type-check octoctl
+        working-directory: octoctl
+        run: |
+          bun test --timeout 30000
+          bun run typecheck
+
+      - name: Test and type-check E2E preflight harness
+        run: |
+          bun test scripts/__tests__/test-end-to-end.test.ts --timeout 30000
+          bun run tsc --noEmit -p scripts/tsconfig.json
+
+      - name: Test and build dashboard
+        working-directory: dashboard
+        run: |
+          bun run test
+          bun run lint
+          bun run build
+
+      - name: Type-check and build proxy
+        working-directory: proxy
+        run: |
+          bun run typecheck
+          bun run build
+
+      - name: Lint and build documentation site
+        working-directory: docs-site
+        run: |
+          bun run lint
+          bun run build
+
+      - name: Build controller and CLI
+        run: |
+          bun run build:server
+          bun run build:octoctl
+
+      - name: Build all implant targets
+        working-directory: implant
+        run: bun run build:all
+
+      - name: Smoke-test compiled artifacts
+        run: bun run smoke:builds

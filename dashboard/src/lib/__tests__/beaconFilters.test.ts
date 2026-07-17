@@ -1,8 +1,9 @@
 // dashboard/src/lib/__tests__/beaconFilters.test.ts
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   applyBeaconFilters,
   DEFAULT_FILTER_STATE,
+  TENTACLE_FILTER_OPTIONS,
 } from '../beaconFilters';
 import type { BeaconFilterState } from '../beaconFilters';
 import type { Beacon } from '@/types';
@@ -140,9 +141,36 @@ describe('applyBeaconFilters', () => {
       expect(result[0]!.id).toBe('b4');
     });
 
+    it('filters the historical string tentacle ID 7b without coercing it', () => {
+      const beacons = [
+        makeBeacon({ id: 'secrets', activeTentacle: '7b' }),
+        makeBeacon({ id: 'issues', activeTentacle: 1 }),
+      ];
+      const result = applyBeaconFilters(beacons, f({ tentacle: '7b' }));
+      expect(result.map(beacon => beacon.id)).toEqual(['secrets']);
+    });
+
+    it('filters the HTTP tentacle ID 13', () => {
+      const beacons = [
+        makeBeacon({ id: 'http', activeTentacle: 13 }),
+        makeBeacon({ id: 'issues', activeTentacle: 1 }),
+      ];
+      const result = applyBeaconFilters(beacons, f({ tentacle: 13 }));
+      expect(result.map(beacon => beacon.id)).toEqual(['http']);
+    });
+
     it('returns all when tentacle is "all"', () => {
       const result = applyBeaconFilters(BEACONS, f({ tentacle: 'all' }));
       expect(result).toHaveLength(4);
+    });
+  });
+
+  describe('tentacle filter options', () => {
+    it('includes every selectable canonical channel ID', () => {
+      const values = TENTACLE_FILTER_OPTIONS.map(option => option.value);
+      expect(values).toContain('7b');
+      expect(values).toContain(13);
+      expect(values).not.toContain(8);
     });
   });
 

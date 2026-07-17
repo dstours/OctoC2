@@ -1,332 +1,195 @@
-// dashboard/src/hooks/__tests__/useConnectionMode.test.ts
-import { renderHook, act } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, renderHook } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { useConnectionMode } from '../useConnectionMode';
-import type { ConnectionMode } from '@/types';
 
-// ── Fetch mock helpers ────────────────────────────────────────────────────────
+const nativeFetch = globalThis.fetch;
+type FetchCall = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+let fetchMock = vi.fn<FetchCall>();
 
-function mockFetchOk(latencyHint = 0) {
-  vi.mocked(fetch).mockImplementation(() =>
-    new Promise(resolve =>
-      setTimeout(
-        () => resolve({ ok: true, status: 200 } as Response),
-        latencyHint,
-      ),
-    ),
-  );
+function response(ok: boolean, status: number, body: unknown = {}) {
+  return {
+    ok,
+    status,
+    json: vi.fn().mockResolvedValue(body),
+  } as unknown as Response;
 }
-
-function mockFetchStatus(status: number) {
-  vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status } as Response);
-}
-
-function mockFetchNetworkError() {
-  vi.mocked(fetch).mockRejectedValueOnce(new TypeError('Failed to fetch'));
-}
-
-function mockFetchTimeout() {
-  // Returns a promise that never resolves so AbortController fires
-  vi.mocked(fetch).mockImplementation(
-    (_url, init) =>
-      new Promise((_, reject) => {
-        const signal = (init as RequestInit | undefined)?.signal;
-        if (signal) {
-          signal.addEventListener('abort', () => {
-            const err = new DOMException('The operation was aborted.', 'AbortError');
-            reject(err);
-          });
-        }
-      }),
-  );
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('useConnectionMode', () => {
   beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn());
-    vi.useFakeTimers();
+    fetchMock = vi.fn<FetchCall>();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
   });
 
   afterEach(() => {
-    vi.useRealTimers();
-    vi.unstubAllGlobals();
+    globalThis.fetch = nativeFetch;
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
-  // ── Initial state ──────────────────────────────────────────────────────────
-
-  describe('initial state (before refresh)', () => {
-    it('starts offline with loading=false', () => {
-      const { result } = renderHook(() => useConnectionMode(''));
-      expect(result.current.mode).toBe('offline');
-      expect(result.current.loading).toBe(false);
-      expect(result.current.latencyMs).toBeNull();
-      expect(result.current.error).toBeNull();
+  it('starts offline and does not probe on mount', () => {
+    const { result } = renderHook(() => useConnectionMode('', ''));
+    expect(result.current).toMatchObject({
+      mode: 'offline',
+      loading: false,
+      latencyMs: null,
+      error: null,
     });
-
-    it('does NOT call fetch on mount', () => {
-      renderHook(() => useConnectionMode('ghp_test'));
-      expect(fetch).not.toHaveBeenCalled();
-    });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  // ── Live mode ─────────────────────────────────────────────────────────────
+  it('enters live mode only after health and operator authentication succeed', async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(true, 200))
+      .mockResolvedValueOnce(response(true, 200));
+    const { result } = renderHook(() =>
+      useConnectionMode('operator-secret', 'ghp_fallback'),
+    );
 
-  describe('live mode', () => {
-    it('returns live when the server health check returns 200', async () => {
-      mockFetchOk();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
-      });
-
-      expect(result.current.mode).toBe('live');
-      expect(result.current.loading).toBe(false);
-      expect(result.current.error).toBeNull();
+    await act(async () => {
+      await result.current.refresh();
     });
 
-    it('records a non-negative latencyMs in live mode', async () => {
-      mockFetchOk();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
-      });
-
-      expect(result.current.latencyMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it('probes the correct /api/health endpoint', async () => {
-      mockFetchOk();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
-      });
-
-      expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining('/api/health'),
-        expect.objectContaining({ signal: expect.anything() }),
-      );
-    });
+    expect(result.current.mode).toBe('live');
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      'https://127.0.0.1:8080/api/health',
+      expect.objectContaining({ signal: expect.anything() }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      'https://127.0.0.1:8080/api/beacons',
+      expect.objectContaining({
+        headers: { Authorization: 'Bearer operator-secret' },
+        signal: expect.anything(),
+      }),
+    );
   });
 
-  // ── API mode ──────────────────────────────────────────────────────────────
+  it('never sends the GitHub PAT to controller endpoints', async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(true, 200))
+      .mockResolvedValueOnce(response(true, 200));
+    const { result } = renderHook(() =>
+      useConnectionMode('operator-token', 'ghp_must_not_cross_roles'),
+    );
 
-  describe('api mode', () => {
-    it('returns api when server is unreachable and PAT is present', async () => {
-      mockFetchNetworkError();
-      const { result } = renderHook(() => useConnectionMode('ghp_test'));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
-      });
-
-      expect(result.current.mode).toBe('api');
-      expect(result.current.latencyMs).toBeNull();
+    await act(async () => {
+      await result.current.refresh();
     });
 
-    it('returns api when server returns a non-OK status and PAT is present', async () => {
-      mockFetchStatus(503);
-      const { result } = renderHook(() => useConnectionMode('ghp_test'));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
-      });
-
-      expect(result.current.mode).toBe('api');
-      expect(result.current.error).toMatch(/503/);
-    });
+    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain(
+      'ghp_must_not_cross_roles',
+    );
   });
 
-  // ── Offline mode ──────────────────────────────────────────────────────────
+  it('requires an operator token even when health is public and a GitHub PAT exists', async () => {
+    fetchMock.mockResolvedValueOnce(response(true, 200));
+    const { result } = renderHook(() => useConnectionMode('', 'ghp_direct'));
 
-  describe('offline mode', () => {
-    it('returns offline when server unreachable and no PAT', async () => {
-      mockFetchNetworkError();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
-      });
-
-      expect(result.current.mode).toBe('offline');
-      expect(result.current.latencyMs).toBeNull();
+    await act(async () => {
+      await result.current.refresh();
     });
+
+    expect(result.current.mode).toBe('api');
+    expect(result.current.error).toMatch(/operator api token required/i);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  // ── Timeout handling ──────────────────────────────────────────────────────
+  it('falls back to direct GitHub mode when operator authentication fails', async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(true, 200))
+      .mockResolvedValueOnce(response(false, 401));
+    const { result } = renderHook(() =>
+      useConnectionMode('bad-operator-token', 'ghp_direct'),
+    );
 
-  describe('timeout handling', () => {
-    it('sets error to "Server probe timed out" and falls through on timeout', async () => {
-      mockFetchTimeout();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        // Advance past PROBE_TIMEOUT_MS (2500ms) to trigger AbortController
-        vi.advanceTimersByTime(3000);
-        await probe;
-      });
-
-      expect(result.current.error).toBe('Server probe timed out');
-      expect(result.current.mode).toBe('offline'); // no PAT → offline
-      expect(result.current.loading).toBe(false);
+    await act(async () => {
+      await result.current.refresh();
     });
 
-    it('returns api after timeout when PAT is present', async () => {
-      mockFetchTimeout();
-      const { result } = renderHook(() => useConnectionMode('ghp_test'));
-
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.advanceTimersByTime(3000);
-        await probe;
-      });
-
-      expect(result.current.mode).toBe('api');
-    });
+    expect(result.current.mode).toBe('api');
+    expect(result.current.error).toMatch(/authentication failed.*401/i);
   });
 
-  // ── Loading state ─────────────────────────────────────────────────────────
+  it('falls back offline when the controller is unreachable and no GitHub PAT exists', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    const { result } = renderHook(() => useConnectionMode('operator-token', ''));
 
-  describe('loading state', () => {
-    it('sets loading=true while the probe is in flight', async () => {
-      // Use a fetch that resolves only after we inspect loading state
-      let resolveProbe!: () => void;
-      vi.mocked(fetch).mockImplementation(
-        () =>
-          new Promise(resolve => {
-            resolveProbe = () => resolve({ ok: true, status: 200 } as Response);
-          }),
-      );
-
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      // Start the probe but don't await it yet
-      let probePromise!: Promise<{ mode: ConnectionMode; latencyMs: number | null }>;
-      act(() => {
-        probePromise = result.current.refresh();
-      });
-
-      expect(result.current.loading).toBe(true);
-
-      // Now let it finish
-      await act(async () => {
-        resolveProbe();
-        vi.runAllTimers();
-        await probePromise;
-      });
-
-      expect(result.current.loading).toBe(false);
+    await act(async () => {
+      await result.current.refresh();
     });
+
+    expect(result.current.mode).toBe('offline');
+    expect(result.current.error).toBe('Server unreachable');
   });
 
-  // ── Refresh with override URL ─────────────────────────────────────────────
+  it('uses an override URL without changing credential roles', async () => {
+    fetchMock
+      .mockResolvedValueOnce(response(true, 200))
+      .mockResolvedValueOnce(response(true, 200));
+    const { result } = renderHook(() => useConnectionMode('operator-token', ''));
 
-  describe('refresh with override URL', () => {
-    it('uses the override URL and updates serverUrl state', async () => {
-      mockFetchOk();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      await act(async () => {
-        const probe = result.current.refresh('https://my-codespace-url.github.dev');
-        vi.runAllTimers();
-        await probe;
-      });
-
-      expect(result.current.serverUrl).toBe('https://my-codespace-url.github.dev');
-      expect(fetch).toHaveBeenCalledWith(
-        'https://my-codespace-url.github.dev/api/health',
-        expect.anything(),
-      );
+    await act(async () => {
+      await result.current.refresh('https://private.example.test');
     });
+
+    expect(result.current.serverUrl).toBe('https://private.example.test');
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      'https://private.example.test/api/health',
+      expect.anything(),
+    );
   });
 
-  // ── Error cleared on success ───────────────────────────────────────────────
+  it('rejects unsafe override URLs before any request or bearer token is sent', async () => {
+    const { result } = renderHook(() =>
+      useConnectionMode('operator-secret', 'ghp_fallback'),
+    );
+    const invalidUrls = [
+      'http://controller.example',
+      'https://operator:secret@controller.example',
+      'https://controller.example?target=attacker',
+      'https://controller.example/proxy',
+    ];
 
-  describe('error handling', () => {
-    it('clears a previous error when refresh succeeds', async () => {
-      // First call fails
-      mockFetchNetworkError();
-      const { result } = renderHook(() => useConnectionMode(''));
+    for (const invalidUrl of invalidUrls) {
       await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
+        const detected = await result.current.refresh(invalidUrl);
+        expect(detected.mode).toBe('api');
       });
-      expect(result.current.error).not.toBeNull();
+    }
 
-      // Second call succeeds
-      mockFetchOk();
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        await probe;
-      });
-      expect(result.current.error).toBeNull();
-      expect(result.current.mode).toBe('live');
-    });
+    expect(result.current.serverUrl).toBe('https://127.0.0.1:8080');
+    expect(result.current.error).toMatch(/pathless HTTPS origin/i);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  // ── refresh() return value ─────────────────────────────────────────────────
+  it('aborts a stalled probe and falls back to direct GitHub mode', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementation(
+      (_url, init) =>
+        new Promise((_, reject) => {
+          (init?.signal as AbortSignal | undefined)?.addEventListener('abort', () => {
+            reject(new DOMException('aborted', 'AbortError'));
+          });
+        }),
+    );
+    const { result } = renderHook(() => useConnectionMode('', 'ghp_direct'));
 
-  describe('refresh() return value', () => {
-    it('returns { mode: "live", latencyMs: number } when server returns 200', async () => {
-      mockFetchOk();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      let ret: { mode: ConnectionMode; latencyMs: number | null } | undefined;
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        ret = await probe;
-      });
-
-      expect(ret).toEqual({ mode: 'live', latencyMs: expect.any(Number) });
+    let probe!: Promise<unknown>;
+    act(() => {
+      probe = result.current.refresh();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+      await Promise.resolve();
+      await probe;
     });
 
-    it('returns { mode: "api", latencyMs: null } when server unreachable and PAT present', async () => {
-      mockFetchNetworkError();
-      const { result } = renderHook(() => useConnectionMode('ghp_test'));
-
-      let ret: { mode: ConnectionMode; latencyMs: number | null } | undefined;
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        ret = await probe;
-      });
-
-      expect(ret).toEqual({ mode: 'api', latencyMs: null });
-    });
-
-    it('returns { mode: "offline", latencyMs: null } when server unreachable and no PAT', async () => {
-      mockFetchNetworkError();
-      const { result } = renderHook(() => useConnectionMode(''));
-
-      let ret: { mode: ConnectionMode; latencyMs: number | null } | undefined;
-      await act(async () => {
-        const probe = result.current.refresh();
-        vi.runAllTimers();
-        ret = await probe;
-      });
-
-      expect(ret).toEqual({ mode: 'offline', latencyMs: null });
-    });
+    expect(result.current.mode).toBe('api');
+    expect(result.current.error).toBe('Server probe timed out');
   });
 });

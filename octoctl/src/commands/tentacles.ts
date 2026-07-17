@@ -9,28 +9,25 @@
  *   octoctl tentacles list --beacon <beaconId> --server-url <url>
  */
 
-import { loadRegistry } from "../lib/registry.ts";
+import { getBeacon } from "../lib/registry.ts";
+import {
+  controllerFetch,
+  requireControllerServerUrl,
+  requireOperatorApiToken,
+} from "../lib/env.ts";
+import {
+  CHANNEL_BY_ID,
+  SELECTABLE_CHANNEL_KINDS,
+  type ChannelKind,
+  isChannelKind,
+} from "@octoc2/shared";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-/** The 13 canonical tentacle kinds shown in the health table. */
-const ALL_KINDS = [
-  "issues",
-  "gist",
-  "branch",
-  "notes",
-  "actions",
-  "secrets",
-  "proxy",
-  "codespaces",
-  "http",
-  "relay",
-  "oidc",
-  "pages",
-  "stego",
-] as const;
+export type TentacleKind = Exclude<ChannelKind, "pull_request">;
 
-export type TentacleKind = (typeof ALL_KINDS)[number];
+/** Canonical implemented channel list from the shared protocol catalog. */
+const ALL_KINDS = SELECTABLE_CHANNEL_KINDS as readonly TentacleKind[];
 
 export type TentacleStatus = "active" | "live" | "degraded" | "slow" | "failed" | "dead" | "idle" | "unknown" | "inactive" | "error";
 
@@ -245,6 +242,22 @@ export function buildChannels(
   });
 }
 
+export function normalizeActiveChannel(
+  raw: string | number | undefined,
+): TentacleKind | null {
+  if (raw === undefined) return null;
+  if (typeof raw === "string" && isChannelKind(raw)) {
+    return SELECTABLE_CHANNEL_KINDS.includes(raw)
+      ? raw as TentacleKind
+      : null;
+  }
+  const definition = CHANNEL_BY_ID[String(raw)];
+  return definition &&
+      definition.implementationStatus !== "unavailable"
+    ? definition.kind as TentacleKind
+    : null;
+}
+
 // ── Server-mode fetch ──────────────────────────────────────────────────────────
 
 interface ServerBeacon {
@@ -268,7 +281,7 @@ async function fetchFromServer(
   const headers = { Authorization: `Bearer ${token}` };
 
   // GET /api/beacons
-  const beaconsResp = await fetch(`${serverUrl}/api/beacons`, { headers });
+  const beaconsResp = await controllerFetch(`${serverUrl}/api/beacons`, { headers });
   if (!beaconsResp.ok) {
     throw new Error(`GET /api/beacons returned ${beaconsResp.status}`);
   }
@@ -282,7 +295,7 @@ async function fetchFromServer(
   }
 
   // GET /api/beacon/:id/maintenance
-  const maintResp = await fetch(
+  const maintResp = await controllerFetch(
     `${serverUrl}/api/beacon/${beacon.id}/maintenance`,
     { headers },
   );
@@ -293,7 +306,7 @@ async function fetchFromServer(
 
   // GET /api/beacon/:id/results
   let tasks: TaskResult[] = [];
-  const resultsResp = await fetch(
+  const resultsResp = await controllerFetch(
     `${serverUrl}/api/beacon/${beacon.id}/results`,
     { headers },
   );
@@ -332,8 +345,6 @@ export function printErrorDetails(
 // ── Main entrypoint ────────────────────────────────────────────────────────────
 
 export async function runTentaclesList(opts: TentaclesListOptions): Promise<void> {
-  const token = process.env["OCTOC2_DASHBOARD_TOKEN"] ?? "dev-token";
-
   let activeTentacle: string | null = null;
   let lastSeen:       string | null = null;
   let beaconId:       string        = opts.beacon;
@@ -341,30 +352,26 @@ export async function runTentaclesList(opts: TentaclesListOptions): Promise<void
 
   if (opts.serverUrl) {
     // ── Online mode ────────────────────────────────────────────────────────────
-    const { beacon, tasks } = await fetchFromServer(opts.serverUrl, opts.beacon, token);
+    const token = requireOperatorApiToken();
+    const serverUrl = requireControllerServerUrl(opts.serverUrl);
+    const { beacon, tasks } = await fetchFromServer(serverUrl, opts.beacon, token);
     beaconId = beacon.id;
     lastSeen = beacon.lastSeen ?? null;
     // activeTentacle from server may be a number (legacy) or string kind name
-    const raw = beacon.activeTentacle;
-    if (typeof raw === "string" && raw.length > 0) {
-      activeTentacle = raw;
-    }
+    activeTentacle = normalizeActiveChannel(beacon.activeTentacle);
     // If it's a number (legacy API) we can't map it without more context — leave null
     if (tasks.length > 0) {
       statsMap = computeChannelStats(tasks, opts.verbose ?? false);
     }
   } else {
     // ── Offline mode ───────────────────────────────────────────────────────────
-    const registry = await loadRegistry(opts.dataDir);
-    const record = registry.find(
-      b => b.beaconId === opts.beacon || b.beaconId.startsWith(opts.beacon),
-    );
+    const record = await getBeacon(opts.beacon, opts.dataDir);
     if (!record) {
       throw new Error(`Beacon '${opts.beacon}' not found in registry`);
     }
     beaconId       = record.beaconId;
     lastSeen       = record.lastSeen ?? null;
-    activeTentacle = record.activeTentacle ?? null;
+    activeTentacle = normalizeActiveChannel(record.activeTentacle);
     // No results available offline — statsMap stays undefined
   }
 

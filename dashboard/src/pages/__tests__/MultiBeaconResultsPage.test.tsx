@@ -1,6 +1,6 @@
 // dashboard/src/pages/__tests__/MultiBeaconResultsPage.test.tsx
 import { render, screen, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MultiBeaconResultsPage } from '../MultiBeaconResultsPage';
@@ -8,29 +8,29 @@ import type { ServerTask } from '@/lib/C2ServerClient';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
-const mockGetResults      = vi.hoisted(() => vi.fn());
-const mockAuthPrivkey     = vi.hoisted(() => ({ value: null as string | null }));
-const mockDecryptSealedResult = vi.hoisted(() => vi.fn());
+const mockGetResults      = vi.fn();
+const mockAuthPrivkey     = { value: null as string | null };
+const mockDecryptSealedResult = vi.fn();
 
 vi.mock('@/context/AuthContext', () => ({
   useAuth: () => ({
-    pat: 'ghp_test', mode: 'live', serverUrl: 'http://localhost:8080',
+    githubPat: 'ghp_test', operatorToken: 'operator-test',
+    mode: 'live', serverUrl: 'https://localhost:8080',
     privkey: mockAuthPrivkey.value, latencyMs: null,
     login: vi.fn(), logout: vi.fn(), setPrivkey: vi.fn(), isAuthenticated: true,
   }),
 }));
 
 vi.mock('@/lib/C2ServerClient', () => ({
-  C2ServerClient: vi.fn(function (this: Record<string, unknown>) {
-    this['getResults']  = mockGetResults;
-    this['getBeacons']  = vi.fn().mockResolvedValue([]);
-    this['health']      = vi.fn().mockResolvedValue({ ok: true, latencyMs: 5 });
-  }),
+  C2ServerClient: class {
+    getResults = mockGetResults;
+    getBeacons = vi.fn().mockResolvedValue([]);
+    health = vi.fn().mockResolvedValue({ ok: true, latencyMs: 5 });
+  },
 }));
 
 vi.mock('@/lib/crypto', () => ({
   decryptSealedResult:               mockDecryptSealedResult,
-  deadDropGistKey:                   vi.fn().mockResolvedValue('deadbeef'),
   parseMaintenanceDiagnosticPayload: vi.fn().mockReturnValue(null),
 }));
 

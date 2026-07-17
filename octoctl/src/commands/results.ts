@@ -1,147 +1,120 @@
 /**
- * octoctl results
- *
- * Fetch and decrypt result comments ([job:...:logs:...]) from a beacon's issue.
- *
- * Usage:
- *   octoctl results <beaconId>
- *   octoctl results <beaconId> --last 5
- *   octoctl results <beaconId> --since 2h
- *   octoctl results <beaconId> --json
+ * Fetch task results that the controller has already authenticated, bound to
+ * the owning task, and persisted through the central TaskService.
  */
 
-import { resolveEnv }           from "../lib/env.ts";
-import { getBeacon }            from "../lib/registry.ts";
-import { openSealBox, bytesToString } from "../lib/crypto.ts";
+import {
+  controllerFetch,
+  requireControllerServerUrl,
+  requireOperatorApiToken,
+} from "../lib/env.ts";
+import { getBeacon } from "../lib/registry.ts";
 
 export interface ResultsOptions {
-  last?:  number | undefined;
+  last?: number | undefined;
   since?: string | undefined;
-  json:   boolean;
+  json: boolean;
 }
 
-// ── Parsed result ─────────────────────────────────────────────────────────────
-
-interface TaskResult {
-  taskId:      string;
-  beaconId:    string;
-  kind?:       string;
+interface DisplayResult {
+  taskId: string;
+  beaconId: string;
+  kind?: string;
   completedAt: string;
-  output?:     string;
-  error?:      string;
+  output?: string;
+  error?: string;
 }
 
-// ── Time parsing ──────────────────────────────────────────────────────────────
+interface ServerResult {
+  taskId: string;
+  beaconId?: string;
+  kind?: string;
+  status?: string;
+  completedAt?: string | null;
+  output?: string;
+  success?: boolean;
+  result?: {
+    output?: string;
+    success?: boolean;
+    completedAt?: string;
+  } | null;
+}
 
-function parseSince(s: string): Date {
-  const m = /^(\d+)(s|m|h|d)$/.exec(s);
-  if (m) {
-    const n   = parseInt(m[1]!, 10);
-    const unit: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
-    return new Date(Date.now() - n * unit[m[2]!]!);
+function parseSince(value: string): Date {
+  const relative = /^(\d+)(s|m|h|d)$/.exec(value);
+  if (relative) {
+    const amount = Number.parseInt(relative[1]!, 10);
+    const units: Record<string, number> = {
+      s: 1_000,
+      m: 60_000,
+      h: 3_600_000,
+      d: 86_400_000,
+    };
+    return new Date(Date.now() - amount * units[relative[2]!]!);
   }
-  return new Date(s); // try ISO-8601
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime())) {
+    throw new Error("--since must be a valid ISO timestamp or duration such as 2h");
+  }
+  return parsed;
 }
 
-// ── Comment parsing ───────────────────────────────────────────────────────────
-
-const HEARTBEAT_RE  = /<!--\s*job:(\d+):(reg|ci|logs|deploy):([^\s>]+)\s*-->/m;
-// Beacon comments embed the ciphertext inside the infra-diagnostic HTML comment: <!-- infra-diagnostic:epoch:CIPHERTEXT -->
-const CIPHERTEXT_RE = /<!--\s*infra-diagnostic:[^\s:>]+:([A-Za-z0-9_\-+/=]+)\s*-->/;
-
-// ── Main ──────────────────────────────────────────────────────────────────────
-
-export async function runResults(beaconIdPrefix: string, opts: ResultsOptions): Promise<void> {
-  const env = await resolveEnv();
-
-  const beacon = await getBeacon(beaconIdPrefix, env.dataDir);
+export async function runResults(
+  beaconIdPrefix: string,
+  opts: ResultsOptions,
+): Promise<void> {
+  const dataDir = process.env["OCTOC2_DATA_DIR"]?.trim() ?? "./data";
+  const beacon = await getBeacon(beaconIdPrefix, dataDir);
   if (!beacon) {
-    console.error(
-      `\n  Beacon '${beaconIdPrefix}' not found in registry.\n` +
-      "  Run: octoctl beacons  to list registered beacons.\n"
-    );
-    process.exit(1);
+    throw new Error(`Beacon '${beaconIdPrefix}' was not found in the registry`);
   }
 
-  // Determine `since` filter
-  const since = opts.since
-    ? parseSince(opts.since).toISOString()
-    : new Date(Date.now() - 24 * 3600 * 1000).toISOString(); // default: last 24h
+  const sinceDate = opts.since
+    ? parseSince(opts.since)
+    : new Date(Date.now() - 24 * 60 * 60 * 1_000);
+  const since = sinceDate.toISOString();
+  const serverUrl = requireControllerServerUrl();
+  const operatorApiToken = requireOperatorApiToken();
+  const response = await controllerFetch(
+    `${serverUrl}/api/beacon/${encodeURIComponent(beacon.beaconId)}/results`,
+    { headers: { Authorization: `Bearer ${operatorApiToken}` } },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `Server returned ${response.status}: ${await response.text()}`,
+    );
+  }
 
-  let results: TaskResult[] = [];
-
-  // ── Fetch results: server API or direct Issues comments ─────────────────
-  if (beacon.issueNumber === 0) {
-    // No issue — beacon registered via Actions/Notes/etc. Use server API.
-    const serverUrl = process.env["OCTOC2_SERVER_URL"] ?? "http://localhost:8080";
-    const resp = await fetch(`${serverUrl}/api/beacon/${beacon.beaconId}/results`, {
-      headers: { "Authorization": `Bearer ${env.token}` },
+  const serverResults = await response.json() as ServerResult[];
+  let results: DisplayResult[] = serverResults
+    .filter((entry) => entry.status === "completed" || entry.result)
+    .filter((entry) => {
+      const completedAt =
+        entry.result?.completedAt ?? entry.completedAt ?? "";
+      const completed = new Date(completedAt);
+      return Number.isFinite(completed.getTime()) && completed >= sinceDate;
+    })
+    .map((entry) => {
+      const success = entry.result?.success ?? entry.success;
+      const output = entry.result?.output ?? entry.output;
+      return {
+        taskId: entry.taskId,
+        beaconId: entry.beaconId ?? beacon.beaconId,
+        completedAt:
+          entry.result?.completedAt ??
+          entry.completedAt ??
+          new Date(0).toISOString(),
+        ...(entry.kind !== undefined && { kind: entry.kind }),
+        ...(output !== undefined && { output }),
+        ...(success === false && { error: "task failed" }),
+      };
     });
-    if (!resp.ok) {
-      throw new Error(`Server returned ${resp.status}: ${await resp.text()}`);
+
+  if (opts.last !== undefined) {
+    if (!Number.isSafeInteger(opts.last) || opts.last <= 0) {
+      throw new Error("--last must be a positive integer");
     }
-    const serverResults = await resp.json() as Array<{
-      taskId: string; beaconId?: string; kind?: string; status?: string;
-      completedAt?: string; output?: string; success?: boolean;
-      result?: { output?: string; success?: boolean; completedAt?: string };
-    }>;
-
-    results = serverResults
-      .filter(r => r.status === "completed" || r.result)
-      .filter(r => new Date(r.result?.completedAt ?? r.completedAt ?? 0) >= new Date(since))
-      .map(r => ({
-        taskId:      r.taskId,
-        beaconId:    r.beaconId ?? beacon.beaconId,
-        kind:        r.kind,
-        completedAt: r.result?.completedAt ?? r.completedAt ?? new Date().toISOString(),
-        output:      r.result?.output ?? r.output,
-        error:       (r.result?.success === false || r.success === false) ? "task failed" : undefined,
-      }));
-
-    if (opts.last) results = results.slice(-opts.last);
-  } else {
-    // Issues-based — fetch and decrypt comments
-    const allComments = await env.octokit.paginate(
-      env.octokit.rest.issues.listComments,
-      {
-        owner:        env.owner,
-        repo:         env.repo,
-        issue_number: beacon.issueNumber,
-        since,
-        per_page:     100,
-      }
-    );
-
-    const logsComments = allComments.filter(c =>
-      /<!--\s*job:\d+:logs:/m.test(c.body ?? "")
-    );
-
-    const limited = opts.last
-      ? logsComments.slice(-opts.last)
-      : logsComments;
-
-    for (const comment of limited) {
-      const hb = HEARTBEAT_RE.exec(comment.body ?? "");
-      const ct = CIPHERTEXT_RE.exec(comment.body ?? "");
-      if (!hb || !ct) continue;
-
-      try {
-        const plain  = await openSealBox(
-          ct[1]!.trim(),
-          env.operatorPublicKey,
-          env.operatorSecretKey
-        );
-        const result = JSON.parse(bytesToString(plain)) as TaskResult;
-        results.push(result);
-      } catch (err) {
-        results.push({
-          taskId:      `<decrypt failed: ${(err as Error).message}>`,
-          beaconId:    beacon.beaconId,
-          completedAt: comment.created_at,
-          error:       "decryption failed",
-        });
-      }
-    }
+    results = results.slice(-opts.last);
   }
 
   if (opts.json) {
@@ -149,51 +122,46 @@ export async function runResults(beaconIdPrefix: string, opts: ResultsOptions): 
     return;
   }
 
-  const DIM   = "\x1b[2m";
-  const BOLD  = "\x1b[1m";
-  const RESET = "\x1b[0m";
-  const GREEN = "\x1b[32m";
-  const RED   = "\x1b[31m";
-  const CYAN  = "\x1b[36m";
+  const dim = "\x1b[2m";
+  const bold = "\x1b[1m";
+  const reset = "\x1b[0m";
+  const green = "\x1b[32m";
+  const red = "\x1b[31m";
+  const cyan = "\x1b[36m";
 
   console.log("");
   console.log(
-    `  ${BOLD}Results for ${beacon.hostname}${RESET}  ` +
-    `${DIM}(${beacon.beaconId.slice(0, 8)}…, issue #${beacon.issueNumber})${RESET}`
+    `  ${bold}Verified results for ${beacon.hostname}${reset}  ` +
+      `${dim}(${beacon.beaconId.slice(0, 8)}…)${reset}`,
   );
-
   if (results.length === 0) {
-    console.log(`\n  No results in the last ${opts.since ?? "24h"}.\n`);
+    console.log(`\n  No verified results in the last ${opts.since ?? "24h"}.\n`);
     return;
   }
 
-  console.log(`  ${DIM}Showing ${results.length} result(s) since ${since}${RESET}`);
-  console.log("  " + "─".repeat(72));
-
-  for (const r of results) {
-    const hasError  = Boolean(r.error);
-    const statusMark = hasError ? `${RED}✗${RESET}` : `${GREEN}✓${RESET}`;
-
+  console.log(`  ${dim}Showing ${results.length} result(s) since ${since}${reset}`);
+  console.log(`  ${"─".repeat(72)}`);
+  for (const result of results) {
+    const statusMark = result.error
+      ? `${red}✗${reset}`
+      : `${green}✓${reset}`;
     console.log("");
-    console.log(`  ${statusMark}  ${BOLD}${r.taskId.slice(0, 8)}…${RESET}  ${DIM}${r.completedAt}${RESET}`);
-    if (r.kind) {
-      console.log(`  ${DIM}Kind:${RESET} ${r.kind}`);
-    }
-    if (r.output && r.output.trim().length > 0) {
-      console.log(`  ${CYAN}Output:${RESET}`);
-      const lines = r.output.split("\n");
-      const preview = lines.slice(0, 20);
-      for (const line of preview) {
-        console.log(`    ${line}`);
-      }
+    console.log(
+      `  ${statusMark}  ${bold}${result.taskId.slice(0, 8)}…${reset}  ` +
+        `${dim}${result.completedAt}${reset}`,
+    );
+    if (result.kind) console.log(`  ${dim}Kind:${reset} ${result.kind}`);
+    if (result.output?.trim()) {
+      console.log(`  ${cyan}Output:${reset}`);
+      const lines = result.output.split("\n");
+      for (const line of lines.slice(0, 20)) console.log(`    ${line}`);
       if (lines.length > 20) {
-        console.log(`    ${DIM}… (${lines.length - 20} more lines — use --json to see all)${RESET}`);
+        console.log(
+          `    ${dim}… (${lines.length - 20} more lines; use --json)${reset}`,
+        );
       }
     }
-    if (r.error && r.error !== "decryption failed") {
-      console.log(`  ${RED}Error:${RESET} ${r.error}`);
-    }
+    if (result.error) console.log(`  ${red}Error:${reset} ${result.error}`);
   }
-
   console.log("");
 }

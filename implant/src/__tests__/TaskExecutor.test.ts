@@ -22,6 +22,20 @@ const MOCK_CONFIG: BeaconConfig = {
 };
 const executor  = new TaskExecutor(MOCK_CONFIG);
 const BEACON_ID = "test-beacon-id";
+const SHELL_MULTILINE =
+  process.platform === "win32"
+    ? "echo line1 & echo line2 & echo line3"
+    : "printf 'line1\\nline2\\nline3\\n'";
+const SHELL_TIMEOUT =
+  process.platform === "win32"
+    ? "ping -n 30 127.0.0.1 >nul"
+    : "while :; do :; done";
+const SHELL_STDERR =
+  process.platform === "win32"
+    ? "echo err 1>&2 & echo out"
+    : "echo err >&2; echo out";
+const SHELL_NONZERO = process.platform === "win32" ? "exit /b 42" : "exit 42";
+const SHELL_SUCCESS = process.platform === "win32" ? "ver >nul" : "true";
 
 function makeTask(kind: Task["kind"], args: Record<string, unknown> = {}): Task {
   return { taskId: crypto.randomUUID(), kind, args };
@@ -42,7 +56,7 @@ describe("shell tasks", () => {
 
   it("captures stderr separately", async () => {
     const { result } = await executor.execute(
-      makeTask("shell", { cmd: "echo err >&2; echo out" }),
+      makeTask("shell", { cmd: SHELL_STDERR }),
       BEACON_ID
     );
     expect(result.output).toContain("out");
@@ -52,7 +66,7 @@ describe("shell tasks", () => {
 
   it("reports non-zero exit codes", async () => {
     const { result } = await executor.execute(
-      makeTask("shell", { cmd: "exit 42" }),
+      makeTask("shell", { cmd: SHELL_NONZERO }),
       BEACON_ID
     );
     expect(result.success).toBe(false);
@@ -70,7 +84,7 @@ describe("shell tasks", () => {
   it("sets completedAt on result", async () => {
     const before = new Date().toISOString();
     const { result } = await executor.execute(
-      makeTask("shell", { cmd: "true" }),
+      makeTask("shell", { cmd: SHELL_SUCCESS }),
       BEACON_ID
     );
     expect(result.completedAt >= before).toBe(true);
@@ -79,7 +93,7 @@ describe("shell tasks", () => {
 
   it("captures multiline output", async () => {
     const { result } = await executor.execute(
-      makeTask("shell", { cmd: "printf 'line1\\nline2\\nline3\\n'" }),
+      makeTask("shell", { cmd: SHELL_MULTILINE }),
       BEACON_ID
     );
     expect(result.output).toContain("line1");
@@ -100,7 +114,7 @@ describe("shell tasks", () => {
     // Use a shell builtin loop so there's no child process to hold the pipe
     // open after SIGKILL (unlike `sleep 10` which forks a subprocess).
     const { result } = await executor.execute(
-      makeTask("shell", { cmd: "while :; do :; done", timeout: 200 }),
+      makeTask("shell", { cmd: SHELL_TIMEOUT, timeout: 200 }),
       BEACON_ID
     );
     expect(result.success).toBe(false);
@@ -171,7 +185,10 @@ describe("kill task", () => {
 describe("exec tasks", () => {
   it("runs a binary directly without a shell wrapper", async () => {
     const { result, directive } = await executor.execute(
-      makeTask("exec", { cmd: "/usr/bin/env", args: ["echo", "exec-hello"] }),
+      makeTask("exec", {
+        cmd: process.execPath,
+        args: ["-e", "console.log('exec-hello')"],
+      }),
       BEACON_ID
     );
     expect(result.success).toBe(true);
@@ -181,7 +198,7 @@ describe("exec tasks", () => {
 
   it("accepts args as a single string when only one arg", async () => {
     const { result } = await executor.execute(
-      makeTask("exec", { cmd: "uname", args: "-a" }),
+      makeTask("exec", { cmd: process.execPath, args: "--version" }),
       BEACON_ID
     );
     expect(result.success).toBe(true);
@@ -190,7 +207,10 @@ describe("exec tasks", () => {
 
   it("reports non-zero exit codes", async () => {
     const { result } = await executor.execute(
-      makeTask("exec", { cmd: "/usr/bin/false" }),
+      makeTask("exec", {
+        cmd: process.execPath,
+        args: ["-e", "process.exit(7)"],
+      }),
       BEACON_ID
     );
     expect(result.success).toBe(false);
@@ -205,7 +225,10 @@ describe("exec tasks", () => {
 
   it("includes duration in output", async () => {
     const { result } = await executor.execute(
-      makeTask("exec", { cmd: "true" }),
+      makeTask("exec", {
+        cmd: process.execPath,
+        args: ["-e", "process.exit(0)"],
+      }),
       BEACON_ID
     );
     expect(result.output).toMatch(/\[\d+ms\]/);
@@ -213,7 +236,11 @@ describe("exec tasks", () => {
 
   it("times out and kills the process", async () => {
     const { result } = await executor.execute(
-      makeTask("exec", { cmd: "/bin/sh", args: ["-c", "while :; do :; done"], timeout: 200 }),
+      makeTask("exec", {
+        cmd: process.execPath,
+        args: ["-e", "while (true) {}"],
+        timeout: 200,
+      }),
       BEACON_ID
     );
     expect(result.success).toBe(false);
@@ -222,7 +249,10 @@ describe("exec tasks", () => {
 
   it("does not set shellInvoked metadata on exec tasks", async () => {
     const { result } = await executor.execute(
-      makeTask("exec", { cmd: "echo", args: ["no-shell"] }),
+      makeTask("exec", {
+        cmd: process.execPath,
+        args: ["-e", "console.log('no-shell')"],
+      }),
       BEACON_ID
     );
     expect(result.success).toBe(true);
@@ -259,39 +289,5 @@ describe("ping task", () => {
 
 // ── not-implemented stubs ─────────────────────────────────────────────────────
 
-describe("unimplemented task kinds", () => {
-  const stubs: Task["kind"][] = [
-    "upload", "download", "screenshot",
-    "keylog_start", "keylog_stop",
-  ];
-
-  for (const kind of stubs) {
-    it(`returns failure for ${kind}`, async () => {
-      const { result } = await executor.execute(makeTask(kind), BEACON_ID);
-      expect(result.success).toBe(false);
-      expect(result.output).toContain("not yet implemented");
-    });
-  }
-});
 
 // ── load-module tasks ─────────────────────────────────────────────────────────
-
-describe("load-module tasks", () => {
-  it("returns failure when neither serverUrl nor payload is provided", async () => {
-    const { result } = await executor.execute(
-      makeTask("load-module", { name: "recon" }),
-      BEACON_ID
-    );
-    expect(result.success).toBe(false);
-    expect(result.output).toContain("serverUrl");
-  });
-
-  it("returns failure when name is missing", async () => {
-    const { result } = await executor.execute(
-      makeTask("load-module", { serverUrl: "http://localhost:8080" }),
-      BEACON_ID
-    );
-    expect(result.success).toBe(false);
-    expect(result.output).toContain("name");
-  });
-});

