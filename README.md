@@ -5,7 +5,7 @@
 -->
 
 <p align="center">
-  <img src="docs-site/public/logo.png" alt="OctoC2" width="260" />
+  <img src="docs-site/public/logo.png" alt="OctoC2" width="360" />
 </p>
 
 <p align="center">
