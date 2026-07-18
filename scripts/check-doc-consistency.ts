@@ -39,6 +39,14 @@ const runtimeConfig = await readFile(
   join(root, "server", "src", "config", "RuntimeConfig.ts"),
   "utf8",
 );
+const docsRegistry = await readFile(
+  join(root, "docs-site", "src", "docs.ts"),
+  "utf8",
+);
+const docsReader = await readFile(
+  join(root, "docs-site", "src", "DocumentationPage.tsx"),
+  "utf8",
+);
 
 function requireText(path: (typeof publicDocs)[number], text: string): void {
   if (!contents.get(path)?.includes(text)) {
@@ -112,6 +120,48 @@ if (!serverEntry.includes("const listeners    = readListenerConfig();")) {
   errors.push("server/src/index.ts must use the validated listener configuration");
 }
 
+const containedArticles = [
+  "docs/README.md",
+  "docs/INSTALLATION.md",
+  "docs/GITHUB_SETUP.md",
+  "docs/QUICKSTART.md",
+  "docs/ARCHITECTURE.md",
+  "docs/CHANNELS.md",
+  "docs/CONFIGURATION.md",
+  "docs/CLI.md",
+  "dashboard/README.md",
+  "docs/PRODUCTION.md",
+  "docs/RECOVERY.md",
+  "templates/proxy/README.md",
+  "docs/TROUBLESHOOTING.md",
+  "docs/DEVELOPMENT.md",
+  "docs/REMEDIATION_TRACEABILITY.md",
+] as const;
+for (const sourcePath of containedArticles) {
+  if (!docsRegistry.includes(`sourcePath: '${sourcePath}'`)) {
+    errors.push(`docs site must contain article ${sourcePath}`);
+  }
+}
+if (
+  contents.get("docs-site/src/App.tsx")?.includes("/blob/main/docs/") ||
+  contents.get("docs-site/src/App.tsx")?.includes("docsUrl(")
+) {
+  errors.push("docs-site guide links must open the in-site article reader");
+}
+for (const requiredReaderContract of [
+  "DOCUMENTATION_ID_BY_SOURCE",
+  "documentationUrl(articleId, anchor)",
+  "ReactMarkdown",
+  "remarkGfm",
+  "rehypeSlug",
+]) {
+  if (!docsReader.includes(requiredReaderContract)) {
+    errors.push(
+      `docs-site/src/DocumentationPage.tsx is missing reader contract: ${requiredReaderContract}`,
+    );
+  }
+}
+
 if (errors.length > 0) {
   console.error("Documentation consistency violations:");
   for (const error of errors) {
@@ -119,5 +169,5 @@ if (errors.length > 0) {
   }
   process.exitCode = 1;
 } else {
-  console.log("Public documentation authorization, listener, credential, and port claims are consistent.");
+  console.log("Public documentation authorization, containment, listener, credential, and port claims are consistent.");
 }
